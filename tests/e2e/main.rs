@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use piano_e2e::client::{Proto, client};
-use piano_e2e::origin::{INFO_PUBLIC, Origin};
+use piano_e2e::origin::{INFO_PUBLIC, Origin, pattern_byte};
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
@@ -107,4 +107,54 @@ async fn untrusted_origin_certificate_is_a_502() {
     let res = c.get(url(&w, "/System/Info/Public")).send().await.unwrap();
     assert_eq!(res.status(), 502);
     assert_eq!(w.origin.requests(), 0);
+}
+
+#[tokio::test]
+async fn range_requests_are_passed_through() {
+    let w = world(None, true).await;
+    for proto in [Proto::H1, Proto::H2] {
+        let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto);
+        let res = c
+            .get(url(&w, "/__bytes/1000000"))
+            .header("range", "bytes=1000-1999")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 206, "{proto:?}");
+        assert_eq!(res.headers()["content-range"], "bytes 1000-1999/1000000");
+        let body = res.bytes().await.unwrap();
+        assert_eq!(body.len(), 1000);
+        assert!(
+            body.iter()
+                .zip(1000u64..)
+                .all(|(&b, i)| b == pattern_byte(i))
+        );
+    }
+}
+
+#[tokio::test]
+async fn large_bodies_stream_intact() {
+    const LEN: u64 = 64 << 20;
+    let w = world(None, true).await;
+    for proto in [Proto::H1, Proto::H2] {
+        let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto);
+        let mut res = c
+            .get(url(&w, &format!("/__bytes/{LEN}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut offset = 0u64;
+        while let Some(chunk) = res.chunk().await.unwrap() {
+            assert!(
+                chunk
+                    .iter()
+                    .zip(offset..)
+                    .all(|(&b, i)| b == pattern_byte(i)),
+                "{proto:?}: corrupt data near offset {offset}"
+            );
+            offset += chunk.len() as u64;
+        }
+        assert_eq!(offset, LEN, "{proto:?}");
+    }
 }
