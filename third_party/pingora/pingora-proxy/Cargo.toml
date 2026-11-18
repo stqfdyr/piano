@@ -18,9 +18,6 @@ Pingora HTTP proxy APIs and traits.
 name = "pingora_proxy"
 path = "src/lib.rs"
 
-[[bench]]
-name = "shutdown_signal"
-harness = false
 
 [dependencies]
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
@@ -54,11 +51,6 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
-pingora-limits = { version = "0.9.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", default-features=false }
-pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
-pingora-test-utils = { version = "0.9.0", path = "../pingora-test-utils" }
-prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -70,15 +62,7 @@ hyperlocal = "0.9"
 
 [features]
 default = []
-openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
-boringssl = [
-    "pingora-core/boringssl",
-    "pingora-cache/boringssl",
-    "openssl_derived",
-]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
-s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
-openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
 patched_http1 = ["pingora-core/patched_http1"]
@@ -87,17 +71,9 @@ connection_filter = ["pingora-core/connection_filter"]
 trace = ["pingora-cache/trace"]
 early_body_buffer = ["dep:pingora-timeout"]
 
-[[example]]
-name = "connection_filter"
-required-features = ["connection_filter"]
 
-[[example]]
-name = "body_routing"
-required-features = ["early_body_buffer"]
-
-# or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_async_trait"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)', 'cfg(feature, values("openssl", "boringssl", "s2n", "openssl_derived"))'] }

@@ -58,22 +58,13 @@ env_logger = "0.11"
 dhat = "0"
 futures = { workspace = true }
 
-[[bench]]
-name = "simple_lru_memory"
-harness = false
 
-[[bench]]
-name = "lru_memory"
-harness = false
 
-[[bench]]
-name = "lru_serde"
-harness = false
 
 [features]
 default = []
-openssl = ["pingora-core/openssl"]
-boringssl = ["pingora-core/boringssl"]
 rustls = ["pingora-core/rustls"]
-s2n = ["pingora-core/s2n"]
 trace = ["dep:cf-rustracing", "dep:cf-rustracing-jaeger"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("openssl", "boringssl", "s2n", "openssl_derived"))'] }

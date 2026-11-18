@@ -32,6 +32,3 @@ tokio-test = "0.4"
 [lints]
 workspace = true
 
-[[bench]]
-name = "connection_pool"
-harness = false

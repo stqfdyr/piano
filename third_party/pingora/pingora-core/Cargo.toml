@@ -20,15 +20,12 @@ path = "src/lib.rs"
 
 [dependencies]
 pingora-runtime = { version = "0.9.0", path = "../pingora-runtime" }
-pingora-openssl = { version = "0.9.0", path = "../pingora-openssl", optional = true }
-pingora-boringssl = { version = "0.9.0", path = "../pingora-boringssl", optional = true }
 pingora-pool = { version = "0.9.0", path = "../pingora-pool" }
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
 pingora-http-parser = { workspace = true }
 pingora-rustls = { version = "0.9.0", path = "../pingora-rustls", optional = true }
-pingora-s2n = { version = "0.9.0", path = "../pingora-s2n", optional = true }
 bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true }
@@ -104,9 +101,6 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ] }
 
-[[bench]]
-name = "h1_pipelining"
-harness = false
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"
@@ -119,12 +113,11 @@ default = []
 dial9 = ["pingora-runtime/dial9"]
 dial9-worker-s3 = ["dial9", "pingora-runtime/dial9-worker-s3"]
 dial9-cpu-profiling = ["dial9", "pingora-runtime/dial9-cpu-profiling"]
-openssl = ["pingora-openssl", "openssl_derived"]
-boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
-s2n = ["pingora-s2n", "any_tls", "dep:x509-parser", "ouroboros", "lru"]
 patched_http1 = ["pingora-http/patched_http1", "pingora-http-parser/patched_http1"]
-openssl_derived = ["any_tls"]
 any_tls = ["dep:tokio-util"]
 sentry = ["dep:sentry"]
 connection_filter = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("openssl", "boringssl", "s2n", "openssl_derived"))'] }

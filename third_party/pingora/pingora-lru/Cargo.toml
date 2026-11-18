@@ -32,14 +32,5 @@ lru = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
-[[bench]]
-name = "bench_linked_list"
-harness = false
 
-[[bench]]
-name = "bench_lru"
-harness = false
 
-[[bench]]
-name = "bench_async_lru"
-harness = false
