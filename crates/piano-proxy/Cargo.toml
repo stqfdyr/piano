@@ -1,0 +1,22 @@
+[package]
+name = "piano-proxy"
+description = "The ProxyHttp implementation: routing and request/response policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+http.workspace = true
+log.workspace = true
+piano-config.workspace = true
+piano-upstream.workspace = true
+pingora-core.workspace = true
+pingora-error.workspace = true
+pingora-http.workspace = true
+pingora-proxy.workspace = true
+
+[lints]
+workspace = true

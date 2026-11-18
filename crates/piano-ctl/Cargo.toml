@@ -1,0 +1,13 @@
+[package]
+name = "piano-ctl"
+description = "Control protocol between the CLI and the daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

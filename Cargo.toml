@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests", "xtask"]
+exclude = ["third_party/pingora"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+piano-config = { path = "crates/piano-config" }
+piano-edge = { path = "crates/piano-edge" }
+piano-proxy = { path = "crates/piano-proxy" }
+piano-telemetry = { path = "crates/piano-telemetry" }
+piano-upstream = { path = "crates/piano-upstream" }
+piano = { path = "crates/piano" }
+
+# Trimmed fork; see third_party/pingora/PATCHES.md.
+pingora-core = { path = "third_party/pingora/pingora-core", default-features = false, features = ["rustls", "connection_filter"] }
+pingora-proxy = { path = "third_party/pingora/pingora-proxy", default-features = false, features = ["rustls", "connection_filter"] }
+pingora-error = { path = "third_party/pingora/pingora-error" }
+pingora-http = { path = "third_party/pingora/pingora-http" }
+
+async-trait = "0.1"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+http = "1"
+log = { version = "0.4", features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tikv-jemallocator = "0.6"
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+
+# Test-only.
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "http2"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "time", "sync", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,27 @@
+[package]
+name = "piano"
+description = "Emby relay: daemon and command-line tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+http.workspace = true
+log.workspace = true
+piano-config.workspace = true
+piano-edge.workspace = true
+piano-proxy.workspace = true
+piano-telemetry.workspace = true
+piano-upstream.workspace = true
+pingora-core.workspace = true
+pingora-proxy.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator.workspace = true
+
+[lints]
+workspace = true

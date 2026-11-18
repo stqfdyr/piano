@@ -1,0 +1,23 @@
+[package]
+name = "piano-upstream"
+description = "Upstream side: name resolution, origins and TLS client setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+log.workspace = true
+piano-config.workspace = true
+pingora-core.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+thiserror.workspace = true
+
+[features]
+# Lets tests map host names to loopback addresses. Never enabled in release builds.
+test-support = []
+
+[lints]
+workspace = true
