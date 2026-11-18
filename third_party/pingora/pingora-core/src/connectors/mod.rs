@@ -117,6 +117,15 @@ pub struct ConnectorOptions {
     /// Optional callback for observing how long upstream connections stayed idle
     /// before leaving the keep-alive pool without reuse.
     pub keepalive_pool_callback: Option<PoolCallback>,
+    /// A prebuilt rustls client config and the root store it trusts.
+    ///
+    /// When set, `ca_file`, `cert_key_file` and `debug_ssl_keylog` are ignored. The root
+    /// store backs per-peer verification overrides, so it must be the one the config uses.
+    #[cfg(feature = "rustls")]
+    pub rustls_client_config: Option<(
+        Arc<pingora_rustls::ClientConfig>,
+        Arc<pingora_rustls::RootCertStore>,
+    )>,
 }
 
 impl ConnectorOptions {
@@ -155,6 +164,8 @@ impl ConnectorOptions {
             bind_to_v4,
             bind_to_v6,
             keepalive_pool_callback: None,
+            #[cfg(feature = "rustls")]
+            rustls_client_config: None,
         }
     }
 
@@ -172,6 +183,8 @@ impl ConnectorOptions {
             bind_to_v4: vec![],
             bind_to_v6: vec![],
             keepalive_pool_callback: None,
+            #[cfg(feature = "rustls")]
+            rustls_client_config: None,
         }
     }
 }

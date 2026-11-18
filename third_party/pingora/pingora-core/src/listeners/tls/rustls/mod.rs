@@ -38,6 +38,7 @@ pub struct TlsSettings {
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     callbacks: Option<TlsAcceptCallbacks>,
     offload_threadpool: Option<(usize, usize)>,
+    server_config: Option<Arc<ServerConfig>>,
 }
 
 pub struct Acceptor {
@@ -57,6 +58,17 @@ impl TlsSettings {
     pub fn build(self) -> Acceptor {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
+
+        let offload = self.offload_threadpool.map(|(shards, threads_per_shard)| {
+            OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
+        });
+        if let Some(config) = self.server_config {
+            return Acceptor {
+                acceptor: RusTlsAcceptor::from(config),
+                callbacks: self.callbacks.map(SharedTlsAcceptCallbacks::from),
+                offload,
+            };
+        }
 
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
@@ -98,9 +110,25 @@ impl TlsSettings {
         Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
             callbacks: self.callbacks.map(SharedTlsAcceptCallbacks::from),
-            offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
-                OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
-            }),
+            offload,
+        }
+    }
+
+    /// Create [`TlsSettings`] from a prebuilt rustls [`ServerConfig`].
+    ///
+    /// The config is used as is: certificate resolution, ALPN, session resumption and
+    /// client authentication all come from it, and the other setters that shape the
+    /// config have no effect. Callbacks and handshake offload still apply.
+    pub fn with_server_config(config: Arc<ServerConfig>) -> Self {
+        TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            cert_resolver: None,
+            client_cert_verifier: None,
+            callbacks: None,
+            offload_threadpool: None,
+            server_config: Some(config),
         }
     }
 
@@ -200,6 +228,7 @@ impl TlsSettings {
             client_cert_verifier: None,
             callbacks: None,
             offload_threadpool: None,
+            server_config: None,
         })
     }
 
@@ -220,6 +249,7 @@ impl TlsSettings {
             client_cert_verifier: None,
             callbacks: Some(callbacks),
             offload_threadpool: None,
+            server_config: None,
         })
     }
 }

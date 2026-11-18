@@ -64,6 +64,15 @@ impl TlsConnector {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
 
+        if let Some((config, ca_certs)) = options
+            .as_ref()
+            .and_then(|o| o.rustls_client_config.clone())
+        {
+            return Ok(Connector {
+                ctx: Arc::new(TlsConnector { config, ca_certs }),
+            });
+        }
+
         // NOTE: Rustls only supports TLS 1.2 & 1.3
 
         // TODO: currently using Rustls defaults
