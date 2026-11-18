@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+[env]
+# One jemalloc arena: the daemon runs one worker per core on small hosts, and the
+# default of four arenas per CPU multiplies idle RSS.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "narenas:1"
