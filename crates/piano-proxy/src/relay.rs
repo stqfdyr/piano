@@ -285,15 +285,17 @@ impl ProxyHttp for Relay {
                 }
             }
         }
-        session
-            .as_downstream_mut()
-            .set_write_timeout(Some(ctx.class.downstream_write_timeout()));
+        let downstream = session.as_downstream_mut();
+        downstream.set_write_timeout(Some(ctx.class.downstream_write_timeout()));
+        if let Some(t) = ctx.class.idle_read_timeout() {
+            downstream.set_read_timeout(Some(t));
+        }
         Ok(false)
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         let site = ctx.site()?;
-        let (peer, addrs, addr) = match &ctx.hop {
+        let (mut peer, addrs, addr) = match &ctx.hop {
             None => {
                 let addr = site.origin.addrs.current();
                 let peer = site.origin.peer(addr)?;
@@ -319,6 +321,10 @@ impl ProxyHttp for Relay {
                 (origin.peer(addr)?, origin.addrs, addr)
             }
         };
+        if let Some(t) = ctx.class.idle_read_timeout() {
+            peer.options.read_timeout = Some(t);
+            peer.options.write_timeout = Some(t);
+        }
         ctx.attempt = Some(Attempt { addrs, addr });
         Ok(Box::new(peer))
     }

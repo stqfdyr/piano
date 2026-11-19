@@ -17,6 +17,8 @@
 //!   `pad=N` adds N bytes of padding; `gzip=1` compresses the body whatever the
 //!   request accepts.
 //! - `/System/Ext/ServerDomains`: the origin's name and `alias.example.net`.
+//! - `/embywebsocket`: with `Upgrade: websocket`, 101 and then every byte echoed back
+//!   (no websocket framing); without, 400.
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
 //!   single-range `Range` support; stands in for a media file.
 //! - anything else: 404.
@@ -141,7 +143,7 @@ impl Origin {
                         handle(req, Arc::clone(&seqs))
                     });
                     let _ = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(tls), service)
+                        .serve_connection_with_upgrades(TokioIo::new(tls), service)
                         .await;
                 });
             }
@@ -169,7 +171,10 @@ fn full(body: impl Into<Bytes>) -> ResBody {
     Full::new(body.into()).boxed()
 }
 
-async fn handle(req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>, Infallible> {
+async fn handle(mut req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>, Infallible> {
+    if req.uri().path().eq_ignore_ascii_case("/embywebsocket") {
+        return Ok(websocket(&mut req));
+    }
     let path = req.uri().path();
     let response = if path.eq_ignore_ascii_case("/System/Info/Public")
         || path.eq_ignore_ascii_case("/emby/System/Info/Public")
@@ -284,6 +289,35 @@ async fn handle(req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>,
             .body(full(Bytes::new()))
     };
     Ok(response.unwrap())
+}
+
+/// Answers an upgrade request with 101 and echoes the upgraded stream.
+fn websocket(req: &mut Request<Incoming>) -> Response<ResBody> {
+    let wants = req
+        .headers()
+        .get("upgrade")
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if !wants {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(full(Bytes::new()))
+            .unwrap();
+    }
+    let upgrade = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        let Ok(upgraded) = upgrade.await else {
+            return;
+        };
+        let (mut rd, mut wr) = tokio::io::split(TokioIo::new(upgraded));
+        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        .body(full(Bytes::new()))
+        .unwrap()
 }
 
 pub fn gzip(data: &[u8]) -> Vec<u8> {

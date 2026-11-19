@@ -23,6 +23,10 @@ pub enum RouteClass {
     Local,
 }
 
+/// Longest silence on a websocket in either direction; clients send keep-alive
+/// messages well within it.
+const SOCKET_IDLE: Duration = Duration::from_secs(600);
+
 impl RouteClass {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -41,8 +45,18 @@ impl RouteClass {
     pub fn downstream_write_timeout(self) -> Duration {
         match self {
             Self::Media => Duration::from_secs(300),
-            Self::Socket => Duration::from_secs(600),
+            Self::Socket => SOCKET_IDLE,
             _ => Duration::from_secs(60),
+        }
+    }
+
+    /// Longest wait for the next bytes from the client and from the upstream, where the
+    /// defaults (60 s downstream, `upstream.read_timeout` upstream) would cut off a
+    /// legitimately quiet connection. They also apply after an upgrade.
+    pub fn idle_read_timeout(self) -> Option<Duration> {
+        match self {
+            Self::Socket => Some(SOCKET_IDLE),
+            _ => None,
         }
     }
 }

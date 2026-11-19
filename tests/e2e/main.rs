@@ -8,6 +8,7 @@ mod headers;
 mod retry;
 mod rewrite;
 mod routing;
+mod socket;
 
 use piano_e2e::client::{Proto, client, connect};
 use piano_e2e::origin::{INFO_PUBLIC, Origin, pattern_byte};
