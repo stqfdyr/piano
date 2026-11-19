@@ -1514,9 +1514,11 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "bytes",
  "http",
  "log",
  "piano-config",
+ "piano-edge",
  "piano-upstream",
  "pingora-core",
  "pingora-error",

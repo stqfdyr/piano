@@ -23,6 +23,8 @@ pub struct RelaySetup<'a> {
     pub allow: &'a [&'a str],
     /// Public hosts, each relayed to the fake origin.
     pub hosts: &'a [&'a str],
+    /// `block` entries for every site.
+    pub block: &'a [&'a str],
 }
 
 pub struct Relay {
@@ -57,12 +59,14 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         .map(|(i, pem)| format!("{:?}", dir.write(&format!("root{i}.pem"), pem)))
         .collect();
     let allow: Vec<String> = setup.allow.iter().map(|a| format!("{a:?}")).collect();
+    let block: Vec<String> = setup.block.iter().map(|b| format!("{b:?}")).collect();
+    let block = block.join(", ");
     let sites: String = setup
         .hosts
         .iter()
         .map(|h| {
             format!(
-                "[[site]]\nhost = \"{h}\"\nupstream = \"https://{ORIGIN_HOST}:{}\"\n",
+                "[[site]]\nhost = \"{h}\"\nupstream = \"https://{ORIGIN_HOST}:{}\"\nblock = [{block}]\n",
                 setup.origin_port
             )
         })

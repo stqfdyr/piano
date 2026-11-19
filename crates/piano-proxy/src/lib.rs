@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod relay;
+pub mod route;
 mod sites;
 
 pub use relay::{Ctx, Relay};

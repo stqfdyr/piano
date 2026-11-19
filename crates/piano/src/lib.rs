@@ -7,7 +7,8 @@ mod reload;
 use arc_swap::ArcSwap;
 use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
-use piano_edge::tls::{CertStore, SniTable};
+use piano_edge::tls::{CertStore, SniRecorder, SniTable};
+use piano_proxy::route::BlockList;
 use piano_proxy::{Relay, Site, Sites};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::connectors::ConnectorOptions;
@@ -134,7 +135,8 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     service.set_runtime_group(RUNTIME_GROUP);
     service.set_connection_filter(Arc::clone(&access) as _);
     for addr in &config.server.listen {
-        let tls = TlsSettings::with_server_config(Arc::clone(&server_tls));
+        let mut tls = TlsSettings::with_server_config(Arc::clone(&server_tls));
+        tls.set_callbacks(Box::new(SniRecorder));
         service.add_tls_with_settings(addr, None, tls);
     }
     server.add_service(service);
@@ -202,12 +204,14 @@ fn build_sites(
             addr,
             options,
         };
-        let s = Site::new(site.name.clone(), site.host.clone(), origin).map_err(|source| {
-            Error::Site {
-                site: site.name.clone(),
-                source,
-            }
-        })?;
+        let block = BlockList::new(&site.block);
+        let s =
+            Site::new(site.name.clone(), site.host.clone(), origin, block).map_err(|source| {
+                Error::Site {
+                    site: site.name.clone(),
+                    source,
+                }
+            })?;
         sites.push(s);
     }
     Ok(Sites::new(sites))

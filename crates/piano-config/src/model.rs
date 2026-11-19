@@ -89,6 +89,10 @@ pub struct Site {
     pub name: String,
     pub host: String,
     pub upstream: String,
+    /// Path prefixes answered with 404 instead of being relayed. Matching ignores ASCII
+    /// case and an optional leading `/emby`.
+    #[serde(default)]
+    pub block: Vec<String>,
     /// Parsed form of `upstream`, filled in by validation.
     #[serde(skip)]
     pub upstream_url: Option<UpstreamUrl>,

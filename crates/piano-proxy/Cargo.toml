@@ -10,9 +10,11 @@ publish.workspace = true
 [dependencies]
 arc-swap.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 http.workspace = true
 log.workspace = true
 piano-config.workspace = true
+piano-edge.workspace = true
 piano-upstream.workspace = true
 pingora-core.workspace = true
 pingora-error.workspace = true

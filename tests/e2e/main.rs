@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod access;
+mod routing;
 
 use piano_e2e::client::{Proto, client, connect};
 use piano_e2e::origin::{INFO_PUBLIC, Origin, pattern_byte};
@@ -35,6 +36,7 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         origin_port: origin.addr.port(),
         allow: &["127.0.0.1"],
         hosts: &[SITE_HOST],
+        block: &[],
     });
     World { ca, origin, relay }
 }

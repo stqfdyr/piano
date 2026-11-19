@@ -1,12 +1,15 @@
 //! The `ProxyHttp` implementation.
 
+use crate::route::{self, HEALTH_PATH, RouteClass};
 use crate::{Site, Sites};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use http::header::HOST;
+use bytes::Bytes;
+use http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use piano_edge::tls::Sni;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
-use pingora_http::RequestHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use std::sync::Arc;
 
@@ -16,6 +19,7 @@ pub struct Ctx {
     /// The site table taken when the request started; a reload does not change it.
     sites: Option<Arc<Sites>>,
     site: usize,
+    pub class: RouteClass,
 }
 
 impl Ctx {
@@ -46,6 +50,25 @@ fn request_authority(req: &RequestHeader) -> Option<&[u8]> {
         .or_else(|| req.headers.get(HOST).map(|v| v.as_bytes()))
 }
 
+/// The SNI name recorded on the connection, if any.
+fn sni(session: &Session) -> Option<&str> {
+    let digest = session.as_downstream().digest()?.ssl_digest.as_ref()?;
+    digest.extension.get::<Sni>().map(|s| s.0.as_str())
+}
+
+/// Answers locally with a small text body. Unlike `respond_error`, the connection
+/// stays open for further requests.
+async fn respond_local(session: &mut Session, status: u16, body: &'static [u8]) -> Result<()> {
+    let mut resp = ResponseHeader::build(status, Some(3))?;
+    resp.insert_header(CONTENT_TYPE, "text/plain")?;
+    resp.insert_header(CONTENT_LENGTH, body.len())?;
+    resp.insert_header(CACHE_CONTROL, "no-store")?;
+    session.write_response_header(Box::new(resp), false).await?;
+    session
+        .write_response_body(Some(Bytes::from_static(body)), true)
+        .await
+}
+
 #[async_trait]
 impl ProxyHttp for Relay {
     type CTX = Ctx;
@@ -56,17 +79,37 @@ impl ProxyHttp for Relay {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let sites = self.sites.load_full();
-        match request_authority(session.req_header()).and_then(|a| sites.find(a)) {
-            Some(i) => {
-                ctx.sites = Some(sites);
-                ctx.site = i;
-                Ok(false)
-            }
-            None => {
-                session.respond_error(421).await?;
-                Ok(true)
-            }
+        let Some(index) = request_authority(session.req_header()).and_then(|a| sites.find(a))
+        else {
+            session.respond_error(421).await?;
+            return Ok(true);
+        };
+        // A connection is bound to the site it was opened for: a certificate covering
+        // several sites must not let one site's connection reach another.
+        if sni(session).is_some_and(|name| sites.find(name.as_bytes()) != Some(index)) {
+            session.respond_error(421).await?;
+            return Ok(true);
         }
+        ctx.sites = Some(Arc::clone(&sites));
+        ctx.site = index;
+        let site = ctx.site()?;
+
+        let path = session.req_header().uri.path();
+        if path == HEALTH_PATH {
+            ctx.class = RouteClass::Local;
+            respond_local(session, 200, b"ok\n").await?;
+            return Ok(true);
+        }
+        if site.block.blocks(path) {
+            ctx.class = RouteClass::Local;
+            respond_local(session, 404, b"").await?;
+            return Ok(true);
+        }
+        ctx.class = route::classify(path);
+        session
+            .as_downstream_mut()
+            .set_write_timeout(Some(ctx.class.downstream_write_timeout()));
+        Ok(false)
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {

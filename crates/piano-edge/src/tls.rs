@@ -5,13 +5,17 @@
 //! scanners probing by IP never see which names this host serves.
 
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use piano_config::Config;
+use pingora_core::listeners::TlsAccept;
+use pingora_core::protocols::tls::TlsRef;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, version};
+use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,6 +49,27 @@ pub enum Error {
     },
     #[error("TLS setup failed: {0}")]
     Rustls(#[from] rustls::Error),
+}
+
+/// The server name a client sent in its ClientHello, lowercased. Attached to every
+/// accepted connection's TLS digest by [`SniRecorder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sni(pub String);
+
+/// Handshake callback that records the SNI name on the connection, so the HTTP layer can
+/// check that a request's host belongs to the same site.
+#[derive(Debug)]
+pub struct SniRecorder;
+
+#[async_trait]
+impl TlsAccept for SniRecorder {
+    async fn handshake_complete_callback(
+        &self,
+        tls: &TlsRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        let name = tls.server_name()?.to_ascii_lowercase();
+        Some(Arc::new(Sni(name)))
+    }
 }
 
 /// Certificates by SNI name, loaded from the files named in a configuration.

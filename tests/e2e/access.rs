@@ -28,6 +28,7 @@ async fn refused_addresses_are_closed_before_the_handshake() {
         origin_port: origin.addr.port(),
         allow: &["192.0.2.1", "2001:db8::/32"],
         hosts: &[SITE_HOST],
+        block: &[],
     });
     let err = get(&ca, &relay, SITE_HOST).await.unwrap_err();
     assert!(err.is_connect(), "{err:?}");
@@ -47,6 +48,7 @@ async fn reload_replaces_access_certificates_and_sites() {
         origin_port: origin.addr.port(),
         allow: &["192.0.2.1"],
         hosts: &[SITE_HOST],
+        block: &[],
     });
     assert!(get(&old_ca, &relay, SITE_HOST).await.is_err());
 
@@ -57,6 +59,7 @@ async fn reload_replaces_access_certificates_and_sites() {
             origin_port: origin.addr.port(),
             allow: &["127.0.0.0/8"],
             hosts: &[SITE_HOST, OTHER_HOST],
+            block: &[],
         })
         .unwrap();
     assert!(restart.is_empty(), "{restart:?}");
@@ -82,6 +85,7 @@ async fn failed_reload_keeps_the_running_configuration() {
         origin_port: origin.addr.port(),
         allow: &["127.0.0.1"],
         hosts: &[SITE_HOST],
+        block: &[],
     };
     let relay = Relay::start(&setup);
 

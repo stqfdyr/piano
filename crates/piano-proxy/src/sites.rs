@@ -1,5 +1,6 @@
 //! Site lookup by request host.
 
+use crate::route::BlockList;
 use http::HeaderValue;
 use piano_upstream::Origin;
 
@@ -11,6 +12,7 @@ pub struct Site {
     pub origin: Origin,
     /// Precomputed upstream `Host` header value.
     pub upstream_host: HeaderValue,
+    pub block: BlockList,
 }
 
 impl Site {
@@ -18,6 +20,7 @@ impl Site {
         name: String,
         host: String,
         origin: Origin,
+        block: BlockList,
     ) -> Result<Self, http::header::InvalidHeaderValue> {
         let upstream_host = HeaderValue::from_str(&origin.authority())?;
         Ok(Self {
@@ -25,6 +28,7 @@ impl Site {
             host,
             origin,
             upstream_host,
+            block,
         })
     }
 }
@@ -84,7 +88,7 @@ mod tests {
                 idle_timeout: d,
             },
         };
-        Site::new(host.into(), host.into(), origin).unwrap()
+        Site::new(host.into(), host.into(), origin, BlockList::default()).unwrap()
     }
 
     #[test]

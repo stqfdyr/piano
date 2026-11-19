@@ -19,6 +19,8 @@ pub enum ValidationError {
     DuplicateHost(String),
     #[error("site name {0:?} is used by more than one site")]
     DuplicateName(String),
+    #[error("site {site:?}: block entry {path:?} must start with / and have no query")]
+    BadBlock { site: String, path: String },
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
         site: String,
@@ -138,6 +140,14 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
         }
         if !names.insert(site.name.clone()) {
             errors.push(ValidationError::DuplicateName(site.name.clone()));
+        }
+        for path in &site.block {
+            if !path.starts_with('/') || path.contains(['?', '#']) {
+                errors.push(ValidationError::BadBlock {
+                    site: site.name.clone(),
+                    path: path.clone(),
+                });
+            }
         }
         match UpstreamUrl::parse(&site.upstream) {
             Ok(origin) => site.upstream_url = Some(origin),
