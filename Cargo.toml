@@ -24,6 +24,8 @@ pingora-proxy = { path = "third_party/pingora/pingora-proxy", default-features =
 pingora-error = { path = "third_party/pingora/pingora-error" }
 pingora-http = { path = "third_party/pingora/pingora-http" }
 
+# Atomically replaced configuration snapshots (sites, ACL, certificates).
+arc-swap = "1"
 async-trait = "0.1"
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 http = "1"

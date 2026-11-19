@@ -44,6 +44,10 @@ impl Sites {
         self.sites.get(index)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Site> {
+        self.sites.iter()
+    }
+
     /// Finds the site for a `Host` header or `:authority` value. Matching ignores ASCII
     /// case, a trailing dot and any port.
     pub fn find(&self, authority: &[u8]) -> Option<usize> {

@@ -30,12 +30,19 @@ The release binary is built for `x86_64-unknown-linux-musl` with
 cert = "/etc/letsencrypt/live/media.example.com/fullchain.pem"
 key  = "/etc/letsencrypt/live/media.example.com/privkey.pem"
 
+[access]
+allow = ["203.0.113.7", "2001:db8:1:2::/64"]
+
 [[site]]
 host     = "media.example.com"
 upstream = "https://emby.example.net"
 ```
 
 - `listen` defaults to `[::]:443`.
+- `access.allow` lists the client addresses and networks that may connect; anyone else
+  is disconnected before the TLS handshake. It must not be empty: to serve every
+  address, write `allow = ["0.0.0.0/0", "::/0"]` (`config check` warns about it).
+  IPv4 clients of a dual-stack listener match IPv4 entries.
 - The certificate must cover every site host. Connections without SNI, or for a host
   that is not a site, are refused during the TLS handshake.
 - Upstreams must be `https://` with a DNS name; certificate verification is always on.
@@ -50,7 +57,13 @@ piano run              # run in the foreground (for systemd or OpenRC)
 piano version
 ```
 
-Exit codes: 0 success, 1 runtime error, 2 usage or configuration error.
+Send `SIGHUP` to reload the configuration file: certificates, the allow list and sites
+are replaced together, or not at all if the new file has an error (the error is
+logged). Requests in progress finish with the configuration they started with.
+Changes to `server` settings and `upstream.extra_roots` need a restart.
+
+Exit codes: 0 success, 1 runtime error, 2 usage or configuration error, 3 `config
+check` passed with warnings.
 
 ## License
 

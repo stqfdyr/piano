@@ -1,6 +1,7 @@
 //! The `ProxyHttp` implementation.
 
-use crate::Sites;
+use crate::{Site, Sites};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use http::header::HOST;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -12,17 +13,28 @@ use std::sync::Arc;
 /// Per-request state; one per HTTP/2 stream or HTTP/1 request.
 #[derive(Debug, Default)]
 pub struct Ctx {
-    site: Option<usize>,
+    /// The site table taken when the request started; a reload does not change it.
+    sites: Option<Arc<Sites>>,
+    site: usize,
+}
+
+impl Ctx {
+    fn site(&self) -> Result<&Site> {
+        self.sites
+            .as_deref()
+            .and_then(|s| s.get(self.site))
+            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no site selected"))
+    }
 }
 
 /// Relays each request to the origin of the site named by its host.
 #[derive(Debug)]
 pub struct Relay {
-    sites: Arc<Sites>,
+    sites: Arc<ArcSwap<Sites>>,
 }
 
 impl Relay {
-    pub fn new(sites: Arc<Sites>) -> Self {
+    pub fn new(sites: Arc<ArcSwap<Sites>>) -> Self {
         Self { sites }
     }
 }
@@ -43,20 +55,22 @@ impl ProxyHttp for Relay {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
-        ctx.site = request_authority(session.req_header()).and_then(|a| self.sites.find(a));
-        if ctx.site.is_none() {
-            session.respond_error(421).await?;
-            return Ok(true);
+        let sites = self.sites.load_full();
+        match request_authority(session.req_header()).and_then(|a| sites.find(a)) {
+            Some(i) => {
+                ctx.sites = Some(sites);
+                ctx.site = i;
+                Ok(false)
+            }
+            None => {
+                session.respond_error(421).await?;
+                Ok(true)
+            }
         }
-        Ok(false)
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
-        let site = ctx
-            .site
-            .and_then(|i| self.sites.get(i))
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no site selected"))?;
-        Ok(Box::new(site.origin.peer()?))
+        Ok(Box::new(ctx.site()?.origin.peer()?))
     }
 
     async fn upstream_request_filter(
@@ -65,11 +79,7 @@ impl ProxyHttp for Relay {
         upstream_request: &mut RequestHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        let site = ctx
-            .site
-            .and_then(|i| self.sites.get(i))
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no site selected"))?;
-        upstream_request.insert_header(HOST, site.upstream_host.clone())?;
+        upstream_request.insert_header(HOST, ctx.site()?.upstream_host.clone())?;
         Ok(())
     }
 }

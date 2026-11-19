@@ -15,6 +15,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod exit {
     pub const RUNTIME: u8 = 1;
     pub const CONFIG: u8 = 2;
+    pub const WARNINGS: u8 = 3;
 }
 
 #[derive(Parser)]
@@ -93,7 +94,7 @@ fn config_check(path: &std::path::Path) -> ExitCode {
             return ExitCode::from(exit::CONFIG);
         }
     };
-    if let Err(e) = piano_edge::tls::server_config(&config) {
+    if let Err(e) = piano_edge::tls::SniTable::load(&config) {
         eprintln!("{e}");
         return ExitCode::from(exit::CONFIG);
     }
@@ -101,8 +102,16 @@ fn config_check(path: &std::path::Path) -> ExitCode {
         eprintln!("{e}");
         return ExitCode::from(exit::CONFIG);
     }
+    let warnings = config.warnings();
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
     println!("{}: ok ({} sites)", path.display(), config.sites.len());
-    ExitCode::SUCCESS
+    if warnings.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(exit::WARNINGS)
+    }
 }
 
 fn run(path: &std::path::Path) -> ExitCode {
@@ -113,13 +122,17 @@ fn run(path: &std::path::Path) -> ExitCode {
             return ExitCode::from(exit::CONFIG);
         }
     };
-    let server = match piano::build_server(&config, &Resolver::system()) {
-        Ok(s) => s,
+    for w in config.warnings() {
+        log::warn!("{w}");
+    }
+    let piano::Daemon { mut server, live } = match piano::build(&config, Resolver::system()) {
+        Ok(d) => d,
         Err(e) => {
             log::error!("{e}");
             return ExitCode::from(exit::CONFIG);
         }
     };
+    server.add_service(piano::Reloader::new(live, path.to_owned()));
     log::info!(
         "piano {} serving {} sites on {}",
         env!("CARGO_PKG_VERSION"),

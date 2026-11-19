@@ -8,6 +8,11 @@ pub enum ValidationError {
     NoListen,
     #[error("no [[site]] configured")]
     NoSites,
+    #[error(
+        "access.allow is empty; list the client addresses, or write \
+         allow = [\"0.0.0.0/0\", \"::/0\"] to serve everyone"
+    )]
+    NoAccess,
     #[error("site {site:?}: host {host:?} is not a valid lowercase DNS name")]
     BadHost { site: String, host: String },
     #[error("host {0:?} is used by more than one site")]
@@ -20,6 +25,24 @@ pub enum ValidationError {
         url: String,
         reason: &'static str,
     },
+}
+
+/// Something valid but probably unintended.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Warning {
+    #[error("access.allow contains {0}: every address of that family may connect")]
+    OpenAccess(crate::IpNet),
+}
+
+/// Warnings for a configuration that passed validation.
+pub fn warnings(config: &Config) -> Vec<Warning> {
+    config
+        .access
+        .allow
+        .iter()
+        .filter(|n| n.is_everything())
+        .map(|n| Warning::OpenAccess(*n))
+        .collect()
 }
 
 /// A parsed upstream URL: always https, always a DNS name.
@@ -95,6 +118,9 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     if config.sites.is_empty() {
         errors.push(ValidationError::NoSites);
     }
+    if config.access.allow.is_empty() {
+        errors.push(ValidationError::NoAccess);
+    }
     let mut hosts = HashSet::new();
     let mut names = HashSet::new();
     for site in &mut config.sites {
@@ -138,6 +164,9 @@ mod tests {
         [tls]
         cert = "/etc/piano/fullchain.pem"
         key  = "/etc/piano/privkey.pem"
+
+        [access]
+        allow = ["192.0.2.7", "2001:db8:1:2::/64"]
 
         [[site]]
         host     = "media.example.com"
@@ -217,8 +246,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_sites_is_an_error() {
+    fn empty_sites_and_access_are_errors() {
         let text = "[tls]\ncert = \"a\"\nkey = \"b\"\n";
-        assert_eq!(errors(text), [ValidationError::NoSites]);
+        assert_eq!(
+            errors(text),
+            [ValidationError::NoSites, ValidationError::NoAccess]
+        );
+    }
+
+    #[test]
+    fn open_access_is_a_warning() {
+        let c = parse(MINIMAL).unwrap();
+        assert!(c.warnings().is_empty());
+        let text = MINIMAL.replace(
+            r#"allow = ["192.0.2.7", "2001:db8:1:2::/64"]"#,
+            r#"allow = ["0.0.0.0/0", "::/0"]"#,
+        );
+        let c = parse(&text).unwrap();
+        assert_eq!(c.warnings().len(), 2);
+    }
+
+    #[test]
+    fn bad_networks_fail_parsing() {
+        let text = MINIMAL.replace(r#""192.0.2.7""#, r#""192.0.2.7/24""#);
+        assert!(matches!(parse(&text), Err(Error::Parse { .. })));
     }
 }

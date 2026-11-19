@@ -7,11 +7,13 @@
 
 mod duration;
 mod model;
+mod net;
 mod validate;
 
 pub use duration::{Duration, ParseDurationError};
-pub use model::{Config, Server, Site, Tls, Upstream};
-pub use validate::{UpstreamUrl, ValidationError};
+pub use model::{Access, Config, Server, Site, Tls, Upstream};
+pub use net::{IpNet, ParseIpNetError};
+pub use validate::{UpstreamUrl, ValidationError, Warning};
 
 use std::path::Path;
 

@@ -4,11 +4,12 @@
 //! without SNI, or for a name that is not a site, finds no certificate and fails, so
 //! scanners probing by IP never see which names this host serves.
 
+use arc_swap::ArcSwap;
 use piano_config::Config;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::ResolvesServerCertUsingSni;
+use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, version};
 use std::path::{Path, PathBuf};
@@ -46,9 +47,55 @@ pub enum Error {
     Rustls(#[from] rustls::Error),
 }
 
-/// Builds the downstream `ServerConfig` for all sites in `config`.
-pub fn server_config(config: &Config) -> Result<Arc<ServerConfig>, Error> {
-    let provider = Arc::new(default_provider());
+/// Certificates by SNI name, loaded from the files named in a configuration.
+#[derive(Debug)]
+pub struct SniTable(ResolvesServerCertUsingSni);
+
+impl SniTable {
+    /// Loads the certificate and maps every site host to it; fails if it does not cover
+    /// one of them.
+    pub fn load(config: &Config) -> Result<Self, Error> {
+        sni_table(config).map(Self)
+    }
+}
+
+/// The certificate table in use, replaced as a whole on reload. A handshake uses the
+/// table that was current when its ClientHello arrived.
+#[derive(Debug)]
+pub struct CertStore {
+    table: ArcSwap<SniTable>,
+}
+
+impl CertStore {
+    pub fn new(table: SniTable) -> Self {
+        Self {
+            table: ArcSwap::from_pointee(table),
+        }
+    }
+
+    pub fn replace(&self, table: SniTable) {
+        self.table.store(Arc::new(table));
+    }
+}
+
+impl ResolvesServerCert for CertStore {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.table.load().0.resolve(hello)
+    }
+}
+
+/// Builds the downstream `ServerConfig` around `certs`.
+pub fn server_config(certs: Arc<CertStore>) -> Result<Arc<ServerConfig>, Error> {
+    let mut server = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_protocol_versions(&[&version::TLS13, &version::TLS12])?
+        .with_no_client_auth()
+        .with_cert_resolver(certs);
+    server.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(server))
+}
+
+fn sni_table(config: &Config) -> Result<ResolvesServerCertUsingSni, Error> {
+    let provider = default_provider();
     let key = load_certified_key(&config.tls.cert, &config.tls.key, &provider)?;
     let mut resolver = ResolvesServerCertUsingSni::new();
     for site in &config.sites {
@@ -60,12 +107,7 @@ pub fn server_config(config: &Config) -> Result<Arc<ServerConfig>, Error> {
                 source,
             })?;
     }
-    let mut server = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&version::TLS13, &version::TLS12])?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
-    server.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(server))
+    Ok(resolver)
 }
 
 fn load_certified_key(

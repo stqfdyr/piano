@@ -1,4 +1,4 @@
-use crate::{Duration, UpstreamUrl};
+use crate::{Duration, IpNet, UpstreamUrl};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -11,6 +11,8 @@ pub struct Config {
     #[serde(default)]
     pub server: Server,
     pub tls: Tls,
+    #[serde(default)]
+    pub access: Access,
     #[serde(default)]
     pub upstream: Upstream,
     #[serde(default, rename = "site")]
@@ -43,6 +45,15 @@ impl Default for Server {
 pub struct Tls {
     pub cert: PathBuf,
     pub key: PathBuf,
+}
+
+/// Who may connect. Checked on the client address before the TLS handshake.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Access {
+    /// Addresses and networks allowed to connect. Must not be empty: serving everyone
+    /// has to be written out as `["0.0.0.0/0", "::/0"]`.
+    pub allow: Vec<IpNet>,
 }
 
 /// Defaults for every upstream connection.
@@ -81,4 +92,11 @@ pub struct Site {
     /// Parsed form of `upstream`, filled in by validation.
     #[serde(skip)]
     pub upstream_url: Option<UpstreamUrl>,
+}
+
+impl Config {
+    /// Problems that do not stop the configuration from being used.
+    pub fn warnings(&self) -> Vec<crate::Warning> {
+        crate::validate::warnings(self)
+    }
 }

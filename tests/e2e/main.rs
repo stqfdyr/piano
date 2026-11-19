@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod access;
+
 use piano_e2e::client::{Proto, client, connect};
 use piano_e2e::origin::{INFO_PUBLIC, Origin, pattern_byte};
 use piano_e2e::pki::Ca;
@@ -31,6 +33,8 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         site: &ca.leaf(&[SITE_HOST]),
         extra_roots: &roots,
         origin_port: origin.addr.port(),
+        allow: &["127.0.0.1"],
+        hosts: &[SITE_HOST],
     });
     World { ca, origin, relay }
 }
@@ -162,7 +166,7 @@ async fn large_bodies_stream_intact() {
 }
 
 /// Reads one HTTP/1.1 response with a `content-length` body.
-async fn read_response(io: &mut (impl AsyncRead + Unpin)) -> (String, Vec<u8>) {
+pub(crate) async fn read_response(io: &mut (impl AsyncRead + Unpin)) -> (String, Vec<u8>) {
     let mut buf = Vec::new();
     let head_end = loop {
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {

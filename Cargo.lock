@@ -103,6 +103,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1428,6 +1437,8 @@ dependencies = [
 name = "piano"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "async-trait",
  "clap",
  "http",
  "log",
@@ -1440,6 +1451,7 @@ dependencies = [
  "pingora-proxy",
  "thiserror 2.0.21",
  "tikv-jemallocator",
+ "tokio",
 ]
 
 [[package]]
@@ -1482,10 +1494,14 @@ dependencies = [
 name = "piano-edge"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "async-trait",
  "log",
  "piano-config",
+ "pingora-core",
  "rustls",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -1496,6 +1512,7 @@ version = "0.1.0"
 name = "piano-proxy"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "http",
  "log",
