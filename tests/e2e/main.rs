@@ -2,11 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use piano_e2e::client::{Proto, client};
+use piano_e2e::client::{Proto, client, connect};
 use piano_e2e::origin::{INFO_PUBLIC, Origin, pattern_byte};
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 struct World {
     ca: Ca,
@@ -157,4 +159,68 @@ async fn large_bodies_stream_intact() {
         }
         assert_eq!(offset, LEN, "{proto:?}");
     }
+}
+
+/// Reads one HTTP/1.1 response with a `content-length` body.
+async fn read_response(io: &mut (impl AsyncRead + Unpin)) -> (String, Vec<u8>) {
+    let mut buf = Vec::new();
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = io.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "connection closed inside the response header");
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8(buf[..head_end].to_vec()).unwrap();
+    let len: usize = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap())
+        })
+        .expect("content-length");
+    let mut body = buf.split_off(head_end);
+    while body.len() < len {
+        let mut chunk = [0u8; 4096];
+        let n = io.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "connection closed inside the body");
+        body.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(body.len(), len, "bytes beyond the body");
+    (head, body)
+}
+
+#[tokio::test]
+async fn keepalive_connection_serves_requests_in_turn() {
+    let w = world(None, true).await;
+    let mut io = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
+    for i in 0..3 {
+        // The second request has a header far larger than one small read and arrives
+        // in two pieces.
+        let pad = if i == 1 {
+            "a".repeat(3000)
+        } else {
+            String::new()
+        };
+        let req = format!(
+            "GET /emby/System/Info/Public HTTP/1.1\r\nhost: {SITE_HOST}\r\nx-pad: {pad}\r\n\r\n"
+        );
+        if i == 1 {
+            let (a, b) = req.as_bytes().split_at(10);
+            io.write_all(a).await.unwrap();
+            io.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            io.write_all(b).await.unwrap();
+        } else {
+            io.write_all(req.as_bytes()).await.unwrap();
+        }
+        io.flush().await.unwrap();
+        let (head, body) = read_response(&mut io).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "request {i}: {head}");
+        assert_eq!(body, INFO_PUBLIC.as_bytes(), "request {i}");
+    }
+    assert_eq!(w.origin.requests(), 3);
 }
