@@ -2167,7 +2167,9 @@ where
                 .on_connection_reuse(&mut session, &mut ctx, prev_ctx);
         }
 
-        self.process_request(session, ctx).await
+        // Boxed so that a connection waiting for its next request holds only the small
+        // request-reading state, not the state of the whole proxy pipeline.
+        Box::pin(self.process_request(session, ctx)).await
     }
 
     async fn http_cleanup(&self) {

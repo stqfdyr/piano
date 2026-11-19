@@ -45,6 +45,9 @@ use crate::protocols::http::{
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
+/// Size of the on-stack buffer for the first read of a request header.
+const FIRST_READ_SIZE: usize = 256;
+
 /// Tracks which writer is currently processing a task.
 ///
 /// This enables resuming writes after cancellation. Each variant stores the
@@ -215,9 +218,9 @@ impl HttpSession {
         }
     }
 
-    async fn read_request_buf(
+    async fn read_request_buf<B: BufMut + ?Sized>(
         &mut self,
-        buf: &mut BytesMut,
+        buf: &mut B,
         already_read: usize,
     ) -> Result<Option<usize>> {
         let read_result = {
@@ -302,11 +305,24 @@ impl HttpSession {
         // below tries to parse first when we already have pipelined bytes —
         // a pipelined prefix can contain a complete request header, in which
         // case we must NOT issue another stream read (which would block).
-        let mut buf = self
+        let mut buf = match self
             .pipelined_prefix
             .take()
             .filter(|prefix| !prefix.is_empty())
-            .unwrap_or_else(|| BytesMut::with_capacity(INIT_HEADER_BUF_SIZE));
+        {
+            Some(prefix) => prefix,
+            None => {
+                // The header buffer is allocated only once the first bytes arrive, so a
+                // keep-alive connection waiting for its next request does not hold it.
+                let mut first = [0u8; FIRST_READ_SIZE];
+                let Some(n) = self.read_request_buf(&mut &mut first[..], 0).await? else {
+                    return Ok(None);
+                };
+                let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
+                buf.extend_from_slice(&first[..n]);
+                buf
+            }
+        };
         let mut already_read = buf.len();
         let mut skip_next_read = already_read != 0;
         let mut detached_suffix = None;

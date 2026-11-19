@@ -316,11 +316,15 @@ impl HttpSession {
                         }
 
                         let buf = std::mem::take(&mut self.response_header_read_buf).freeze();
+                        // Header values get their own allocation: they can outlive the
+                        // response (an HTTP/2 downstream's HPACK table keeps them for the
+                        // connection), and slices of `buf` would pin the whole read buffer.
+                        let head = Bytes::copy_from_slice(&buf[..s]);
 
                         for header in header_refs {
-                            let header_name = header.get_name_bytes(&buf);
+                            let header_name = header.get_name_bytes(&head);
                             let header_name = header_name.into_case_header_name();
-                            let value_bytes = header.get_value_bytes(&buf);
+                            let value_bytes = header.get_value_bytes(&head);
                             let header_value = pingora_http::header_value_from_raw(value_bytes);
                             if let Err(e) = response_header
                                 .append_header(header_name, header_value)

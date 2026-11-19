@@ -328,7 +328,9 @@ where
             });
 
             let h2_options = self.h2_options();
-            let h2_conn = match server::handshake(stream, h2_options).await {
+            // The h2 futures are boxed so that HTTP/1.1 connections, which never take
+            // this branch, do not carry their size.
+            let h2_conn = match Box::pin(server::handshake(stream, h2_options)).await {
                 Err(e) => {
                     error!("H2 handshake error {e}");
                     return None;
@@ -342,7 +344,7 @@ where
             let app = self.clone();
             let shutdown_for_session = shutdown.clone();
             let h2_idle_timeout = self.server_options().and_then(|o| o.h2_idle_timeout);
-            server::accept_downstream_sessions(
+            Box::pin(server::accept_downstream_sessions(
                 h2_conn,
                 digest,
                 shutdown.clone(),
@@ -362,7 +364,7 @@ where
                         .await;
                     });
                 },
-            )
+            ))
             .await;
         } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
             return self.clone().process_custom_session(stream, shutdown).await;

@@ -276,7 +276,9 @@ where
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
                         let peer_addr = io.peer_addr();
-                        match io.handshake_with_limits().await {
+                        // Boxed so the handshake state is freed once it completes instead of
+                        // sizing the task for the whole life of the connection.
+                        match Box::pin(io.handshake_with_limits()).await {
                             Ok(io) => Self::handle_event(io, app, shutdown).await,
                             Err(HandshakeFailure::Skipped(reason)) => {
                                 debug!(
