@@ -10,10 +10,7 @@ const OTHER_HOST: &str = "other.example.com";
 
 async fn get(ca: &Ca, relay: &Relay, host: &str) -> reqwest::Result<reqwest::Response> {
     client(ca.cert_der(), host, relay.addr, Proto::H1)
-        .get(format!(
-            "https://{host}:{}/emby/System/Info/Public",
-            relay.addr.port()
-        ))
+        .get(format!("https://{host}:{}/__info", relay.addr.port()))
         .send()
         .await
 }

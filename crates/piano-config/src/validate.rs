@@ -422,6 +422,25 @@ mod tests {
     }
 
     #[test]
+    fn server_domains_modes() {
+        use crate::ServerDomains;
+        assert_eq!(
+            parse(MINIMAL).unwrap().sites[0].server_domains,
+            ServerDomains::Rewrite
+        );
+        for (value, mode) in [
+            ("rewrite", ServerDomains::Rewrite),
+            ("block", ServerDomains::Block),
+            ("pass", ServerDomains::Pass),
+        ] {
+            let text = format!("{MINIMAL}server_domains = \"{value}\"\n");
+            assert_eq!(parse(&text).unwrap().sites[0].server_domains, mode);
+        }
+        let text = format!("{MINIMAL}server_domains = \"drop\"\n");
+        assert!(matches!(parse(&text), Err(Error::Parse { .. })));
+    }
+
+    #[test]
     fn bad_networks_fail_parsing() {
         let text = MINIMAL.replace(r#""192.0.2.7""#, r#""192.0.2.7/24""#);
         assert!(matches!(parse(&text), Err(Error::Parse { .. })));

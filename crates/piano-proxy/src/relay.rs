@@ -2,6 +2,7 @@
 
 use crate::follow::{self, MAX_HOPS, Target, TargetKind};
 use crate::headers;
+use crate::rewrite::MAX_BODY;
 use crate::route::{self, HEALTH_PATH, RouteClass};
 use crate::{Site, Sites};
 use arc_swap::ArcSwap;
@@ -9,11 +10,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::Method;
 use http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    COOKIE, ETAG, HOST, LOCATION, TRANSFER_ENCODING,
 };
 use log::warn;
+use piano_config::ServerDomains;
 use piano_edge::tls::Sni;
 use piano_upstream::{AddrCache, Addrs, Origin, Resolver};
+use pingora_core::modules::http::compression::ResponseCompression;
+use pingora_core::protocols::http::compression::Algorithm;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -43,6 +48,11 @@ const FOLLOW: ErrorType = ErrorType::Custom("FollowRedirect");
 /// or 504.
 const STATUS_RETRY: ErrorType = ErrorType::Custom("UpstreamStatusRetry");
 
+/// Compression levels for rewritten bodies, which can no longer pass on the upstream's
+/// compressed bytes.
+const GZIP_LEVEL: u32 = 6;
+const BROTLI_LEVEL: u32 = 5;
+
 /// Client credentials, sent only to the upstream server itself.
 const CREDENTIAL_HEADERS: [&str; 3] = [
     "x-emby-authorization",
@@ -64,6 +74,16 @@ struct Attempt {
     addr: SocketAddr,
 }
 
+/// A response body being collected for rewriting.
+#[derive(Debug)]
+struct Rewrite {
+    /// The site as the client addressed it: host, and port unless 443.
+    authority: String,
+    /// Set once the response qualifies; cleared when the body turns out too large.
+    collecting: bool,
+    body: Vec<u8>,
+}
+
 /// Per-request state; one per HTTP/2 stream or HTTP/1 request.
 #[derive(Debug, Default)]
 pub struct Ctx {
@@ -79,6 +99,7 @@ pub struct Ctx {
     pub connect_retries: u8,
     /// Attempts repeated because the upstream answered 502 or 504.
     pub status_retries: u8,
+    rewrite: Option<Rewrite>,
 }
 
 impl Ctx {
@@ -114,6 +135,45 @@ impl Relay {
             follow_addrs: AddrCache::new(FOLLOW_ADDR_TTL),
         }
     }
+}
+
+/// `host` with the port of the client's `authority`, unless that is 443 or absent.
+fn public_authority(host: &str, authority: &[u8]) -> String {
+    let port = authority
+        .iter()
+        .rposition(|&b| b == b':')
+        .and_then(|i| std::str::from_utf8(&authority[i + 1..]).ok())
+        .and_then(|p| p.parse::<u16>().ok());
+    match port {
+        Some(p) if p != 443 => format!("{host}:{p}"),
+        _ => host.to_owned(),
+    }
+}
+
+/// Turns on gzip and brotli for this response, as the client accepts them.
+fn enable_compression(session: &mut Session) {
+    let req = session.req_header().clone();
+    if let Some(c) = session
+        .downstream_modules_ctx
+        .get_mut::<ResponseCompression>()
+    {
+        c.adjust_algorithm_level(Algorithm::Gzip, GZIP_LEVEL);
+        c.adjust_algorithm_level(Algorithm::Brotli, BROTLI_LEVEL);
+        // The module read Accept-Encoding before this request was known to need it.
+        c.request_filter(&req);
+    }
+}
+
+/// A rewritten body is no longer byte-identical to what a strong ETag promised.
+fn weaken_etag(resp: &mut ResponseHeader) -> Result<()> {
+    let Some(etag) = resp.headers.get(ETAG) else {
+        return Ok(());
+    };
+    if etag.as_bytes().starts_with(b"W/") {
+        return Ok(());
+    }
+    let weak = [b"W/", etag.as_bytes()].concat();
+    resp.insert_header(ETAG, weak)
 }
 
 fn request_authority(req: &RequestHeader) -> Option<&[u8]> {
@@ -186,6 +246,9 @@ impl ProxyHttp for Relay {
         ctx.sites = Some(Arc::clone(&sites));
         ctx.site = index;
         let site = ctx.site()?;
+        let authority = request_authority(session.req_header()).unwrap_or_default();
+        let public = public_authority(&site.host, authority);
+        let server_domains = site.policy.server_domains;
 
         let path = session.req_header().uri.path();
         if path == HEALTH_PATH {
@@ -199,6 +262,29 @@ impl ProxyHttp for Relay {
             return Ok(true);
         }
         ctx.class = route::classify(path);
+        if matches!(ctx.class, RouteClass::Info | RouteClass::PlaybackInfo) {
+            let mode = if route::is_server_domains(path) {
+                server_domains
+            } else {
+                ServerDomains::Rewrite
+            };
+            match mode {
+                ServerDomains::Block => {
+                    ctx.class = RouteClass::Local;
+                    respond_local(session, 404, b"").await?;
+                    return Ok(true);
+                }
+                ServerDomains::Pass => {}
+                ServerDomains::Rewrite => {
+                    ctx.rewrite = Some(Rewrite {
+                        authority: public,
+                        collecting: false,
+                        body: Vec::new(),
+                    });
+                    enable_compression(session);
+                }
+            }
+        }
         session
             .as_downstream_mut()
             .set_write_timeout(Some(ctx.class.downstream_write_timeout()));
@@ -279,6 +365,9 @@ impl ProxyHttp for Relay {
                 }
             }
         }
+        if ctx.rewrite.is_some() {
+            upstream_request.insert_header(ACCEPT_ENCODING, "identity")?;
+        }
         headers::scrub_request(upstream_request);
         headers::rewrite_user_agent(&site.policy.ua, upstream_request)?;
         headers::strip_cookies(&site.policy.strip_cookies, upstream_request)?;
@@ -340,12 +429,74 @@ impl ProxyHttp for Relay {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
         let site_host = ctx.site()?.host.clone();
-        headers::scrub_response(upstream_response, ctx.target_host()?, &site_host)
+        headers::scrub_response(upstream_response, ctx.target_host()?, &site_host)?;
+        let Some(rewrite) = ctx.rewrite.as_mut() else {
+            return Ok(());
+        };
+        let encoded = upstream_response
+            .headers
+            .get(CONTENT_ENCODING)
+            .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
+        if encoded {
+            warn!(
+                "site {site_host}: upstream compressed {} despite Accept-Encoding: identity; \
+                 passed on without rewriting",
+                session.req_header().uri.path()
+            );
+            return Ok(());
+        }
+        if upstream_response.status != 200 || session.req_header().method == Method::HEAD {
+            return Ok(());
+        }
+        rewrite.collecting = true;
+        upstream_response.remove_header(&CONTENT_LENGTH);
+        upstream_response.insert_header(TRANSFER_ENCODING, "chunked")?;
+        weaken_etag(upstream_response)
+    }
+
+    async fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> Result<Option<Duration>> {
+        let Some(rewrite) = ctx.rewrite.as_mut().filter(|r| r.collecting) else {
+            return Ok(None);
+        };
+        if let Some(chunk) = body.take() {
+            if rewrite.body.len() + chunk.len() > MAX_BODY {
+                warn!(
+                    "{} is larger than {MAX_BODY} bytes; passed on without rewriting",
+                    session.req_header().uri.path()
+                );
+                rewrite.collecting = false;
+                let mut all = std::mem::take(&mut rewrite.body);
+                all.extend_from_slice(&chunk);
+                *body = Some(Bytes::from(all));
+                return Ok(None);
+            }
+            rewrite.body.extend_from_slice(&chunk);
+        }
+        if !end_of_stream {
+            return Ok(None);
+        }
+        rewrite.collecting = false;
+        let collected = std::mem::take(&mut rewrite.body);
+        let authority = std::mem::take(&mut rewrite.authority);
+        let site = ctx.site()?;
+        let out = site
+            .policy
+            .rewriter
+            .rewrite(&collected, &site.host, &authority)
+            .unwrap_or(collected);
+        *body = Some(Bytes::from(out));
+        Ok(None)
     }
 
     fn error_while_proxy(

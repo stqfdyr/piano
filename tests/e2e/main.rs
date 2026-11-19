@@ -6,6 +6,7 @@ mod access;
 mod follow;
 mod headers;
 mod retry;
+mod rewrite;
 mod routing;
 
 use piano_e2e::client::{Proto, client, connect};
@@ -59,11 +60,7 @@ async fn passes_through_200_over_h1_and_h2() {
         (Proto::H2, reqwest::Version::HTTP_2),
     ] {
         let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto);
-        let res = c
-            .get(url(&w, "/emby/System/Info/Public"))
-            .send()
-            .await
-            .unwrap();
+        let res = c.get(url(&w, "/__info")).send().await.unwrap();
         assert_eq!(res.status(), 200, "{proto:?}");
         assert_eq!(res.version(), version, "{proto:?}");
         assert_eq!(
@@ -217,9 +214,7 @@ async fn keepalive_connection_serves_requests_in_turn() {
         } else {
             String::new()
         };
-        let req = format!(
-            "GET /emby/System/Info/Public HTTP/1.1\r\nhost: {SITE_HOST}\r\nx-pad: {pad}\r\n\r\n"
-        );
+        let req = format!("GET /__info HTTP/1.1\r\nhost: {SITE_HOST}\r\nx-pad: {pad}\r\n\r\n");
         if i == 1 {
             let (a, b) = req.as_bytes().split_at(10);
             io.write_all(a).await.unwrap();

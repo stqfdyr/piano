@@ -117,6 +117,12 @@ pub fn classify(path: &str) -> RouteClass {
     }
 }
 
+/// Whether `path` is the endpoint listing the upstream's own domain names.
+pub fn is_server_domains(path: &str) -> bool {
+    let (s, n) = segments(path);
+    n == 3 && is(s[0], "system") && is(s[1], "ext") && is(s[2], "serverdomains")
+}
+
 /// Path prefixes a site answers with 404, stored without a leading `/emby`.
 #[derive(Debug, Default, Clone)]
 pub struct BlockList(Vec<String>);
@@ -188,6 +194,14 @@ mod tests {
         ] {
             assert_eq!(classify(path), class, "{path}");
         }
+    }
+
+    #[test]
+    fn server_domains_path() {
+        assert!(is_server_domains("/emby/System/Ext/ServerDomains"));
+        assert!(is_server_domains("/system/ext/serverdomains/"));
+        assert!(!is_server_domains("/System/Info/Public"));
+        assert!(!is_server_domains("/System/Ext/ServerDomains/x"));
     }
 
     #[test]

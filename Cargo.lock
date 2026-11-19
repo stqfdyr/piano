@@ -1476,7 +1476,9 @@ name = "piano-e2e"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "brotli",
  "bytes",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1512,6 +1514,7 @@ version = "0.1.0"
 name = "piano-proxy"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "arc-swap",
  "async-trait",
  "bytes",

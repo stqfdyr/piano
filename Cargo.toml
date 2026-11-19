@@ -37,11 +37,16 @@ thiserror = "2"
 tikv-jemallocator = "0.6"
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 
+# JSON rewriting: one pass over a body finds every place an upstream address may start.
+aho-corasick = "1"
+
 # UA rewrite rules in the configuration.
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case"] }
 
 # Test-only.
+brotli = "3"
 bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }

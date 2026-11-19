@@ -5,6 +5,7 @@
 pub mod follow;
 pub mod headers;
 mod relay;
+pub mod rewrite;
 pub mod route;
 mod sites;
 

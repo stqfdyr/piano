@@ -1,7 +1,8 @@
 //! A fake Emby origin over TLS, speaking HTTP/1.1 and HTTP/2.
 //!
 //! Routes:
-//! - `/System/Info/Public`: a fixed JSON document, like Emby's.
+//! - `/System/Info/Public`: a fixed JSON document, like Emby's; also `/__info`, which
+//!   the relay does not rewrite.
 //! - `/__echo…`: the request line and headers as text, for header assertions; any
 //!   path starting with `/__echo`.
 //! - `/__redirect?to=LOCATION[&status=N]`: status N (default 302) with the
@@ -11,6 +12,11 @@
 //!   `cf-ray`, `alt-svc`, its own HSTS) and two cookies, one scoped to the origin host.
 //! - `/__seq/{key}/{codes}`: the n-th request for `key` gets the n-th status of the
 //!   comma-separated `codes` (the last one repeats) and `n` as its body.
+//! - `…/PlaybackInfo` and `/__json…`: [`json_doc`] for the request's `Host`, with
+//!   `x-seen-accept-encoding` echoing the request header and a strong `ETag`. Query
+//!   `pad=N` adds N bytes of padding; `gzip=1` compresses the body whatever the
+//!   request accepts.
+//! - `/System/Ext/ServerDomains`: the origin's name and `alias.example.net`.
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
 //!   single-range `Range` support; stands in for a media file.
 //! - anything else: 404.
@@ -38,6 +44,32 @@ use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+
+/// The body of `/System/Ext/ServerDomains`.
+pub const SERVER_DOMAINS: &str = r#"{"Domains":["origin.example.net","alias.example.net"]}"#;
+
+/// A JSON document naming its server `host` (as in `Host`) in several ways, with
+/// `pad` bytes of padding.
+pub fn json_doc(host: &str, pad: usize) -> String {
+    let mut doc = format!(
+        concat!(
+            r#"{{"LocalAddress":"http://172.17.0.1:8096","Url":"https://{host}/emby/x","#,
+            r#""Esc":"https:\/\/{upper}\/y","Rel":"//alias.example.net/z","#,
+            r#""Bare":"origin.example.net","Other":"https://vod.example.net/a","#,
+            r#""Near":"https://origin.example.net.evil.example/b","#,
+            r#""Path":"/videos/1/stream?api_key=k""#
+        ),
+        host = host,
+        upper = host.to_ascii_uppercase(),
+    );
+    if pad > 0 {
+        doc.push_str(r#","Pad":""#);
+        doc.push_str(&"a".repeat(pad));
+        doc.push('"');
+    }
+    doc.push('}');
+    doc
+}
 
 pub const INFO_PUBLIC: &str = r#"{"LocalAddress":"https://origin.example.net","ServerName":"fake","Version":"4.8.10.0","Id":"0123456789abcdef"}"#;
 
@@ -141,6 +173,7 @@ async fn handle(req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>,
     let path = req.uri().path();
     let response = if path.eq_ignore_ascii_case("/System/Info/Public")
         || path.eq_ignore_ascii_case("/emby/System/Info/Public")
+        || path == "/__info"
     {
         Response::builder()
             .header(CONTENT_TYPE, "application/json; charset=utf-8")
@@ -197,6 +230,42 @@ async fn handle(req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>,
         Response::builder()
             .status(codes[(n - 1).min(codes.len() - 1)])
             .body(full(n.to_string()))
+    } else if path.to_ascii_lowercase().ends_with("/playbackinfo") || path.starts_with("/__json") {
+        let query = req.uri().query().unwrap_or_default();
+        let param = |name: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+        };
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+        let pad = param("pad").and_then(|p| p.parse().ok()).unwrap_or(0);
+        let doc = json_doc(host, pad);
+        let seen = req
+            .headers()
+            .get("accept-encoding")
+            .cloned()
+            .unwrap_or_else(|| hyper::header::HeaderValue::from_static(""));
+        let builder = Response::builder()
+            .header(CONTENT_TYPE, "application/json; charset=utf-8")
+            .header("etag", "\"v1\"")
+            .header("x-seen-accept-encoding", seen);
+        if param("gzip") == Some("1") {
+            builder
+                .header("content-encoding", "gzip")
+                .body(full(gzip(doc.as_bytes())))
+        } else {
+            builder.body(full(doc))
+        }
+    } else if path.eq_ignore_ascii_case("/System/Ext/ServerDomains")
+        || path.eq_ignore_ascii_case("/emby/System/Ext/ServerDomains")
+    {
+        Response::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(full(SERVER_DOMAINS))
     } else if path == "/__cdn" {
         Response::builder()
             .header("server", "cloudflare")
@@ -215,6 +284,28 @@ async fn handle(req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>,
             .body(full(Bytes::new()))
     };
     Ok(response.unwrap())
+}
+
+pub fn gzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+pub fn gunzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(data)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+pub fn unbrotli(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    brotli::BrotliDecompress(&mut &data[..], &mut out).unwrap();
+    out
 }
 
 fn bytes_response(total: u64, headers: &HeaderMap) -> Response<ResBody> {

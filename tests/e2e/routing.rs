@@ -71,7 +71,7 @@ async fn statuses(w: &World, hosts: &[&str]) -> Vec<String> {
     let mut io = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
     let mut out = Vec::new();
     for host in hosts {
-        let req = format!("GET /emby/System/Info/Public HTTP/1.1\r\nhost: {host}\r\n\r\n");
+        let req = format!("GET /__info HTTP/1.1\r\nhost: {host}\r\n\r\n");
         io.write_all(req.as_bytes()).await.unwrap();
         io.flush().await.unwrap();
         let (head, _) = read_response(&mut io).await;
@@ -99,7 +99,7 @@ async fn local_answers_keep_the_connection_open() {
     for (path, status) in [
         ("/__piano/health", "200"),
         ("/emby/api/danmu/1", "404"),
-        ("/emby/System/Info/Public", "200"),
+        ("/__info", "200"),
     ] {
         let req = format!("GET {path} HTTP/1.1\r\nhost: {SITE_HOST}\r\n\r\n");
         io.write_all(req.as_bytes()).await.unwrap();

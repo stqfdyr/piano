@@ -106,9 +106,26 @@ pub struct Site {
     /// User-Agent rewrites, tried in order; the first match wins.
     #[serde(default)]
     pub ua: Vec<UaRule>,
+    /// What happens to `/System/Ext/ServerDomains`, which lists names that reach the
+    /// upstream directly.
+    #[serde(default)]
+    pub server_domains: ServerDomains,
     /// Parsed form of `upstream`, filled in by validation.
     #[serde(skip)]
     pub upstream_url: Option<UpstreamUrl>,
+}
+
+/// Handling of the endpoint that lists the upstream's own domain names.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerDomains {
+    /// Relayed, with the upstream's names replaced by the site's.
+    #[default]
+    Rewrite,
+    /// Answered with 404.
+    Block,
+    /// Relayed unchanged.
+    Pass,
 }
 
 /// Cookie handling towards the upstream.

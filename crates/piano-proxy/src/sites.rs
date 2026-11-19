@@ -2,8 +2,10 @@
 
 use crate::follow::FollowRules;
 use crate::headers::{UaRuleError, UaRules};
+use crate::rewrite::Rewriter;
 use crate::route::BlockList;
 use http::HeaderValue;
+use piano_config::ServerDomains;
 use piano_upstream::Origin;
 
 /// One public host and the origin behind it.
@@ -18,12 +20,14 @@ pub struct Site {
 }
 
 /// Per-site request handling taken from the configuration.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Policy {
     pub follow: FollowRules,
     pub block: BlockList,
     pub ua: UaRules,
     pub strip_cookies: Vec<String>,
+    pub rewriter: Rewriter,
+    pub server_domains: ServerDomains,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,16 +36,22 @@ pub enum SiteError {
     Host(#[from] http::header::InvalidHeaderValue),
     #[error("ua rule: {0}")]
     Ua(#[from] UaRuleError),
+    #[error("rewrite patterns: {0}")]
+    Rewrite(#[from] aho_corasick::BuildError),
 }
 
 impl Policy {
     pub fn from_config(site: &piano_config::Site) -> Result<Self, SiteError> {
+        let upstream = site
+            .upstream_url
+            .as_ref()
+            .map(|u| u.host.clone())
+            .unwrap_or_default();
+        let names = std::iter::once(upstream.clone())
+            .chain(site.aliases.iter().cloned())
+            .collect();
         let follow = FollowRules {
-            upstream: site
-                .upstream_url
-                .as_ref()
-                .map(|u| u.host.clone())
-                .unwrap_or_default(),
+            upstream,
             aliases: site.aliases.clone(),
             follow: site.follow.clone(),
         };
@@ -50,6 +60,8 @@ impl Policy {
             block: BlockList::new(&site.block),
             ua: UaRules::new(&site.ua)?,
             strip_cookies: site.cookies.strip.clone(),
+            rewriter: Rewriter::new(names)?,
+            server_domains: site.server_domains,
         })
     }
 }
@@ -128,7 +140,15 @@ mod tests {
                 idle_timeout: d,
             },
         };
-        Site::new(host.into(), host.into(), origin, Policy::default()).unwrap()
+        let policy = Policy {
+            follow: FollowRules::default(),
+            block: BlockList::default(),
+            ua: UaRules::default(),
+            strip_cookies: Vec::new(),
+            rewriter: Rewriter::new(Vec::new()).unwrap(),
+            server_domains: ServerDomains::default(),
+        };
+        Site::new(host.into(), host.into(), origin, policy).unwrap()
     }
 
     #[test]
