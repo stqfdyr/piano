@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod access;
+mod follow;
 mod headers;
 mod routing;
 
@@ -39,6 +40,7 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         hosts: &[SITE_HOST],
         block: &[],
         site_toml: "",
+        names: &[],
     });
     World { ca, origin, relay }
 }

@@ -89,6 +89,14 @@ pub struct Site {
     pub name: String,
     pub host: String,
     pub upstream: String,
+    /// Other names of the upstream server; redirects to them are followed like
+    /// redirects to the upstream itself.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Hosts whose redirects are followed inside the relay: exact names, or
+    /// `*.<domain>` for exactly one more label.
+    #[serde(default)]
+    pub follow: Vec<String>,
     /// Path prefixes answered with 404 instead of being relayed. Matching ignores ASCII
     /// case and an optional leading `/emby`.
     #[serde(default)]

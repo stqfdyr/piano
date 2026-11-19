@@ -1545,6 +1545,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs 0.8.5",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

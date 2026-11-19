@@ -27,6 +27,24 @@ pub struct RelaySetup<'a> {
     pub block: &'a [&'a str],
     /// Extra TOML appended to every `[[site]]` table (may open `[[site.ua]]` tables).
     pub site_toml: &'a str,
+    /// Further host names the relay resolves to loopback, like the origin's.
+    pub names: &'a [&'a str],
+}
+
+impl<'a> RelaySetup<'a> {
+    /// One site, `SITE_HOST`, open to loopback, without extra rules.
+    pub fn new(site: &'a crate::pki::Leaf, extra_roots: &'a [String], origin_port: u16) -> Self {
+        Self {
+            site,
+            extra_roots,
+            origin_port,
+            allow: &["127.0.0.1"],
+            hosts: &[crate::SITE_HOST],
+            block: &[],
+            site_toml: "",
+            names: &[],
+        }
+    }
 }
 
 pub struct Relay {
@@ -104,7 +122,10 @@ impl Relay {
         let dir = TempDir::new();
         let port = free_port();
         let config = piano_config::parse(&config_text(setup, &dir, 0, port)).unwrap();
-        let resolver = Resolver::system().with_override(ORIGIN_HOST, IpAddr::from([127, 0, 0, 1]));
+        let local = IpAddr::from([127, 0, 0, 1]);
+        let resolver = std::iter::once(&ORIGIN_HOST)
+            .chain(setup.names)
+            .fold(Resolver::system(), |r, name| r.with_override(name, local));
         let piano::Daemon { server, live } = piano::build(&config, resolver).unwrap();
 
         let (stop, rx) = watch::channel(false);

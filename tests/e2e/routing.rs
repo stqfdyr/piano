@@ -27,6 +27,7 @@ async fn world(block: &[&str]) -> World {
         hosts: &[SITE_HOST, OTHER_HOST],
         block,
         site_toml: "",
+        names: &[],
     });
     World { ca, origin, relay }
 }

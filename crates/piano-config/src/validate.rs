@@ -19,6 +19,19 @@ pub enum ValidationError {
     DuplicateHost(String),
     #[error("site name {0:?} is used by more than one site")]
     DuplicateName(String),
+    #[error("site {site:?}: alias {host:?} is not a valid lowercase DNS name")]
+    BadAlias { site: String, host: String },
+    #[error(
+        "site {site:?}: follow entry {entry:?} must be a lowercase DNS name or *.<domain> \
+         with at least two labels after *."
+    )]
+    BadFollow { site: String, entry: String },
+    #[error("site {site:?}: {entry:?} covers the public host of site {other:?}")]
+    FollowCoversSite {
+        site: String,
+        entry: String,
+        other: String,
+    },
     #[error("site {site:?}: block entry {path:?} must start with / and have no query")]
     BadBlock { site: String, path: String },
     #[error("site {site:?}: ua rule {index}: {reason}")]
@@ -100,7 +113,7 @@ impl UpstreamUrl {
 }
 
 /// Lowercase LDH labels, at least two of them, last one not all digits.
-fn is_dns_name(s: &str) -> bool {
+pub fn is_dns_name(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 {
         return false;
     }
@@ -118,6 +131,18 @@ fn is_dns_name(s: &str) -> bool {
         && labels
             .last()
             .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether follow entry `pattern` (a name or `*.<domain>`) matches lowercase `host`.
+/// The wildcard stands for exactly one label.
+pub fn host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(domain) => host
+            .strip_suffix(domain)
+            .and_then(|h| h.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+        None => pattern == host,
+    }
 }
 
 /// An RFC 7230 token, the form of a cookie name.
@@ -138,6 +163,11 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     if config.access.allow.is_empty() {
         errors.push(ValidationError::NoAccess);
     }
+    let site_hosts: Vec<(String, String)> = config
+        .sites
+        .iter()
+        .map(|s| (s.name.clone(), s.host.clone()))
+        .collect();
     let mut hosts = HashSet::new();
     let mut names = HashSet::new();
     for site in &mut config.sites {
@@ -155,6 +185,38 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
         }
         if !names.insert(site.name.clone()) {
             errors.push(ValidationError::DuplicateName(site.name.clone()));
+        }
+        for alias in &site.aliases {
+            if !is_dns_name(alias) {
+                errors.push(ValidationError::BadAlias {
+                    site: site.name.clone(),
+                    host: alias.clone(),
+                });
+            }
+        }
+        for entry in &site.follow {
+            let ok = match entry.strip_prefix("*.") {
+                Some(domain) => is_dns_name(domain),
+                None => is_dns_name(entry),
+            };
+            if !ok {
+                errors.push(ValidationError::BadFollow {
+                    site: site.name.clone(),
+                    entry: entry.clone(),
+                });
+            }
+        }
+        // Following a redirect to a public site host would loop through the relay.
+        for entry in site.aliases.iter().chain(&site.follow) {
+            for (other_name, other_host) in &site_hosts {
+                if host_matches(entry, other_host) {
+                    errors.push(ValidationError::FollowCoversSite {
+                        site: site.name.clone(),
+                        entry: entry.clone(),
+                        other: other_name.clone(),
+                    });
+                }
+            }
         }
         for path in &site.block {
             if !path.starts_with('/') || path.contains(['?', '#']) {
@@ -332,6 +394,31 @@ mod tests {
         );
         let errs = errors(&text);
         assert_eq!(errs.len(), 3, "{errs:?}");
+    }
+
+    #[test]
+    fn follow_patterns() {
+        assert!(host_matches("*.example.net", "a1.example.net"));
+        assert!(!host_matches("*.example.net", "example.net"));
+        assert!(!host_matches("*.example.net", "a.b.example.net"));
+        assert!(!host_matches("*.example.net", "aexample.net"));
+        assert!(host_matches("vod.example.net", "vod.example.net"));
+        assert!(!host_matches("vod.example.net", "x.vod.example.net"));
+
+        let ok = format!(
+            "{MINIMAL}aliases = [\"emby2.example.net\"]\nfollow = [\"vod.example.net\", \"*.files.example.net\"]\n"
+        );
+        assert_eq!(parse(&ok).unwrap().sites[0].follow.len(), 2);
+        for (entry, n) in [
+            ("follow = [\"*.net\"]", 1),
+            ("follow = [\"*\"]", 1),
+            ("follow = [\"Vod.example.net\"]", 1),
+            ("follow = [\"*.example.com\"]", 1),
+            ("aliases = [\"media.example.com\"]", 1),
+        ] {
+            let errs = errors(&format!("{MINIMAL}{entry}\n"));
+            assert_eq!(errs.len(), n, "{entry}: {errs:?}");
+        }
     }
 
     #[test]

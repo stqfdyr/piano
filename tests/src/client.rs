@@ -42,6 +42,7 @@ pub fn client(
     reqwest::Client::builder()
         .use_preconfigured_tls(tls_config(root, proto))
         .resolve(host, relay)
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap()

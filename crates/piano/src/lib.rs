@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
-use piano_proxy::{Policy, Relay, Site, SiteError, Sites};
+use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::listeners::tls::TlsSettings;
@@ -112,6 +112,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         threads,
         work_stealing: false,
         upstream_keepalive_pool_size: UPSTREAM_POOL_SIZE,
+        max_retries: MAX_ATTEMPTS,
         grace_period_seconds: Some(0),
         graceful_shutdown_timeout_seconds: Some(config.server.shutdown_timeout.get().as_secs()),
         pid_file: "/run/piano/piano.pid".to_owned(),
@@ -124,10 +125,11 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     let mut client = ConnectorOptions::from_server_conf(&conf);
     client.rustls_client_config = Some((client_tls.config, client_tls.roots));
 
-    let mut service = ProxyServiceBuilder::new(&conf, Relay::new(Arc::clone(&sites)))
-        .name("piano")
-        .client_options(client)
-        .build();
+    let mut service =
+        ProxyServiceBuilder::new(&conf, Relay::new(Arc::clone(&sites), resolver.clone()))
+            .name("piano")
+            .client_options(client)
+            .build();
     service.set_runtime_group(RUNTIME_GROUP);
     service.set_connection_filter(Arc::clone(&access) as _);
     for addr in &config.server.listen {

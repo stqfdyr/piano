@@ -2,7 +2,11 @@
 //!
 //! Routes:
 //! - `/System/Info/Public`: a fixed JSON document, like Emby's.
-//! - `/__echo`: the request line and headers as text, for header assertions.
+//! - `/__echo…`: the request line and headers as text, for header assertions; any
+//!   path starting with `/__echo`.
+//! - `/__redirect?to=LOCATION[&status=N]`: status N (default 302) with the
+//!   percent-decoded `to` as `Location`.
+//! - `/__loop/N`: 302 to `/__loop/N-1`, until `/__loop/0` answers 200 `done`.
 //! - `/__cdn`: an empty 200 carrying the headers a CDN-fronted Emby sends (`server`,
 //!   `cf-ray`, `alt-svc`, its own HSTS) and two cookies, one scoped to the origin host.
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
@@ -133,7 +137,7 @@ async fn handle(req: Request<Incoming>) -> Result<Response<ResBody>, Infallible>
         Response::builder()
             .header(CONTENT_TYPE, "application/json; charset=utf-8")
             .body(full(INFO_PUBLIC))
-    } else if path == "/__echo" {
+    } else if path.starts_with("/__echo") {
         let mut text = format!("{} {} {:?}\n", req.method(), req.uri(), req.version());
         for (name, value) in req.headers() {
             text.push_str(&format!(
@@ -144,6 +148,33 @@ async fn handle(req: Request<Incoming>) -> Result<Response<ResBody>, Infallible>
         Response::builder()
             .header(CONTENT_TYPE, "text/plain")
             .body(full(text))
+    } else if path == "/__redirect" {
+        let query = req.uri().query().unwrap_or_default();
+        let param = |name: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+                .map(percent_decode)
+        };
+        let status = param("status")
+            .and_then(|s| String::from_utf8(s).ok()?.parse().ok())
+            .unwrap_or(302);
+        Response::builder()
+            .status(status)
+            .header("location", param("to").unwrap_or_default())
+            .body(full("redirect body"))
+    } else if let Some(n) = path
+        .strip_prefix("/__loop/")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        if n == 0 {
+            Response::builder().body(full("done"))
+        } else {
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", format!("/__loop/{}", n - 1))
+                .body(full(Bytes::new()))
+        }
     } else if path == "/__cdn" {
         Response::builder()
             .header("server", "cloudflare")
@@ -184,6 +215,31 @@ fn bytes_response(total: u64, headers: &HeaderMap) -> Response<ResBody> {
             .body(full(Bytes::new())),
     };
     response.unwrap()
+}
+
+/// Decodes `%XX` escapes; anything else is kept as is.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Parses a single `bytes=a-b`, `bytes=a-` or `bytes=-n` range into a half-open

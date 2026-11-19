@@ -14,6 +14,7 @@ pingora-core.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
 
 [features]
 # Lets tests map host names to loopback addresses. Never enabled in release builds.

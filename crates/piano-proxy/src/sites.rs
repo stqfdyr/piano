@@ -1,5 +1,6 @@
 //! Site lookup by request host.
 
+use crate::follow::FollowRules;
 use crate::headers::{UaRuleError, UaRules};
 use crate::route::BlockList;
 use http::HeaderValue;
@@ -19,6 +20,7 @@ pub struct Site {
 /// Per-site request handling taken from the configuration.
 #[derive(Debug, Default)]
 pub struct Policy {
+    pub follow: FollowRules,
     pub block: BlockList,
     pub ua: UaRules,
     pub strip_cookies: Vec<String>,
@@ -34,7 +36,17 @@ pub enum SiteError {
 
 impl Policy {
     pub fn from_config(site: &piano_config::Site) -> Result<Self, SiteError> {
+        let follow = FollowRules {
+            upstream: site
+                .upstream_url
+                .as_ref()
+                .map(|u| u.host.clone())
+                .unwrap_or_default(),
+            aliases: site.aliases.clone(),
+            follow: site.follow.clone(),
+        };
         Ok(Self {
+            follow,
             block: BlockList::new(&site.block),
             ua: UaRules::new(&site.ua)?,
             strip_cookies: site.cookies.strip.clone(),

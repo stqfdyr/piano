@@ -2,10 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod follow;
 pub mod headers;
 mod relay;
 pub mod route;
 mod sites;
 
-pub use relay::{Ctx, Relay};
+pub use relay::{Ctx, MAX_ATTEMPTS, Relay};
 pub use sites::{Policy, Site, SiteError, Sites};
