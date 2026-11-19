@@ -9,6 +9,8 @@
 //! - `/__loop/N`: 302 to `/__loop/N-1`, until `/__loop/0` answers 200 `done`.
 //! - `/__cdn`: an empty 200 carrying the headers a CDN-fronted Emby sends (`server`,
 //!   `cf-ray`, `alt-svc`, its own HSTS) and two cookies, one scoped to the origin host.
+//! - `/__seq/{key}/{codes}`: the n-th request for `key` gets the n-th status of the
+//!   comma-separated `codes` (the last one repeats) and `n` as its body.
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
 //!   single-range `Range` support; stands in for a media file.
 //! - anything else: 404.
@@ -26,11 +28,12 @@ use hyper_util::server::conn::auto;
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -52,6 +55,9 @@ static PATTERN: LazyLock<Vec<u8>> =
     LazyLock::new(|| (0..CHUNK as u64 + PERIOD).map(pattern_byte).collect());
 
 type ResBody = BoxBody<Bytes, Infallible>;
+
+/// Requests seen per `/__seq` key.
+type Seqs = Arc<Mutex<HashMap<String, usize>>>;
 
 pub struct Origin {
     pub addr: SocketAddr,
@@ -85,6 +91,7 @@ impl Origin {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
+        let seqs = Seqs::default();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else {
@@ -92,13 +99,14 @@ impl Origin {
                 };
                 let acceptor = acceptor.clone();
                 let counter = Arc::clone(&counter);
+                let seqs = Arc::clone(&seqs);
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
                     let service = service_fn(move |req| {
                         counter.fetch_add(1, Ordering::Relaxed);
-                        handle(req)
+                        handle(req, Arc::clone(&seqs))
                     });
                     let _ = auto::Builder::new(TokioExecutor::new())
                         .serve_connection(TokioIo::new(tls), service)
@@ -129,7 +137,7 @@ fn full(body: impl Into<Bytes>) -> ResBody {
     Full::new(body.into()).boxed()
 }
 
-async fn handle(req: Request<Incoming>) -> Result<Response<ResBody>, Infallible> {
+async fn handle(req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>, Infallible> {
     let path = req.uri().path();
     let response = if path.eq_ignore_ascii_case("/System/Info/Public")
         || path.eq_ignore_ascii_case("/emby/System/Info/Public")
@@ -175,6 +183,20 @@ async fn handle(req: Request<Incoming>) -> Result<Response<ResBody>, Infallible>
                 .header("location", format!("/__loop/{}", n - 1))
                 .body(full(Bytes::new()))
         }
+    } else if let Some((key, codes)) = path
+        .strip_prefix("/__seq/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        let n = {
+            let mut seqs = seqs.lock().unwrap();
+            let n = seqs.entry(key.to_owned()).or_default();
+            *n += 1;
+            *n
+        };
+        let codes: Vec<u16> = codes.split(',').map(|c| c.parse().unwrap()).collect();
+        Response::builder()
+            .status(codes[(n - 1).min(codes.len() - 1)])
+            .body(full(n.to_string()))
     } else if path == "/__cdn" {
         Response::builder()
             .header("server", "cloudflare")

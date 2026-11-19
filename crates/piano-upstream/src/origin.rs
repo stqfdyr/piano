@@ -1,9 +1,11 @@
 //! An upstream server and how to reach it.
 
+use crate::resolve::Addrs;
 use pingora_core::Result;
 use pingora_core::protocols::ALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Timeouts applied to every connection to an origin.
@@ -24,13 +26,13 @@ impl From<&piano_config::Upstream> for PeerOptions {
     }
 }
 
-/// A resolved upstream: a lowercase host name (used for SNI and `Host`) and the one
-/// address chosen for it.
+/// A resolved upstream: a lowercase host name (used for SNI and `Host`) and its
+/// addresses.
 #[derive(Debug, Clone)]
 pub struct Origin {
     pub host: String,
     pub port: u16,
-    pub addr: SocketAddr,
+    pub addrs: Arc<Addrs>,
     pub options: PeerOptions,
 }
 
@@ -44,10 +46,10 @@ impl Origin {
         }
     }
 
-    /// A peer for one connection attempt. SNI is always set: an empty SNI would turn
-    /// off certificate verification in the connector.
-    pub fn peer(&self) -> Result<HttpPeer> {
-        let mut peer = HttpPeer::new(self.addr, true, self.host.clone())?;
+    /// A peer for one connection attempt to `addr`. SNI is always set: an empty SNI
+    /// would turn off certificate verification in the connector.
+    pub fn peer(&self, addr: SocketAddr) -> Result<HttpPeer> {
+        let mut peer = HttpPeer::new(addr, true, self.host.clone())?;
         let o = &mut peer.options;
         o.alpn = ALPN::H1;
         o.verify_cert = true;

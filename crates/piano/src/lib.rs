@@ -172,8 +172,8 @@ impl Live {
     }
 }
 
-/// Builds the site table. An origin already in `current` keeps its address, so a reload
-/// does not move its pooled connections to a new bucket.
+/// Builds the site table. An origin already in `current` keeps its addresses and the
+/// one in use, so a reload does not move its pooled connections to a new bucket.
 fn build_sites(
     config: &Config,
     resolver: &Resolver,
@@ -190,16 +190,16 @@ fn build_sites(
             c.iter()
                 .map(|s| &s.origin)
                 .find(|o| o.host == url.host && o.port == url.port)
-                .map(|o| o.addr)
+                .map(|o| Arc::clone(&o.addrs))
         });
-        let addr = match known {
+        let addrs = match known {
             Some(a) => a,
-            None => resolver.resolve_blocking(&url.host, url.port)?,
+            None => Arc::new(resolver.resolve_blocking(&url.host, url.port)?),
         };
         let origin = Origin {
             host: url.host.clone(),
             port: url.port,
-            addr,
+            addrs,
             options,
         };
         let s = Policy::from_config(site)

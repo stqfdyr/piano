@@ -29,6 +29,9 @@ pub struct RelaySetup<'a> {
     pub site_toml: &'a str,
     /// Further host names the relay resolves to loopback, like the origin's.
     pub names: &'a [&'a str],
+    /// Addresses the relay resolves the origin's name to, in order; empty means
+    /// loopback only.
+    pub origin_ips: &'a [IpAddr],
 }
 
 impl<'a> RelaySetup<'a> {
@@ -43,6 +46,7 @@ impl<'a> RelaySetup<'a> {
             block: &[],
             site_toml: "",
             names: &[],
+            origin_ips: &[],
         }
     }
 }
@@ -122,10 +126,17 @@ impl Relay {
         let dir = TempDir::new();
         let port = free_port();
         let config = piano_config::parse(&config_text(setup, &dir, 0, port)).unwrap();
-        let local = IpAddr::from([127, 0, 0, 1]);
-        let resolver = std::iter::once(&ORIGIN_HOST)
-            .chain(setup.names)
-            .fold(Resolver::system(), |r, name| r.with_override(name, local));
+        let local = [IpAddr::from([127, 0, 0, 1])];
+        let origin_ips = if setup.origin_ips.is_empty() {
+            &local
+        } else {
+            setup.origin_ips
+        };
+        let resolver = setup
+            .names
+            .iter()
+            .fold(Resolver::system(), |r, name| r.with_override(name, &local))
+            .with_override(ORIGIN_HOST, origin_ips);
         let piano::Daemon { server, live } = piano::build(&config, resolver).unwrap();
 
         let (stop, rx) = watch::channel(false);

@@ -5,6 +5,7 @@
 mod access;
 mod follow;
 mod headers;
+mod retry;
 mod routing;
 
 use piano_e2e::client::{Proto, client, connect};
@@ -41,6 +42,7 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         block: &[],
         site_toml: "",
         names: &[],
+        origin_ips: &[],
     });
     World { ca, origin, relay }
 }

@@ -7,4 +7,4 @@ pub mod resolve;
 pub mod tls;
 
 pub use origin::{Origin, PeerOptions};
-pub use resolve::{AddrCache, Resolver};
+pub use resolve::{AddrCache, Addrs, Resolver};

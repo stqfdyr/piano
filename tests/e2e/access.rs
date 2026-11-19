@@ -31,6 +31,7 @@ async fn refused_addresses_are_closed_before_the_handshake() {
         block: &[],
         site_toml: "",
         names: &[],
+        origin_ips: &[],
     });
     let err = get(&ca, &relay, SITE_HOST).await.unwrap_err();
     assert!(err.is_connect(), "{err:?}");
@@ -53,6 +54,7 @@ async fn reload_replaces_access_certificates_and_sites() {
         block: &[],
         site_toml: "",
         names: &[],
+        origin_ips: &[],
     });
     assert!(get(&old_ca, &relay, SITE_HOST).await.is_err());
 
@@ -66,6 +68,7 @@ async fn reload_replaces_access_certificates_and_sites() {
             block: &[],
             site_toml: "",
             names: &[],
+            origin_ips: &[],
         })
         .unwrap();
     assert!(restart.is_empty(), "{restart:?}");
@@ -94,6 +97,7 @@ async fn failed_reload_keeps_the_running_configuration() {
         block: &[],
         site_toml: "",
         names: &[],
+        origin_ips: &[],
     };
     let relay = Relay::start(&setup);
 

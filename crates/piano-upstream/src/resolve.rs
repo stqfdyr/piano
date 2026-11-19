@@ -2,11 +2,13 @@
 //!
 //! Configured upstreams are resolved once when the site table is built. Redirect
 //! targets are resolved when first followed, must resolve to public addresses, and keep
-//! their address for a while so their pooled connections stay in one bucket.
+//! their addresses for a while. A host keeps using one address, so its pooled
+//! connections stay in one bucket, until connecting to that address fails.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +28,7 @@ pub enum Error {
 #[derive(Debug, Default, Clone)]
 pub struct Resolver {
     #[cfg(feature = "test-support")]
-    overrides: HashMap<String, IpAddr>,
+    overrides: HashMap<String, Vec<IpAddr>>,
 }
 
 impl Resolver {
@@ -35,28 +37,27 @@ impl Resolver {
         Self::default()
     }
 
-    /// Answers `host` with `ip` instead of asking the system resolver. Overridden
-    /// answers skip the public-address check.
+    /// Answers `host` with `ips`, in that order, instead of asking the system resolver.
+    /// Overridden answers skip the public-address check.
     #[cfg(feature = "test-support")]
-    pub fn with_override(mut self, host: &str, ip: IpAddr) -> Self {
-        self.overrides.insert(host.to_owned(), ip);
+    pub fn with_override(mut self, host: &str, ips: &[IpAddr]) -> Self {
+        self.overrides.insert(host.to_owned(), ips.to_vec());
         self
     }
 
     #[cfg(feature = "test-support")]
-    fn overridden(&self, host: &str, port: u16) -> Option<SocketAddr> {
-        self.overrides
-            .get(host)
-            .map(|ip| SocketAddr::new(*ip, port))
+    fn overridden(&self, host: &str, port: u16) -> Option<Addrs> {
+        let ips = self.overrides.get(host)?;
+        Addrs::new(ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
     }
 
     #[cfg(not(feature = "test-support"))]
-    fn overridden(&self, _host: &str, _port: u16) -> Option<SocketAddr> {
+    fn overridden(&self, _host: &str, _port: u16) -> Option<Addrs> {
         None
     }
 
-    /// Resolves `host` and picks one address, preferring IPv4.
-    pub fn resolve_blocking(&self, host: &str, port: u16) -> Result<SocketAddr, Error> {
+    /// Resolves `host`; IPv4 addresses come first.
+    pub fn resolve_blocking(&self, host: &str, port: u16) -> Result<Addrs, Error> {
         if let Some(a) = self.overridden(host, port) {
             return Ok(a);
         }
@@ -67,13 +68,13 @@ impl Resolver {
                 source,
             })?
             .collect();
-        pick(&addrs).ok_or_else(|| Error::NoAddress(host.to_owned()))
+        Addrs::new(ipv4_first(addrs)).ok_or_else(|| Error::NoAddress(host.to_owned()))
     }
 
-    /// Resolves `host` without blocking the runtime and picks one public address,
-    /// preferring IPv4. Fails if the chosen address is not public: a redirect target's
-    /// owner controls its DNS and could point it at this host's private services.
-    pub async fn resolve_public(&self, host: &str, port: u16) -> Result<SocketAddr, Error> {
+    /// Resolves `host` without blocking the runtime and keeps only public addresses,
+    /// IPv4 first. A redirect target's owner controls its DNS and could point it at
+    /// this host's private services.
+    pub async fn resolve_public(&self, host: &str, port: u16) -> Result<Addrs, Error> {
         if let Some(a) = self.overridden(host, port) {
             return Ok(a);
         }
@@ -84,23 +85,67 @@ impl Resolver {
                 source,
             })?
             .collect();
-        let addr = pick(&addrs).ok_or_else(|| Error::NoAddress(host.to_owned()))?;
-        if !is_public(addr.ip()) {
-            return Err(Error::NotPublic {
-                host: host.to_owned(),
-                ip: addr.ip(),
-            });
-        }
-        Ok(addr)
+        let first = addrs
+            .first()
+            .copied()
+            .ok_or_else(|| Error::NoAddress(host.to_owned()))?;
+        let public = addrs.into_iter().filter(|a| is_public(a.ip())).collect();
+        Addrs::new(ipv4_first(public)).ok_or_else(|| Error::NotPublic {
+            host: host.to_owned(),
+            ip: first.ip(),
+        })
     }
 }
 
-fn pick(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    addrs
-        .iter()
-        .find(|a| matches!(a.ip(), IpAddr::V4(_)))
-        .or_else(|| addrs.first())
-        .copied()
+/// Stable order with IPv4 addresses before IPv6 ones, without duplicates.
+fn ipv4_first(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.sort_by_key(SocketAddr::is_ipv6);
+    let mut unique = Vec::with_capacity(addrs.len());
+    for a in addrs {
+        if !unique.contains(&a) {
+            unique.push(a);
+        }
+    }
+    unique
+}
+
+/// The addresses of one host in order of preference, and the one in use. Shared by
+/// every request to the host, so a failed address is skipped by later requests too.
+#[derive(Debug)]
+pub struct Addrs {
+    list: Box<[SocketAddr]>,
+    current: AtomicUsize,
+}
+
+impl Addrs {
+    /// `None` if `list` is empty.
+    pub fn new(list: Vec<SocketAddr>) -> Option<Self> {
+        if list.is_empty() {
+            return None;
+        }
+        Some(Self {
+            list: list.into_boxed_slice(),
+            current: AtomicUsize::new(0),
+        })
+    }
+
+    /// The address to connect to.
+    pub fn current(&self) -> SocketAddr {
+        let i = self.current.load(Ordering::Relaxed);
+        self.list[i % self.list.len()]
+    }
+
+    /// Moves on to the next address after connecting to `failed` did not work. When
+    /// several requests fail on the same address at once, only the first moves on.
+    pub fn failed(&self, failed: SocketAddr) {
+        let i = self.current.load(Ordering::Relaxed);
+        if self.list[i % self.list.len()] == failed {
+            let next = (i + 1) % self.list.len();
+            let _ = self
+                .current
+                .compare_exchange(i, next, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
 }
 
 fn in_v4(ip: Ipv4Addr, net: [u8; 4], prefix: u32) -> bool {
@@ -153,11 +198,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         && !in_net(0x0064_ff9b << 96, 32)
 }
 
-/// Addresses chosen for redirect targets, kept for `ttl` after the first lookup.
+type Entries = HashMap<(String, u16), (Arc<Addrs>, Instant)>;
+
+/// Addresses of redirect targets, kept for `ttl` after the first lookup.
 #[derive(Debug)]
 pub struct AddrCache {
     ttl: Duration,
-    entries: Mutex<HashMap<(String, u16), (SocketAddr, Instant)>>,
+    entries: Mutex<Entries>,
 }
 
 impl AddrCache {
@@ -168,29 +215,31 @@ impl AddrCache {
         }
     }
 
-    /// The cached address of `host:port`, or a fresh public one from `resolver`.
+    /// The cached addresses of `host:port`, or fresh public ones from `resolver`.
     pub async fn get(
         &self,
         resolver: &Resolver,
         host: &str,
         port: u16,
-    ) -> Result<SocketAddr, Error> {
+    ) -> Result<Arc<Addrs>, Error> {
         let key = (host.to_owned(), port);
-        let cached = self.lock().get(&key).copied();
-        if let Some((addr, at)) = cached
-            && at.elapsed() < self.ttl
-        {
-            return Ok(addr);
+        let cached = self
+            .lock()
+            .get(&key)
+            .filter(|(_, at)| at.elapsed() < self.ttl)
+            .map(|(addrs, _)| Arc::clone(addrs));
+        if let Some(addrs) = cached {
+            return Ok(addrs);
         }
-        let addr = resolver.resolve_public(host, port).await?;
+        let addrs = Arc::new(resolver.resolve_public(host, port).await?);
         let mut entries = self.lock();
         let now = Instant::now();
         entries.retain(|_, (_, at)| now.duration_since(*at) < self.ttl);
-        entries.insert(key, (addr, now));
-        Ok(addr)
+        entries.insert(key, (Arc::clone(&addrs), now));
+        Ok(addrs)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, u16), (SocketAddr, Instant)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Entries> {
         // The map holds plain data, so a panic elsewhere cannot leave it inconsistent.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -200,13 +249,34 @@ impl AddrCache {
 mod tests {
     use super::*;
 
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
-    fn prefers_ipv4() {
-        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
-        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        assert_eq!(pick(&[v6, v4]), Some(v4));
-        assert_eq!(pick(&[v6]), Some(v6));
-        assert_eq!(pick(&[]), None);
+    fn ipv4_comes_first() {
+        let (a6, b6) = (sa("[2001:db8::1]:443"), sa("[2001:db8::2]:443"));
+        let (a4, b4) = (sa("192.0.2.1:443"), sa("192.0.2.2:443"));
+        assert_eq!(ipv4_first(vec![a6, a4, b6, b4, a4]), [a4, b4, a6, b6]);
+        assert!(Addrs::new(vec![]).is_none());
+    }
+
+    #[test]
+    fn failed_address_moves_on_once() {
+        let (a, b, c) = (
+            sa("192.0.2.1:443"),
+            sa("192.0.2.2:443"),
+            sa("192.0.2.3:443"),
+        );
+        let addrs = Addrs::new(vec![a, b, c]).unwrap();
+        assert_eq!(addrs.current(), a);
+        addrs.failed(a);
+        // A second request that also failed on `a` does not skip `b`.
+        addrs.failed(a);
+        assert_eq!(addrs.current(), b);
+        addrs.failed(b);
+        addrs.failed(c);
+        assert_eq!(addrs.current(), a);
     }
 
     #[test]

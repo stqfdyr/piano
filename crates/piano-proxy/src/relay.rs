@@ -13,23 +13,35 @@ use http::header::{
 };
 use log::warn;
 use piano_edge::tls::Sni;
-use piano_upstream::{AddrCache, Origin, Resolver};
+use piano_upstream::{AddrCache, Addrs, Origin, Resolver};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, ProxyWarnLogContext, Session};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Total upstream attempts per request: the first, every redirect hop, and two
-/// connection retries.
-pub const MAX_ATTEMPTS: usize = 1 + MAX_HOPS as usize + 2;
+/// Further attempts after failing to connect, each to the host's next address.
+const CONNECT_RETRIES: u8 = 2;
+
+/// Further attempts after the upstream answers 502 or 504. Never after 503: upstreams
+/// use it for deliberate refusals that a retry would only repeat.
+const STATUS_RETRIES: u8 = 1;
+
+/// Total upstream attempts per request: the first, every redirect hop and every retry.
+pub const MAX_ATTEMPTS: usize =
+    1 + MAX_HOPS as usize + CONNECT_RETRIES as usize + STATUS_RETRIES as usize;
 
 /// How long a redirect target keeps the address it was first resolved to.
 const FOLLOW_ADDR_TTL: Duration = Duration::from_secs(300);
 
 /// Marks the error that makes pingora run another attempt towards a redirect target.
 const FOLLOW: ErrorType = ErrorType::Custom("FollowRedirect");
+
+/// Marks the error that makes pingora repeat an attempt the upstream answered with 502
+/// or 504.
+const STATUS_RETRY: ErrorType = ErrorType::Custom("UpstreamStatusRetry");
 
 /// Client credentials, sent only to the upstream server itself.
 const CREDENTIAL_HEADERS: [&str; 3] = [
@@ -45,6 +57,13 @@ struct Hop {
     kind: TargetKind,
 }
 
+/// The address the current attempt connects to.
+#[derive(Debug)]
+struct Attempt {
+    addrs: Arc<Addrs>,
+    addr: SocketAddr,
+}
+
 /// Per-request state; one per HTTP/2 stream or HTTP/1 request.
 #[derive(Debug, Default)]
 pub struct Ctx {
@@ -55,6 +74,11 @@ pub struct Ctx {
     hop: Option<Hop>,
     /// Redirects followed so far.
     pub hops: u8,
+    attempt: Option<Attempt>,
+    /// Attempts repeated because connecting failed.
+    pub connect_retries: u8,
+    /// Attempts repeated because the upstream answered 502 or 504.
+    pub status_retries: u8,
 }
 
 impl Ctx {
@@ -119,6 +143,19 @@ async fn respond_local(session: &mut Session, status: u16, body: &'static [u8]) 
         .await
 }
 
+/// Failures to reach the address at all, as opposed to failures of TLS with a server
+/// that answered.
+fn is_connect_failure(e: &ErrorType) -> bool {
+    matches!(
+        e,
+        ErrorType::ConnectTimedout
+            | ErrorType::ConnectRefused
+            | ErrorType::ConnectNoRoute
+            | ErrorType::ConnectError
+            | ErrorType::TLSHandshakeTimedout
+    )
+}
+
 /// A redirect that will not be followed: the client gets 502, never the Location.
 fn refuse_redirect(reason: String) -> Box<Error> {
     warn!("refused upstream redirect: {reason}");
@@ -170,25 +207,55 @@ impl ProxyHttp for Relay {
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         let site = ctx.site()?;
-        let Some(hop) = &ctx.hop else {
-            return Ok(Box::new(site.origin.peer()?));
+        let (peer, addrs, addr) = match &ctx.hop {
+            None => {
+                let addr = site.origin.addrs.current();
+                let peer = site.origin.peer(addr)?;
+                (peer, Arc::clone(&site.origin.addrs), addr)
+            }
+            Some(hop) => {
+                let t = &hop.target;
+                let addrs = if t.host == site.origin.host && t.port == site.origin.port {
+                    Arc::clone(&site.origin.addrs)
+                } else {
+                    self.follow_addrs
+                        .get(&self.resolver, &t.host, t.port)
+                        .await
+                        .map_err(|e| refuse_redirect(format!("{}: {e}", t.host)))?
+                };
+                let origin = Origin {
+                    host: t.host.clone(),
+                    port: t.port,
+                    addrs,
+                    options: site.origin.options,
+                };
+                let addr = origin.addrs.current();
+                (origin.peer(addr)?, origin.addrs, addr)
+            }
         };
-        let t = &hop.target;
-        let addr = if t.host == site.origin.host && t.port == site.origin.port {
-            site.origin.addr
-        } else {
-            self.follow_addrs
-                .get(&self.resolver, &t.host, t.port)
-                .await
-                .map_err(|e| refuse_redirect(format!("{}: {e}", t.host)))?
-        };
-        let origin = Origin {
-            host: t.host.clone(),
-            port: t.port,
-            addr,
-            options: site.origin.options,
-        };
-        Ok(Box::new(origin.peer()?))
+        ctx.attempt = Some(Attempt { addrs, addr });
+        Ok(Box::new(peer))
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Ctx,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        if !is_connect_failure(e.etype()) {
+            return e;
+        }
+        if let Some(a) = ctx.attempt.take() {
+            a.addrs.failed(a.addr);
+        }
+        // Nothing reached the upstream, so any method may be retried.
+        if ctx.connect_retries < CONNECT_RETRIES {
+            ctx.connect_retries += 1;
+            e.set_retry(true);
+        }
+        e
     }
 
     async fn upstream_request_filter(
@@ -224,7 +291,17 @@ impl ProxyHttp for Relay {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        if !follow::is_redirect(upstream_response.status.as_u16()) {
+        let status = upstream_response.status.as_u16();
+        if matches!(status, 502 | 504)
+            && ctx.status_retries < STATUS_RETRIES
+            && session.req_header().method.is_idempotent()
+        {
+            ctx.status_retries += 1;
+            let mut e = Error::explain(STATUS_RETRY, format!("upstream answered {status}"));
+            e.set_retry(true);
+            return Err(e);
+        }
+        if !follow::is_redirect(status) {
             return Ok(());
         }
         let Some(location) = upstream_response.headers.get(LOCATION) else {

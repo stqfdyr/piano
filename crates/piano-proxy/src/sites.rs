@@ -112,7 +112,8 @@ fn strip_port(authority: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use piano_upstream::PeerOptions;
+    use piano_upstream::{Addrs, PeerOptions};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn site(host: &str) -> Site {
@@ -120,7 +121,7 @@ mod tests {
         let origin = Origin {
             host: "emby.example.net".into(),
             port: 443,
-            addr: "192.0.2.1:443".parse().unwrap(),
+            addrs: Arc::new(Addrs::new(vec!["192.0.2.1:443".parse().unwrap()]).unwrap()),
             options: PeerOptions {
                 connect_timeout: d,
                 read_timeout: d,

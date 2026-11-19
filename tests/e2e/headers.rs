@@ -30,6 +30,7 @@ async fn world() -> World {
         block: &[],
         site_toml: SITE_TOML,
         names: &[],
+        origin_ips: &[],
     });
     World {
         ca,
