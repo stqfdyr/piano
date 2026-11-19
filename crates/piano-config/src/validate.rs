@@ -21,6 +21,14 @@ pub enum ValidationError {
     DuplicateName(String),
     #[error("site {site:?}: block entry {path:?} must start with / and have no query")]
     BadBlock { site: String, path: String },
+    #[error("site {site:?}: ua rule {index}: {reason}")]
+    BadUaRule {
+        site: String,
+        index: usize,
+        reason: String,
+    },
+    #[error("site {site:?}: cookies.strip entry {name:?} is not a cookie name")]
+    BadCookieName { site: String, name: String },
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
         site: String,
@@ -112,6 +120,13 @@ fn is_dns_name(s: &str) -> bool {
             .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// An RFC 7230 token, the form of a cookie name.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     if config.server.listen.is_empty() {
@@ -146,6 +161,30 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
                 errors.push(ValidationError::BadBlock {
                     site: site.name.clone(),
                     path: path.clone(),
+                });
+            }
+        }
+        for (index, rule) in site.ua.iter().enumerate() {
+            let reason = if let Err(e) = regex::Regex::new(&rule.pattern) {
+                Some(e.to_string())
+            } else if rule.set.is_empty() || !rule.set.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                Some("set must be non-empty printable ASCII".to_owned())
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                errors.push(ValidationError::BadUaRule {
+                    site: site.name.clone(),
+                    index,
+                    reason,
+                });
+            }
+        }
+        for name in &site.cookies.strip {
+            if !is_token(name) {
+                errors.push(ValidationError::BadCookieName {
+                    site: site.name.clone(),
+                    name: name.clone(),
                 });
             }
         }
@@ -274,6 +313,25 @@ mod tests {
         );
         let c = parse(&text).unwrap();
         assert_eq!(c.warnings().len(), 2);
+    }
+
+    #[test]
+    fn site_header_rules() {
+        let text = format!(
+            "{MINIMAL}cookies.strip = [\"upstream_session\"]\n\
+             [[site.ua]]\nmatch = '^$|(?i)mozilla/'\nset = \"EmbyMini/0.1.0\"\n"
+        );
+        let c = parse(&text).unwrap();
+        assert_eq!(c.sites[0].cookies.strip, ["upstream_session"]);
+        assert_eq!(c.sites[0].ua[0].set, "EmbyMini/0.1.0");
+
+        let text = format!(
+            "{MINIMAL}cookies.strip = [\"a b\"]\n\
+             [[site.ua]]\nmatch = '('\nset = \"x\"\n\
+             [[site.ua]]\nmatch = 'x'\nset = \"\"\n"
+        );
+        let errs = errors(&text);
+        assert_eq!(errs.len(), 3, "{errs:?}");
     }
 
     #[test]

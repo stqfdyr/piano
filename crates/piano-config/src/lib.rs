@@ -11,7 +11,7 @@ mod net;
 mod validate;
 
 pub use duration::{Duration, ParseDurationError};
-pub use model::{Access, Config, Server, Site, Tls, Upstream};
+pub use model::{Access, Config, Cookies, Server, Site, Tls, UaRule, Upstream};
 pub use net::{IpNet, ParseIpNetError};
 pub use validate::{UpstreamUrl, ValidationError, Warning};
 

@@ -11,7 +11,6 @@ publish.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true
 clap.workspace = true
-http.workspace = true
 log.workspace = true
 piano-config.workspace = true
 piano-edge.workspace = true

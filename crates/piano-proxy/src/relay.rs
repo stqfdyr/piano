@@ -1,5 +1,6 @@
 //! The `ProxyHttp` implementation.
 
+use crate::headers;
 use crate::route::{self, HEALTH_PATH, RouteClass};
 use crate::{Site, Sites};
 use arc_swap::ArcSwap;
@@ -63,6 +64,7 @@ async fn respond_local(session: &mut Session, status: u16, body: &'static [u8]) 
     resp.insert_header(CONTENT_TYPE, "text/plain")?;
     resp.insert_header(CONTENT_LENGTH, body.len())?;
     resp.insert_header(CACHE_CONTROL, "no-store")?;
+    headers::add_security_headers(&mut resp)?;
     session.write_response_header(Box::new(resp), false).await?;
     session
         .write_response_body(Some(Bytes::from_static(body)), true)
@@ -100,7 +102,7 @@ impl ProxyHttp for Relay {
             respond_local(session, 200, b"ok\n").await?;
             return Ok(true);
         }
-        if site.block.blocks(path) {
+        if site.policy.block.blocks(path) {
             ctx.class = RouteClass::Local;
             respond_local(session, 404, b"").await?;
             return Ok(true);
@@ -122,7 +124,21 @@ impl ProxyHttp for Relay {
         upstream_request: &mut RequestHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        upstream_request.insert_header(HOST, ctx.site()?.upstream_host.clone())?;
+        let site = ctx.site()?;
+        upstream_request.insert_header(HOST, site.upstream_host.clone())?;
+        headers::scrub_request(upstream_request);
+        headers::rewrite_user_agent(&site.policy.ua, upstream_request)?;
+        headers::strip_cookies(&site.policy.strip_cookies, upstream_request)?;
         Ok(())
+    }
+
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        let site = ctx.site()?;
+        headers::scrub_response(upstream_response, &site.origin.host, &site.host)
     }
 }

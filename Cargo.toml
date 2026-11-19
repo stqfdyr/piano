@@ -37,6 +37,9 @@ thiserror = "2"
 tikv-jemallocator = "0.6"
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 
+# UA rewrite rules in the configuration.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case"] }
+
 # Test-only.
 bytes = "1"
 http-body-util = "0.1"

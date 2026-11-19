@@ -1,5 +1,6 @@
 //! Site lookup by request host.
 
+use crate::headers::{UaRuleError, UaRules};
 use crate::route::BlockList;
 use http::HeaderValue;
 use piano_upstream::Origin;
@@ -12,7 +13,33 @@ pub struct Site {
     pub origin: Origin,
     /// Precomputed upstream `Host` header value.
     pub upstream_host: HeaderValue,
+    pub policy: Policy,
+}
+
+/// Per-site request handling taken from the configuration.
+#[derive(Debug, Default)]
+pub struct Policy {
     pub block: BlockList,
+    pub ua: UaRules,
+    pub strip_cookies: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SiteError {
+    #[error("invalid upstream host header: {0}")]
+    Host(#[from] http::header::InvalidHeaderValue),
+    #[error("ua rule: {0}")]
+    Ua(#[from] UaRuleError),
+}
+
+impl Policy {
+    pub fn from_config(site: &piano_config::Site) -> Result<Self, SiteError> {
+        Ok(Self {
+            block: BlockList::new(&site.block),
+            ua: UaRules::new(&site.ua)?,
+            strip_cookies: site.cookies.strip.clone(),
+        })
+    }
 }
 
 impl Site {
@@ -20,15 +47,15 @@ impl Site {
         name: String,
         host: String,
         origin: Origin,
-        block: BlockList,
-    ) -> Result<Self, http::header::InvalidHeaderValue> {
+        policy: Policy,
+    ) -> Result<Self, SiteError> {
         let upstream_host = HeaderValue::from_str(&origin.authority())?;
         Ok(Self {
             name,
             host,
             origin,
             upstream_host,
-            block,
+            policy,
         })
     }
 }
@@ -88,7 +115,7 @@ mod tests {
                 idle_timeout: d,
             },
         };
-        Site::new(host.into(), host.into(), origin, BlockList::default()).unwrap()
+        Site::new(host.into(), host.into(), origin, Policy::default()).unwrap()
     }
 
     #[test]

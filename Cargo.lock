@@ -1440,7 +1440,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "clap",
- "http",
  "log",
  "piano-config",
  "piano-edge",
@@ -1462,6 +1461,7 @@ version = "0.1.0"
 name = "piano-config"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "serde",
  "thiserror 2.0.21",
  "toml",
@@ -1524,6 +1524,8 @@ dependencies = [
  "pingora-error",
  "pingora-http",
  "pingora-proxy",
+ "regex",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

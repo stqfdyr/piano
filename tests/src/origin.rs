@@ -3,6 +3,8 @@
 //! Routes:
 //! - `/System/Info/Public`: a fixed JSON document, like Emby's.
 //! - `/__echo`: the request line and headers as text, for header assertions.
+//! - `/__cdn`: an empty 200 carrying the headers a CDN-fronted Emby sends (`server`,
+//!   `cf-ray`, `alt-svc`, its own HSTS) and two cookies, one scoped to the origin host.
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
 //!   single-range `Range` support; stands in for a media file.
 //! - anything else: 404.
@@ -142,6 +144,16 @@ async fn handle(req: Request<Incoming>) -> Result<Response<ResBody>, Infallible>
         Response::builder()
             .header(CONTENT_TYPE, "text/plain")
             .body(full(text))
+    } else if path == "/__cdn" {
+        Response::builder()
+            .header("server", "cloudflare")
+            .header("cf-ray", "0123456789abcdef-LAX")
+            .header("alt-svc", "h3=\":443\"; ma=86400")
+            .header("via", "1.1 cdn")
+            .header("strict-transport-security", "max-age=1")
+            .header("set-cookie", "s=1; Path=/; Domain=origin.example.net")
+            .header("set-cookie", "t=2; Path=/")
+            .body(full(Bytes::new()))
     } else if let Some(len) = path.strip_prefix("/__bytes/").and_then(|n| n.parse().ok()) {
         return Ok(bytes_response(len, req.headers()));
     } else {

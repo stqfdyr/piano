@@ -26,6 +26,7 @@ async fn world(block: &[&str]) -> World {
         allow: &["127.0.0.1"],
         hosts: &[SITE_HOST, OTHER_HOST],
         block,
+        site_toml: "",
     });
     World { ca, origin, relay }
 }

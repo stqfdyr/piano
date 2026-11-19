@@ -25,6 +25,8 @@ pub struct RelaySetup<'a> {
     pub hosts: &'a [&'a str],
     /// `block` entries for every site.
     pub block: &'a [&'a str],
+    /// Extra TOML appended to every `[[site]]` table (may open `[[site.ua]]` tables).
+    pub site_toml: &'a str,
 }
 
 pub struct Relay {
@@ -66,8 +68,8 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         .iter()
         .map(|h| {
             format!(
-                "[[site]]\nhost = \"{h}\"\nupstream = \"https://{ORIGIN_HOST}:{}\"\nblock = [{block}]\n",
-                setup.origin_port
+                "[[site]]\nhost = \"{h}\"\nupstream = \"https://{ORIGIN_HOST}:{}\"\nblock = [{block}]\n{}\n",
+                setup.origin_port, setup.site_toml
             )
         })
         .collect();

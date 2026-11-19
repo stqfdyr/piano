@@ -8,8 +8,7 @@ use arc_swap::ArcSwap;
 use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
-use piano_proxy::route::BlockList;
-use piano_proxy::{Relay, Site, Sites};
+use piano_proxy::{Policy, Relay, Site, SiteError, Sites};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::listeners::tls::TlsSettings;
@@ -38,11 +37,8 @@ pub enum Error {
     UpstreamTls(#[from] piano_upstream::tls::Error),
     #[error(transparent)]
     Resolve(#[from] piano_upstream::resolve::Error),
-    #[error("site {site}: invalid upstream host header: {source}")]
-    Site {
-        site: String,
-        source: http::header::InvalidHeaderValue,
-    },
+    #[error("site {site}: {source}")]
+    Site { site: String, source: SiteError },
     #[error("site {0}: upstream was not validated")]
     Unvalidated(String),
 }
@@ -204,13 +200,11 @@ fn build_sites(
             addr,
             options,
         };
-        let block = BlockList::new(&site.block);
-        let s =
-            Site::new(site.name.clone(), site.host.clone(), origin, block).map_err(|source| {
-                Error::Site {
-                    site: site.name.clone(),
-                    source,
-                }
+        let s = Policy::from_config(site)
+            .and_then(|policy| Site::new(site.name.clone(), site.host.clone(), origin, policy))
+            .map_err(|source| Error::Site {
+                site: site.name.clone(),
+                source,
             })?;
         sites.push(s);
     }

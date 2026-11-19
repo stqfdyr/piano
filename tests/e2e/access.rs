@@ -29,6 +29,7 @@ async fn refused_addresses_are_closed_before_the_handshake() {
         allow: &["192.0.2.1", "2001:db8::/32"],
         hosts: &[SITE_HOST],
         block: &[],
+        site_toml: "",
     });
     let err = get(&ca, &relay, SITE_HOST).await.unwrap_err();
     assert!(err.is_connect(), "{err:?}");
@@ -49,6 +50,7 @@ async fn reload_replaces_access_certificates_and_sites() {
         allow: &["192.0.2.1"],
         hosts: &[SITE_HOST],
         block: &[],
+        site_toml: "",
     });
     assert!(get(&old_ca, &relay, SITE_HOST).await.is_err());
 
@@ -60,6 +62,7 @@ async fn reload_replaces_access_certificates_and_sites() {
             allow: &["127.0.0.0/8"],
             hosts: &[SITE_HOST, OTHER_HOST],
             block: &[],
+            site_toml: "",
         })
         .unwrap();
     assert!(restart.is_empty(), "{restart:?}");
@@ -86,6 +89,7 @@ async fn failed_reload_keeps_the_running_configuration() {
         allow: &["127.0.0.1"],
         hosts: &[SITE_HOST],
         block: &[],
+        site_toml: "",
     };
     let relay = Relay::start(&setup);
 
