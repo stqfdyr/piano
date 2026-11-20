@@ -27,7 +27,7 @@ use log::debug;
 use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OkOrErr, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -309,6 +309,8 @@ pub struct Connector {
     in_use_pool: InUsePool,
     pool_callback: Option<PoolCallback>,
     h1_response_parser_config: ResponseParserConfig,
+    // connections being set up, per peer
+    pub(crate) dials: Arc<Dials>,
 }
 
 impl Connector {
@@ -332,6 +334,7 @@ impl Connector {
             in_use_pool: InUsePool::new(),
             pool_callback,
             h1_response_parser_config,
+            dials: Arc::default(),
         }
     }
 
@@ -530,6 +533,75 @@ impl Connector {
             .preferred_http_version
             .get(peer)
             .is_some_and(|v| matches!(v, ALPN::H1))
+    }
+}
+
+/// Coalesces new connections to one peer. While a connection to a peer is being set up,
+/// further requests for that peer wait for it and then share it as h2 streams, instead of
+/// each opening a connection of its own: a burst of requests to a cold peer would
+/// otherwise open as many connections as there are requests.
+#[derive(Default)]
+pub(crate) struct Dials {
+    state: Mutex<DialState>,
+}
+
+#[derive(Default)]
+struct DialState {
+    // reuse hash -> closed when the dial in progress ends
+    pending: HashMap<u64, watch::Receiver<()>>,
+    // peers whose last connection negotiated HTTP/1: their requests cannot share one, so
+    // they are not held back
+    h1: HashSet<u64>,
+}
+
+pub(crate) enum Dial {
+    /// This caller sets up the connection; others wait until the guard drops.
+    Lead(DialGuard),
+    /// Another caller is setting one up; wait until its sender closes.
+    Wait(watch::Receiver<()>),
+    /// Set up a connection without coordinating.
+    Alone,
+}
+
+pub(crate) struct DialGuard {
+    dials: Arc<Dials>,
+    hash: u64,
+    _done: watch::Sender<()>,
+}
+
+impl Dials {
+    pub(crate) fn begin(self: &Arc<Self>, hash: u64) -> Dial {
+        let mut state = self.state.lock();
+        if state.h1.contains(&hash) {
+            return Dial::Alone;
+        }
+        if let Some(rx) = state.pending.get(&hash) {
+            return Dial::Wait(rx.clone());
+        }
+        let (tx, rx) = watch::channel(());
+        state.pending.insert(hash, rx);
+        Dial::Lead(DialGuard {
+            dials: Arc::clone(self),
+            hash,
+            _done: tx,
+        })
+    }
+
+    /// Records which protocol a new connection to the peer negotiated.
+    pub(crate) fn negotiated(&self, hash: u64, h2: bool) {
+        let mut state = self.state.lock();
+        if h2 {
+            state.h1.remove(&hash);
+        } else {
+            state.h1.insert(hash);
+        }
+    }
+}
+
+impl Drop for DialGuard {
+    fn drop(&mut self) {
+        // the entry goes first, so nobody new waits on the sender about to close
+        self.dials.state.lock().pending.remove(&self.hash);
     }
 }
 

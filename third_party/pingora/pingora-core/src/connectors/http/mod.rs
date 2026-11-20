@@ -106,25 +106,49 @@ where
             let (h1, reused) = self.h1.get_http_session(peer).await?;
             Ok((HttpSession::H1(h1), reused))
         } else {
-            // the peer allows h2, we first check the h2 reuse pool
-            let reused_h2 = self.h2.reused_http_session(peer).await?;
-            if let Some(h2) = reused_h2 {
-                return Ok((HttpSession::H2(h2), true));
-            }
-            let h2_only = peer
-                .get_peer_options()
-                .is_some_and(|o| o.alpn.get_min_http_version() == 2)
-                && !self.h2.h1_is_preferred(peer);
-            if !h2_only {
-                // We next check the reuse pool for h1 before creating a new h2 connection.
-                // This is because the server may not support h2 at all, connections to
-                // the server could all be h1.
-                if let Some(h1) = self.h1.reused_http_session(peer).await {
-                    return Ok((HttpSession::H1(h1), true));
+            let hash = peer.reuse_hash();
+            let mut waited = false;
+            loop {
+                // the peer allows h2, we first check the h2 reuse pool
+                let reused_h2 = self.h2.reused_http_session(peer).await?;
+                if let Some(h2) = reused_h2 {
+                    return Ok((HttpSession::H2(h2), true));
                 }
+                let h2_only = peer
+                    .get_peer_options()
+                    .is_some_and(|o| o.alpn.get_min_http_version() == 2)
+                    && !self.h2.h1_is_preferred(peer);
+                if !h2_only {
+                    // We next check the reuse pool for h1 before creating a new h2 connection.
+                    // This is because the server may not support h2 at all, connections to
+                    // the server could all be h1.
+                    if let Some(h1) = self.h1.reused_http_session(peer).await {
+                        return Ok((HttpSession::H1(h1), true));
+                    }
+                }
+                // Wait at most once: if the awaited dial failed, retrying it one caller at a
+                // time would add a connect timeout per waiting caller.
+                let dial = if waited {
+                    v2::Dial::Alone
+                } else {
+                    self.h2.dials.begin(hash)
+                };
+                let guard = match dial {
+                    v2::Dial::Wait(mut done) => {
+                        let _ = done.changed().await;
+                        waited = true;
+                        continue;
+                    }
+                    v2::Dial::Lead(guard) => Some(guard),
+                    v2::Dial::Alone => None,
+                };
+                let session = self.h2.new_http_session(peer).await?;
+                self.h2
+                    .dials
+                    .negotiated(hash, matches!(session, HttpSession::H2(_)));
+                drop(guard);
+                return Ok((session, false));
             }
-            let session = self.h2.new_http_session(peer).await?;
-            Ok((session, false))
         }
     }
 
