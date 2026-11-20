@@ -1,6 +1,6 @@
 //! The control socket: status and reload.
 
-use piano_ctl::proto::{ReloadReply, Status};
+use piano_ctl::proto::{Live, ReloadReply, Status};
 use piano_e2e::client::{Proto, client};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
@@ -167,4 +167,65 @@ async fn the_socket_is_removed_when_the_daemon_stops() {
     assert!(socket.exists());
     drop(w.relay);
     assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn live_lists_a_stalled_stream_and_times_first_bytes() {
+    let w = world().await;
+    let url = format!(
+        "https://{SITE_HOST}:{}/videos/live/stream.mkv?len=300000&plan=b4000,b4000,-",
+        w.relay.addr.port()
+    );
+    let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1);
+    let play = tokio::spawn(async move {
+        let res = c
+            .get(url)
+            .header("range", "bytes=1000-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 206);
+        res.bytes().await.unwrap().len()
+    });
+    // Both requests hold their bodies for 4 s, under the test site's 5 s stall limit;
+    // the second starts after 3 s without bytes.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        let l: Live = ask(w.relay.control_socket(), "live").await;
+        if let Some(s) = l.streams.first()
+            && s.hedges == 1
+        {
+            break s.clone();
+        }
+        assert!(Instant::now() < deadline, "{l:#?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(stream.site, "media");
+    assert_eq!(stream.client.as_deref(), Some("127.0.0.1"));
+    assert!(stream.path.starts_with("/videos/live/"), "{}", stream.path);
+    assert_eq!((stream.position, stream.size), (Some(1000), Some(300_000)));
+    assert_eq!((stream.sent, stream.requests, stream.in_flight), (0, 2, 2));
+    assert!(stream.ttfb_ms.is_some());
+    assert!(stream.idle_ms >= 3000, "{}", stream.idle_ms);
+    assert!(!stream.client_holds);
+    assert_eq!(stream.upstream.as_deref(), Some(ORIGIN_HOST));
+    // The stream's first byte counts while it still runs.
+    let l: Live = ask(w.relay.control_socket(), "live").await;
+    assert_eq!(l.sites[0].ttfb["media"].iter().sum::<u64>(), 1);
+    assert_eq!(play.await.unwrap(), 299_000);
+    assert_eq!(get(&w.ca, &w.relay, "/__info").await, 200);
+    let s = status_after(&w.relay, 2).await;
+    let site = &s.sites[0];
+    assert_eq!(site.ttfb["media"].count, 1);
+    assert_eq!(site.ttfb["browse"].count, 1);
+    assert_eq!(site.ttfb["image"].count, 0);
+    assert!(site.ttfb["media"].p50_ms.is_some());
+    let l: Live = ask(w.relay.control_socket(), "live").await;
+    assert!(l.streams.is_empty());
+    assert_eq!(l.ttfb_bounds_ms.len() + 1, l.sites[0].ttfb["media"].len());
+    assert_eq!(l.sites[0].ttfb["media"].iter().sum::<u64>(), 1);
+    assert_eq!(
+        l.sites[0].total.bytes_sent,
+        s.sites[0].traffic.total.bytes_sent
+    );
 }

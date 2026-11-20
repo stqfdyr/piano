@@ -595,6 +595,7 @@ async fn fetch(spec: &Spec) -> Fetched {
 /// CDN and costs the upstream nothing.
 async fn admit(budget: &Budget, free: bool) -> std::result::Result<(), Duration> {
     let deadline = Instant::now() + MAX_WAIT;
+    let mut queued = None;
     loop {
         let now = Instant::now();
         let wait = if free {
@@ -605,7 +606,10 @@ async fn admit(budget: &Budget, free: bool) -> std::result::Result<(), Duration>
         match wait {
             Wait::Go => return Ok(()),
             Wait::For(d) if now + d > deadline => return Err(d),
-            Wait::For(d) => tokio::time::sleep(d).await,
+            Wait::For(d) => {
+                queued.get_or_insert_with(|| budget.queue());
+                tokio::time::sleep(d).await;
+            }
         }
     }
 }

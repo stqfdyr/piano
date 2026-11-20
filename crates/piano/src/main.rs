@@ -4,6 +4,7 @@
 
 mod logtail;
 mod render;
+mod top;
 
 use clap::{Parser, Subcommand};
 use piano_ctl::ClientError;
@@ -63,6 +64,13 @@ enum Command {
     /// Reread the configuration file and certificates; the running configuration stays
     /// if the new one fails.
     Reload,
+    /// Full-screen view of what the daemon is doing now: media streams, sites, upstream
+    /// budgets and recent problems. --json prints one reply of the daemon instead.
+    Top {
+        /// Seconds between updates.
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+    },
     /// Configuration commands.
     Config {
         #[command(subcommand)]
@@ -157,6 +165,7 @@ fn main() -> ExitCode {
         }
         Command::Status => status(&cli),
         Command::Reload => reload(&cli),
+        Command::Top { interval } => top(&cli, interval),
         Command::Config {
             command: ConfigCommand::Check,
         } => config_check(&cli.config),
@@ -247,6 +256,52 @@ fn status(cli: &Cli) -> ExitCode {
         print!("{}", render::status(&status, render::color(cli.no_color)));
     }
     ExitCode::SUCCESS
+}
+
+/// Shortest interval for `top`: each update asks the daemon and redraws the screen.
+const MIN_INTERVAL: f64 = 0.2;
+
+fn top(cli: &Cli, interval: f64) -> ExitCode {
+    if !interval.is_finite() || interval < MIN_INTERVAL {
+        eprintln!("--interval must be at least {MIN_INTERVAL} seconds");
+        return ExitCode::from(exit::CONFIG);
+    }
+    if cli.json {
+        let live: piano_ctl::proto::Live = match ask(cli, "live", STATUS_TIMEOUT) {
+            Ok(l) => l,
+            Err(code) => return code,
+        };
+        print_json(&live);
+        return ExitCode::SUCCESS;
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        eprintln!("piano top needs a terminal; piano top --json prints one reply");
+        return ExitCode::from(exit::CONFIG);
+    }
+    let Some(socket) = socket_path(cli) else {
+        eprintln!(
+            "the control socket is off (control.socket = \"\" in {})",
+            cli.config.display()
+        );
+        return ExitCode::from(exit::UNREACHABLE);
+    };
+    // Fail before taking over the screen when the daemon is not there at all.
+    if let Err(e) = top::ask(&socket, STATUS_TIMEOUT) {
+        eprintln!("{e}");
+        return ExitCode::from(exit::UNREACHABLE);
+    }
+    let opts = top::Options {
+        socket,
+        interval: Duration::from_secs_f64(interval),
+    };
+    match top::run(&opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("terminal: {e}");
+            ExitCode::from(exit::RUNTIME)
+        }
+    }
 }
 
 fn reload(cli: &Cli) -> ExitCode {

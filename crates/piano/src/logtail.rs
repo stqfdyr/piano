@@ -7,9 +7,9 @@ use crate::render::Color;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How often a followed file is checked for new lines and for having been rotated.
@@ -155,16 +155,72 @@ fn drain(
     }
 }
 
+/// Reads a log file as it grows, across rotation: when the path names another file or
+/// the file shrinks, the rest of the old one is read and the new one opened.
+pub struct Follower {
+    path: PathBuf,
+    file: File,
+    reader: BufReader<File>,
+    pending: String,
+}
+
+impl Follower {
+    /// Opens `path` at its start, or with `last` at about that many bytes before its
+    /// end, from the next whole line.
+    pub fn open(path: &Path, last: Option<u64>) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file.try_clone()?);
+        let mut pending = String::new();
+        if let Some(n) = last {
+            let len = file.metadata()?.len();
+            if len > n {
+                reader.seek(SeekFrom::Start(len - n))?;
+                // The partial line before the next newline.
+                reader.read_line(&mut pending)?;
+                pending.clear();
+            }
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            reader,
+            pending,
+        })
+    }
+
+    /// Passes each complete line written since the last call to `each`.
+    pub fn read(&mut self, each: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+        drain(&mut self.reader, &mut self.pending, each)
+    }
+
+    /// Like [`Self::read`], then switches to a new file if the log was rotated or
+    /// truncated.
+    pub fn poll(&mut self, mut each: impl FnMut(&str) -> io::Result<()>) -> io::Result<()> {
+        self.read(&mut each)?;
+        let current = self.file.metadata()?;
+        let replaced = match std::fs::metadata(&self.path) {
+            Ok(m) => m.ino() != current.ino() || m.dev() != current.dev(),
+            Err(_) => false,
+        };
+        let pos = self.reader.stream_position()?;
+        if replaced || current.len() < pos {
+            self.read(&mut each)?;
+            self.pending.clear();
+            self.file = File::open(&self.path)?;
+            self.reader = BufReader::new(self.file.try_clone()?);
+        }
+        Ok(())
+    }
+}
+
 /// Prints the last `n` lines of `path` that pass `filter`, then, with `follow`,
 /// every new one until interrupted, across log rotation.
 pub fn tail(path: &Path, n: usize, follow: bool, filter: &Filter, out: &Output) -> io::Result<()> {
     let stdout = io::stdout();
     let mut w = stdout.lock();
-    let mut file = File::open(path)?;
-    let mut reader = BufReader::new(file.try_clone()?);
-    let mut pending = String::new();
+    let mut log = Follower::open(path, None)?;
     let mut last: VecDeque<String> = VecDeque::with_capacity(n.min(4096));
-    drain(&mut reader, &mut pending, |raw| {
+    log.read(|raw| {
         if let Ok(v) = serde_json::from_str::<Value>(raw)
             && filter.matches(&v)
         {
@@ -195,21 +251,7 @@ pub fn tail(path: &Path, n: usize, follow: bool, filter: &Filter, out: &Output) 
     };
     loop {
         std::thread::sleep(POLL);
-        drain(&mut reader, &mut pending, &mut emit)?;
-        // logrotate moved the file away and the daemon started a new one, or the file
-        // was truncated in place.
-        let current = file.metadata()?;
-        let replaced = match std::fs::metadata(path) {
-            Ok(m) => m.ino() != current.ino() || m.dev() != current.dev(),
-            Err(_) => false,
-        };
-        let pos = reader.stream_position()?;
-        if replaced || current.len() < pos {
-            drain(&mut reader, &mut pending, &mut emit)?;
-            pending.clear();
-            file = File::open(path)?;
-            reader = BufReader::new(file.try_clone()?);
-        }
+        log.poll(&mut emit)?;
     }
 }
 
@@ -247,6 +289,46 @@ mod tests {
             "11-20 08:01:02 uhd    502 GET /emby/Videos/1/stream 12ms 192.0.2.7 end=redirect_refused err=no"
         );
         assert_eq!(clip("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn a_follower_can_start_near_the_end_and_follows_rotation() {
+        let dir = std::env::temp_dir().join(format!("piano-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("access.log");
+        std::fs::write(
+            &path,
+            "first line
+second
+third
+",
+        )
+        .unwrap();
+        let mut f = Follower::open(&path, Some(10)).unwrap();
+        let mut seen = Vec::new();
+        f.poll(|l| {
+            seen.push(l.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, ["third"]);
+        std::fs::write(
+            dir.join("next"),
+            "after rotation
+",
+        )
+        .unwrap();
+        std::fs::rename(dir.join("next"), &path).unwrap();
+        // The first poll notices the new file, the next reads it.
+        for _ in 0..2 {
+            f.poll(|l| {
+                seen.push(l.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(seen, ["third", "after rotation"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

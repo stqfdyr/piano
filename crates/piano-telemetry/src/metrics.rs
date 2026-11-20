@@ -307,6 +307,15 @@ impl Metrics {
         self.read().0
     }
 
+    /// The counts and histograms of every site since start, by name.
+    pub fn live(&self) -> BTreeMap<String, (Counts, TtfbBuckets)> {
+        let sites = self.sites.lock().unwrap_or_else(PoisonError::into_inner);
+        sites
+            .iter()
+            .map(|(n, c)| (n.clone(), (c.counts(), c.ttfb())))
+            .collect()
+    }
+
     fn read_ttfb(&self) -> BTreeMap<String, TtfbBuckets> {
         let sites = self.sites.lock().unwrap_or_else(PoisonError::into_inner);
         sites.iter().map(|(n, c)| (n.clone(), c.ttfb())).collect()

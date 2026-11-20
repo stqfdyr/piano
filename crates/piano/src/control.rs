@@ -38,6 +38,7 @@ impl Handler for Commands {
             "status" => Some(to_value(&self.0.status())),
             "reload" => Some(to_value(&self.0.reload().await)),
             "cache" => Some(to_value(&self.0.cache())),
+            "live" => Some(to_value(&self.0.live_view())),
             "cache purge" => Some(to_value(&self.0.purge())),
             _ => None,
         }

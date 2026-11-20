@@ -1,9 +1,22 @@
 //! The table of media streams being relayed, for live views.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Why an upstream request of a stream started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    First,
+    /// The body stalled; another request for the same bytes.
+    Hedge,
+    /// The previous request failed or ended early.
+    Resume,
+}
+
+/// Marks a counter that has no value yet.
+const UNSET: u64 = u64::MAX;
 
 /// One media stream. The descriptive fields are fixed at registration; the counters
 /// are updated while it runs.
@@ -20,8 +33,31 @@ pub struct Stream {
     sent: AtomicU64,
     /// Upstream requests started for this stream: the first, hedges and resumes.
     requests: AtomicU32,
-    /// Milliseconds to the response head the client got; `u64::MAX` until then.
+    hedges: AtomicU32,
+    resumes: AtomicU32,
+    /// Upstream requests in flight now.
+    sources: AtomicU32,
+    /// Milliseconds to the response head the client got; [`UNSET`] until then.
     ttfb_ms: AtomicU64,
+    /// Milliseconds from the start to the last bytes written to the client.
+    progress_ms: AtomicU64,
+    /// Offset in the whole representation of the next byte for the client, and the
+    /// representation's length, when the response says.
+    position: AtomicU64,
+    size: AtomicU64,
+    /// Host of the upstream request the bytes come from.
+    upstream: Mutex<Option<String>>,
+    /// Bytes are waiting for the client to take them: a paused player or a slow link,
+    /// rather than the upstream, holds the stream.
+    writing: AtomicBool,
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(UNSET - 1)
+}
+
+fn known(v: u64) -> Option<u64> {
+    (v != UNSET).then_some(v)
 }
 
 impl Stream {
@@ -41,12 +77,36 @@ impl Stream {
             started: Instant::now(),
             sent: AtomicU64::new(0),
             requests: AtomicU32::new(0),
-            ttfb_ms: AtomicU64::new(u64::MAX),
+            hedges: AtomicU32::new(0),
+            resumes: AtomicU32::new(0),
+            sources: AtomicU32::new(0),
+            ttfb_ms: AtomicU64::new(UNSET),
+            progress_ms: AtomicU64::new(0),
+            position: AtomicU64::new(UNSET),
+            size: AtomicU64::new(UNSET),
+            upstream: Mutex::new(None),
+            writing: AtomicBool::new(false),
         }
     }
 
+    pub fn set_writing(&self, on: bool) {
+        self.writing.store(on, Ordering::Relaxed);
+    }
+
+    pub fn writing(&self) -> bool {
+        self.writing.load(Ordering::Relaxed)
+    }
+
+    /// Counts body bytes written to the client.
     pub fn add_sent(&self, n: u64) {
         self.sent.fetch_add(n, Ordering::Relaxed);
+        let _ = self
+            .position
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |p| {
+                known(p).map(|p| p.saturating_add(n))
+            });
+        self.progress_ms
+            .store(millis(self.started.elapsed()), Ordering::Relaxed);
     }
 
     /// Body bytes written to the client so far.
@@ -54,24 +114,82 @@ impl Stream {
         self.sent.load(Ordering::Relaxed)
     }
 
-    pub fn add_request(&self) {
+    pub fn add_request(&self, why: Request) {
         self.requests.fetch_add(1, Ordering::Relaxed);
+        match why {
+            Request::First => {}
+            Request::Hedge => {
+                self.hedges.fetch_add(1, Ordering::Relaxed);
+            }
+            Request::Resume => {
+                self.resumes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn requests(&self) -> u32 {
         self.requests.load(Ordering::Relaxed)
     }
 
+    pub fn hedges(&self) -> u32 {
+        self.hedges.load(Ordering::Relaxed)
+    }
+
+    pub fn resumes(&self) -> u32 {
+        self.resumes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sources(&self, n: usize) {
+        self.sources
+            .store(u32::try_from(n).unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+
+    pub fn sources(&self) -> u32 {
+        self.sources.load(Ordering::Relaxed)
+    }
+
     pub fn set_ttfb(&self, d: Duration) {
-        let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1);
-        self.ttfb_ms.store(ms, Ordering::Relaxed);
+        self.ttfb_ms.store(millis(d), Ordering::Relaxed);
     }
 
     pub fn ttfb(&self) -> Option<Duration> {
-        match self.ttfb_ms.load(Ordering::Relaxed) {
-            u64::MAX => None,
-            ms => Some(Duration::from_millis(ms)),
+        known(self.ttfb_ms.load(Ordering::Relaxed)).map(Duration::from_millis)
+    }
+
+    /// Where the client's body starts in the representation and how long that is.
+    pub fn set_span(&self, start: u64, size: Option<u64>) {
+        self.position.store(start, Ordering::Relaxed);
+        self.size.store(size.unwrap_or(UNSET), Ordering::Relaxed);
+    }
+
+    pub fn position(&self) -> Option<u64> {
+        known(self.position.load(Ordering::Relaxed))
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        known(self.size.load(Ordering::Relaxed))
+    }
+
+    /// Time since bytes last reached the client, or since the start before any did.
+    pub fn idle(&self) -> Duration {
+        let last = Duration::from_millis(self.progress_ms.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+
+    fn host(&self) -> MutexGuard<'_, Option<String>> {
+        // A plain value; a panic elsewhere cannot leave it inconsistent.
+        self.upstream.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_upstream(&self, host: &str) {
+        let mut h = self.host();
+        if h.as_deref() != Some(host) {
+            *h = Some(host.to_owned());
         }
+    }
+
+    pub fn upstream(&self) -> Option<String> {
+        self.host().clone()
     }
 }
 
@@ -109,7 +227,7 @@ impl Streams {
         all
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Stream>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Arc<Stream>>> {
         // The map holds plain data, so a panic elsewhere cannot leave it inconsistent.
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -147,7 +265,7 @@ mod tests {
         let a = streams.register(Stream::new("1".into(), "s".into(), None, "/a".into(), None));
         let b = streams.register(Stream::new("2".into(), "s".into(), None, "/b".into(), None));
         a.add_sent(10);
-        a.add_request();
+        a.add_request(Request::First);
         assert_eq!(a.ttfb(), None);
         a.set_ttfb(Duration::from_millis(5));
         assert_eq!(a.ttfb(), Some(Duration::from_millis(5)));
@@ -161,5 +279,27 @@ mod tests {
         assert_eq!(streams.len(), 1);
         drop(b);
         assert!(streams.is_empty());
+    }
+
+    #[test]
+    fn position_follows_the_bytes_sent() {
+        let s = Stream::new("1".into(), "s".into(), None, "/a".into(), None);
+        s.add_sent(5);
+        assert_eq!(s.position(), None);
+        s.set_span(100, Some(1000));
+        s.add_sent(50);
+        assert_eq!(
+            (s.position(), s.size(), s.sent()),
+            (Some(150), Some(1000), 55)
+        );
+        s.add_request(Request::First);
+        s.add_request(Request::Hedge);
+        s.add_request(Request::Resume);
+        s.add_request(Request::Resume);
+        assert_eq!((s.requests(), s.hedges(), s.resumes()), (4, 1, 2));
+        assert_eq!(s.upstream(), None);
+        s.set_upstream("cdn.example.com");
+        assert_eq!(s.upstream().as_deref(), Some("cdn.example.com"));
+        assert!(s.idle() < Duration::from_secs(1));
     }
 }

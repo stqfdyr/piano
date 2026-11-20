@@ -3,6 +3,7 @@
 //! and playback share with them.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Share of the bucket that image requests leave to other requests. Browsing issues up
@@ -35,6 +36,8 @@ pub struct BudgetState {
     pub paused_for: Option<Duration>,
     /// Times the upstream answered 429.
     pub limited: u64,
+    /// Image requests waiting for the budget now.
+    pub waiting: u64,
 }
 
 #[derive(Debug)]
@@ -65,6 +68,17 @@ impl Inner {
 #[derive(Debug)]
 pub struct Budget {
     inner: Mutex<Inner>,
+    waiting: AtomicU64,
+}
+
+/// Counts a request as waiting for the budget while it lives.
+#[derive(Debug)]
+pub struct Queued<'a>(&'a Budget);
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Budget {
@@ -78,7 +92,14 @@ impl Budget {
                 paused_until: None,
                 limited: 0,
             }),
+            waiting: AtomicU64::new(0),
         }
+    }
+
+    /// Marks a request as waiting until the returned guard drops.
+    pub fn queue(&self) -> Queued<'_> {
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        Queued(self)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -153,6 +174,7 @@ impl Budget {
             tokens: s.tokens,
             paused_for: s.paused_for(now),
             limited: s.limited,
+            waiting: self.waiting.load(Ordering::Relaxed),
         }
     }
 }
@@ -241,5 +263,18 @@ mod tests {
         assert_eq!(b.state(t).tokens, 2.0);
         b.set_rate(None, t);
         assert_eq!(b.admit(t), Wait::Go);
+    }
+
+    #[test]
+    fn waiting_requests_are_counted_while_queued() {
+        let now = Instant::now();
+        let b = Budget::new(Some(RATE), now);
+        let one = b.queue();
+        let two = b.queue();
+        assert_eq!(b.state(now).waiting, 2);
+        drop(one);
+        assert_eq!(b.state(now).waiting, 1);
+        drop(two);
+        assert_eq!(b.state(now).waiting, 0);
     }
 }

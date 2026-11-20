@@ -48,6 +48,8 @@ pub const STATUS_SCHEMA: u32 = 1;
 pub const RELOAD_SCHEMA: u32 = 1;
 /// Version of [`CacheStats`] and [`PurgeReply`].
 pub const CACHE_SCHEMA: u32 = 1;
+/// Version of [`Live`].
+pub const LIVE_SCHEMA: u32 = 1;
 
 /// Reply to `status`. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,6 +275,71 @@ pub struct UpstreamBudget {
     pub paused_secs: Option<f64>,
     /// Upstream 429 answers since start.
     pub limited: u64,
+    /// Image requests waiting for the budget now.
+    #[serde(default)]
+    pub waiting: u64,
+}
+
+/// Reply to `live`: what the daemon is doing now, for `piano top`. Counters are
+/// totals since start; a reader takes two replies and divides the difference by the
+/// difference of `uptime_ms`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Live {
+    pub schema: u32,
+    pub version: String,
+    pub pid: u32,
+    /// Milliseconds since start on a clock that only moves forward.
+    pub uptime_ms: u64,
+    pub connections: Connections,
+    /// `None` when the access log is off.
+    pub access_log: Option<String>,
+    /// Upper bounds of the `ttfb` buckets in milliseconds; the last bucket has none.
+    pub ttfb_bounds_ms: Vec<f64>,
+    pub sites: Vec<SiteLive>,
+    pub streams: Vec<StreamLive>,
+    pub cache: CacheStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SiteLive {
+    pub name: String,
+    pub total: Counts,
+    /// Bucket counts of the time to first byte since start, by `browse`, `image` and
+    /// `media`. Every key is present.
+    pub ttfb: BTreeMap<String, Vec<u64>>,
+}
+
+/// A media stream being relayed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamLive {
+    pub rid: String,
+    pub site: String,
+    pub client: Option<String>,
+    /// Request target, credentials removed.
+    pub path: String,
+    pub range: Option<String>,
+    pub age_ms: u64,
+    /// Body bytes written to the client.
+    pub sent: u64,
+    /// Offset of the next byte in the whole file, and the file's length, when known.
+    pub position: Option<u64>,
+    pub size: Option<u64>,
+    /// `None` while the stream waits for its response head.
+    pub ttfb_ms: Option<u64>,
+    /// Time since bytes last reached the client (since the start before any did).
+    pub idle_ms: u64,
+    /// Upstream requests: all of them, those started because the body stalled, and
+    /// those that replaced a failed or short one.
+    pub requests: u32,
+    pub hedges: u32,
+    pub resumes: u32,
+    /// Upstream requests in flight now.
+    pub in_flight: u32,
+    /// Bytes wait for the client to take them: the client, not the upstream, holds the
+    /// stream (a paused player or a slow link).
+    pub client_holds: bool,
+    /// Host the bytes come from.
+    pub upstream: Option<String>,
 }
 
 /// Reply to `cache purge`: what was removed.

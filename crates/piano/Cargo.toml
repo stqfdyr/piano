@@ -21,6 +21,7 @@ piano-media.workspace = true
 piano-proxy.workspace = true
 piano-telemetry.workspace = true
 piano-upstream.workspace = true
+ratatui.workspace = true
 pingora-core.workspace = true
 pingora-proxy.workspace = true
 serde.workspace = true

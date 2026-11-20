@@ -58,6 +58,10 @@ regex = { version = "1", default-features = false, features = ["std", "perf", "u
 # which uses it without the clock. The clock brings iana-time-zone.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+# piano top: layout and drawing of the live view, with crossterm for raw mode, the
+# alternate screen and key events.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
 # Control protocol frames; also the tests' JSON reader.
 serde_json = "1"
 

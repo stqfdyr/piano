@@ -3,17 +3,17 @@
 use crate::{Live, procfs};
 use log::{LevelFilter, error, info, warn};
 use piano_ctl::proto::{
-    self, CACHE_SCHEMA, CacheStats, Certificate, ConfigState, Connections, Finding, Latency, Level,
-    PurgeReply, RELOAD_SCHEMA, ReloadRecord, ReloadReply, STATUS_SCHEMA, SiteStatus, Status,
-    Traffic, UpstreamBudget,
+    self, CACHE_SCHEMA, CacheStats, Certificate, ConfigState, Connections, Finding, LIVE_SCHEMA,
+    Latency, Level, PurgeReply, RELOAD_SCHEMA, ReloadRecord, ReloadReply, STATUS_SCHEMA, SiteLive,
+    SiteStatus, Status, StreamLive, Traffic, UpstreamBudget,
 };
 use piano_telemetry::Ttfb;
-use piano_telemetry::latency::{self, Buckets};
+use piano_telemetry::latency::{self, BOUNDS_US, Buckets};
 use piano_telemetry::logger;
 use piano_telemetry::metrics::{Counts, End, STATUS_CLASSES, TtfbBuckets};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Certificates are renewed 30 days before they expire; 14 days left means renewal has
 /// been failing for two weeks.
@@ -41,6 +41,8 @@ pub struct Admin {
     /// Diagnostic log level given on the command line, which the file does not override.
     level_override: Option<LevelFilter>,
     started: SystemTime,
+    /// The same moment on the monotonic clock, for `live`.
+    started_at: Instant,
     /// One reload at a time, whichever way it was asked for.
     reloading: tokio::sync::Mutex<()>,
     state: Mutex<State>,
@@ -54,6 +56,7 @@ impl Admin {
             path,
             level_override,
             started: now,
+            started_at: Instant::now(),
             reloading: tokio::sync::Mutex::new(()),
             state: Mutex::new(State {
                 loaded: now,
@@ -156,8 +159,86 @@ impl Admin {
                     tokens: b.tokens,
                     paused_secs: b.paused_for.map(|d| d.as_secs_f64()),
                     limited: b.limited,
+                    waiting: b.waiting,
                 })
                 .collect(),
+        }
+    }
+
+    /// What `piano top` shows: counters since start and the streams running now.
+    pub fn live_view(&self) -> proto::Live {
+        let live = &self.live;
+        let mut counts = live.metrics.live();
+        let sites = live
+            .sites
+            .load()
+            .iter()
+            .map(|s| {
+                let (total, ttfb) = counts.remove(&s.name).unwrap_or_else(|| {
+                    (Counts::default(), [[0; latency::BUCKETS]; Ttfb::ALL.len()])
+                });
+                SiteLive {
+                    name: s.name.clone(),
+                    total: wire(&total),
+                    ttfb: Ttfb::ALL
+                        .iter()
+                        .zip(ttfb)
+                        .map(|(k, b)| (k.as_str().to_owned(), b.to_vec()))
+                        .collect(),
+                }
+            })
+            .collect();
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        let streams = live
+            .streams
+            .snapshot()
+            .iter()
+            .map(|s| StreamLive {
+                rid: s.rid.clone(),
+                site: s.site.clone(),
+                client: s.client.map(|a| a.to_string()),
+                path: s.path.clone(),
+                range: s.range.clone(),
+                age_ms: ms(s.started.elapsed()),
+                sent: s.sent(),
+                position: s.position(),
+                size: s.size(),
+                ttfb_ms: s.ttfb().map(ms),
+                idle_ms: ms(s.idle()),
+                requests: s.requests(),
+                hedges: s.hedges(),
+                resumes: s.resumes(),
+                in_flight: s.sources(),
+                client_holds: s.writing(),
+                upstream: s.upstream(),
+            })
+            .collect();
+        proto::Live {
+            schema: LIVE_SCHEMA,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            pid: std::process::id(),
+            uptime_ms: ms(self.started_at.elapsed()),
+            connections: self.connections(),
+            access_log: live.access_log.path().map(|p| p.display().to_string()),
+            ttfb_bounds_ms: BOUNDS_US.iter().map(|&b| b as f64 / 1000.0).collect(),
+            sites,
+            streams,
+            cache: self.cache(),
+        }
+    }
+
+    fn connections(&self) -> Connections {
+        let live = &self.live;
+        let accept = &live.accept;
+        Connections {
+            open: accept.open_connections() as u64,
+            handshaking: accept.pending_handshakes() as u64,
+            limit: (live.fixed.max_connections * live.fixed.listen.len()) as u64,
+            closed_at_limit: accept.closed_at_connection_limit(),
+            handshake_timeouts: accept.handshake_timeouts(),
+            handshake_errors: accept.handshake_errors(),
+            denied: live.denied_connections(),
+            media_streams: live.streams.len() as u64,
         }
     }
 
@@ -206,7 +287,6 @@ impl Admin {
             .collect();
         let state = self.state();
         let cert = live.certs.info();
-        let accept = &live.accept;
         let mut status = Status {
             schema: STATUS_SCHEMA,
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -224,16 +304,7 @@ impl Admin {
                     .collect(),
             },
             process: procfs::process(),
-            connections: Connections {
-                open: accept.open_connections() as u64,
-                handshaking: accept.pending_handshakes() as u64,
-                limit: (live.fixed.max_connections * live.fixed.listen.len()) as u64,
-                closed_at_limit: accept.closed_at_connection_limit(),
-                handshake_timeouts: accept.handshake_timeouts(),
-                handshake_errors: accept.handshake_errors(),
-                denied: live.denied_connections(),
-                media_streams: live.streams.len() as u64,
-            },
+            connections: self.connections(),
             certificate: Certificate {
                 names: cert.names,
                 not_after: cert.not_after,

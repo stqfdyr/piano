@@ -22,7 +22,7 @@ use http::{HeaderName, HeaderValue, Method, Version};
 use log::{debug, warn};
 use piano_cache::Budget;
 use piano_edge::acl::canonical;
-use piano_media::{ByteRange, Head, Resume, Stream, StreamGuard};
+use piano_media::{ByteRange, Head, Request, Resume, Stream, StreamGuard};
 use piano_telemetry::{Id, Kind, SiteCounters, Ttfb, redact};
 use pingora_core::protocols::http::v1::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -145,9 +145,10 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         changed: false,
         error: None,
         stream,
+        serving: None,
         rid: ctx.rid,
     };
-    engine.launch(range);
+    engine.launch(range, Request::First);
     let result = engine.run(session, ctx).await;
     // Requests still running are dropped with the engine; their log entries so far
     // belong to this request.
@@ -247,6 +248,8 @@ struct Source {
     at: Option<u64>,
     /// Absolute end of the bytes its response covers.
     end: u64,
+    /// The host that answered, once its head arrived.
+    host: Option<String>,
 }
 
 impl Source {
@@ -292,11 +295,13 @@ struct Engine {
     /// The last request failure, reported if the stream cannot go on.
     error: Option<Box<Error>>,
     stream: StreamGuard,
+    /// The request whose bytes the client got last.
+    serving: Option<u32>,
     rid: Id,
 }
 
 impl Engine {
-    fn launch(&mut self, range: Option<HeaderValue>) {
+    fn launch(&mut self, range: Option<HeaderValue>, why: Request) {
         let id = self.started;
         self.started += 1;
         let task = tokio::spawn(fetch(Arc::clone(&self.spec), id, range, self.tx.clone()));
@@ -305,10 +310,11 @@ impl Engine {
             task: Some(task),
             at: None,
             end: u64::MAX,
+            host: None,
         });
         self.launched = Instant::now();
         self.unproductive += 1;
-        self.stream.add_request();
+        self.stream.add_request(why);
     }
 
     /// Whether another request may start now that the head is out.
@@ -326,6 +332,7 @@ impl Engine {
 
     async fn run(&mut self, session: &mut Session, ctx: &mut Ctx) -> Result<()> {
         loop {
+            self.stream.set_sources(self.sources.len());
             if self.can_add() && (self.sources.is_empty() || Instant::now() >= self.hedge_at()) {
                 let range = self.resume.as_ref().map(|r| r.range_from(self.pos));
                 let range = range
@@ -339,7 +346,12 @@ impl Engine {
                     self.pos,
                     if self.sources.is_empty() { "resume" } else { "hedge" }
                 );
-                self.launch(range);
+                let why = if self.sources.is_empty() {
+                    Request::Resume
+                } else {
+                    Request::Hedge
+                };
+                self.launch(range, why);
                 continue;
             }
             if self.sources.is_empty() {
@@ -403,10 +415,13 @@ impl Engine {
         };
         match msg {
             Msg::Head(resp, host) => {
+                self.sources[i].host = Some(host.clone());
                 if self.head_sent {
                     self.accept(i, &resp, &host);
                 } else {
                     self.send_head(session, ctx, resp, &host).await?;
+                    self.serving = Some(id);
+                    self.stream.set_upstream(&host);
                     self.sources[i].at = Some(self.pos);
                     self.sources[i].end = self.resume.as_ref().map_or(u64::MAX, |r| r.end);
                 }
@@ -447,6 +462,15 @@ impl Engine {
         headers::scrub_response(&mut resp, host, &self.spec.site()?.host)?;
         self.resume = Resume::of(&head(&resp));
         self.pos = self.resume.as_ref().map_or(0, |r| r.start);
+        let size = match &self.resume {
+            Some(r) => Some(r.complete),
+            None => resp
+                .headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok()),
+        };
+        self.stream.set_span(self.pos, size);
         ctx.ttfb = ctx.start.map(|s| s.elapsed());
         if let Some(t) = ctx.ttfb {
             self.stream.set_ttfb(t);
@@ -512,6 +536,12 @@ impl Engine {
         }
         // The first request to deliver the next bytes carries on alone.
         let winner = self.sources.swap_remove(i);
+        if self.serving != Some(winner.id) {
+            self.serving = Some(winner.id);
+            if let Some(host) = &winner.host {
+                self.stream.set_upstream(host);
+            }
+        }
         self.sources.clear();
         self.sources.push(winner);
         let skip = usize::try_from(self.pos - at).unwrap_or(usize::MAX);
@@ -529,10 +559,10 @@ impl Engine {
 
     async fn write(&mut self, session: &mut Session, data: Bytes) -> Result<()> {
         let n = data.len() as u64;
-        session
-            .write_response_body(Some(data), false)
-            .await
-            .map_err(|e| e.into_down())?;
+        self.stream.set_writing(true);
+        let written = session.write_response_body(Some(data), false).await;
+        self.stream.set_writing(false);
+        written.map_err(|e| e.into_down())?;
         self.pos += n;
         self.stream.add_sent(n);
         self.spec.counters.add_sent(Kind::Media, n);
