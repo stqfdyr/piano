@@ -1,9 +1,12 @@
 //! Development tasks. Run as `cargo xtask <task>`.
 //!
 //! - `ci`: format check, clippy with warnings denied, tests, dependency policy.
-//! - `dist`: static musl release binary for x86-64-v2 hosts, with size and sha256.
-//! - `deploy HOST [--instance NAME] [--rollback]`: builds with `dist`, installs on HOST over
-//!   ssh with `contrib/install.sh` and switches a running daemon with `piano upgrade`;
+//! - `dist`: static musl release binary for x86-64-v2 hosts and the release archive
+//!   (binary, service files, install script), each with a sha256 file.
+//! - `deploy HOST (--release TAG | --local | --rollback) [--instance NAME]`: installs on
+//!   HOST over ssh with `contrib/install.sh` and switches a running daemon with
+//!   `piano upgrade`. `--release` takes a GitHub release of this repository, checked
+//!   against its sha256 and build attestation; `--local` builds with `dist`;
 //!   `--rollback` goes back to the binary installed before.
 
 #![forbid(unsafe_code)]
@@ -16,6 +19,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 const DIST_TARGET: &str = "x86_64-unknown-linux-musl";
+/// Platform part of release file names.
+const DIST_PLATFORM: &str = "x86_64-linux-musl";
 /// Oldest production CPU has no AVX2.
 const DIST_CPU: &str = "x86-64-v2";
 
@@ -29,7 +34,7 @@ fn main() -> ExitCode {
         ["dist"] => dist().map(drop),
         ["deploy", rest @ ..] => parse_deploy(rest).and_then(|d| deploy(&d)),
         _ => {
-            eprintln!("usage: cargo xtask <ci|dist|deploy HOST [--instance NAME] [--rollback]>");
+            eprintln!("usage: cargo xtask <ci|dist|{DEPLOY_USAGE}>");
             return ExitCode::from(2);
         }
     };
@@ -159,7 +164,12 @@ fn ci() -> Result {
     run("deny", deny)
 }
 
-/// Builds the release binary into `target/dist` with its `.sha256` file; returns its path.
+fn target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root().join("target"), PathBuf::from)
+}
+
+/// Builds the release binary and the release archive into `target/dist`, each with its
+/// `.sha256` file; returns the binary's path.
 fn dist() -> Result<PathBuf> {
     let mut build = cargo();
     build
@@ -178,8 +188,7 @@ fn dist() -> Result<PathBuf> {
         );
     run("build", build)?;
 
-    let target_dir =
-        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root().join("target"), PathBuf::from);
+    let target_dir = target_dir();
     let built = target_dir.join(DIST_TARGET).join("release").join("piano");
     let bytes = std::fs::read(&built).map_err(|e| format!("{}: {e}", built.display()))?;
     if has_interpreter(&bytes)? {
@@ -189,21 +198,13 @@ fn dist() -> Result<PathBuf> {
     let version = workspace_version()?;
     let out_dir = target_dir.join("dist");
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
-    let name = format!("piano-{version}-x86_64-linux-musl");
+    let name = format!("piano-{version}-{DIST_PLATFORM}");
     let out = out_dir.join(&name);
     std::fs::write(&out, &bytes).map_err(|e| format!("{}: {e}", out.display()))?;
     set_executable(&out)?;
-
-    let sum = Command::new("sha256sum")
-        .arg(&name)
-        .current_dir(&out_dir)
-        .output()
-        .map_err(|e| format!("sha256sum: {e}"))?;
-    if !sum.status.success() {
-        return Err("sha256sum failed".into());
-    }
-    let sum_path = out_dir.join(format!("{name}.sha256"));
-    std::fs::write(&sum_path, &sum.stdout).map_err(|e| format!("{}: {e}", sum_path.display()))?;
+    let sum = write_sha256(&out_dir, &name)?;
+    let archive = package(&out_dir, &name, &out)?;
+    let archive_sum = write_sha256(&out_dir, &archive)?;
 
     println!("{}", out.display());
     println!(
@@ -212,8 +213,108 @@ fn dist() -> Result<PathBuf> {
         bytes.len()
     );
     println!("  static yes ({DIST_TARGET}, target-cpu={DIST_CPU})");
-    print!("  sha256 {}", String::from_utf8_lossy(&sum.stdout));
+    print!("  sha256 {sum}");
+    println!("{}", out_dir.join(&archive).display());
+    print!("  sha256 {archive_sum}");
     Ok(out)
+}
+
+/// Writes `dir/name.sha256` in `sha256sum` format; returns its line.
+fn write_sha256(dir: &Path, name: &str) -> Result<String> {
+    let sum = Command::new("sha256sum")
+        .arg(name)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("sha256sum: {e}"))?;
+    if !sum.status.success() {
+        return Err(format!("sha256sum {name} failed"));
+    }
+    let path = dir.join(format!("{name}.sha256"));
+    std::fs::write(&path, &sum.stdout).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(String::from_utf8_lossy(&sum.stdout).into_owned())
+}
+
+/// Repository files shipped in the release archive besides the binary and `CONTRIB`.
+const ARCHIVED: [&str; 2] = ["LICENSE", "README.md"];
+
+/// Packs `binary` (as `piano`), `CONTRIB` and `ARCHIVED` into `out_dir/name.tar.gz`
+/// under the directory `name`, so that `install.sh` finds the binary next to itself;
+/// returns the archive's file name. The same tree gives the same bytes: fixed order,
+/// owner and times, and no name or time in the gzip header.
+fn package(out_dir: &Path, name: &str, binary: &Path) -> Result<String> {
+    let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let stage = out_dir.join("stage");
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage).map_err(|e| io(&stage, e))?;
+    }
+    let dir = stage.join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
+    set_mode(&dir, 0o755)?;
+    let contrib = CONTRIB.iter().map(|f| (root().join("contrib").join(f), *f));
+    let archived = ARCHIVED.iter().map(|f| (root().join(f), *f));
+    for (from, to) in std::iter::once((binary.to_path_buf(), "piano"))
+        .chain(contrib)
+        .chain(archived)
+    {
+        let staged = dir.join(to);
+        std::fs::copy(&from, &staged).map_err(|e| io(&from, e))?;
+        // Modes from the checkout depend on the umask of whoever made it.
+        let mode = if matches!(to, "piano" | "install.sh") {
+            0o755
+        } else {
+            0o644
+        };
+        set_mode(&staged, mode)?;
+    }
+
+    let tar_name = format!("{name}.tar");
+    let mut tar = Command::new("tar");
+    tar.args([
+        "--sort=name",
+        "--owner=0",
+        "--group=0",
+        "--numeric-owner",
+        &format!("--mtime=@{}", source_date()?),
+        "-cf",
+    ])
+    .arg(out_dir.join(&tar_name))
+    .arg("-C")
+    .arg(&stage)
+    .arg(name);
+    run("archive", tar)?;
+    let mut gzip = Command::new("gzip");
+    gzip.args(["-n", "-9", "-f"]).arg(out_dir.join(&tar_name));
+    run("compress", gzip)?;
+    std::fs::remove_dir_all(&stage).map_err(|e| io(&stage, e))?;
+    Ok(format!("{tar_name}.gz"))
+}
+
+/// `SOURCE_DATE_EPOCH` if set, else the time of the commit being built. A tree with
+/// uncommitted changes gets that commit's time too, with a warning.
+fn source_date() -> Result<String> {
+    if let Some(t) = std::env::var_os("SOURCE_DATE_EPOCH") {
+        return t
+            .into_string()
+            .map_err(|_| "SOURCE_DATE_EPOCH is not text".into());
+    }
+    let out = Command::new("git")
+        .args(["log", "-1", "--format=%ct"])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.status.success() || t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("no commit time: set SOURCE_DATE_EPOCH".into());
+    }
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(root())
+        .output()
+        .is_ok_and(|o| !o.stdout.is_empty());
+    if dirty {
+        eprintln!("    warning: uncommitted changes; the archive is dated as HEAD");
+    }
+    Ok(t)
 }
 
 /// The remote half of `deploy`, run as `sh -s` on the host.
@@ -243,22 +344,57 @@ const COPY_LIMIT: Duration = Duration::from_secs(300);
 const REMOTE_LIMIT: Duration = Duration::from_secs(300);
 const REMOTE_DIR_PREFIX: &str = "/tmp/piano-deploy.";
 
+/// Downloading a release archive of about 4 MiB.
+const DOWNLOAD_LIMIT: Duration = Duration::from_secs(300);
+/// `gh attestation verify` fetches the attestation and the signing roots.
+const ATTESTATION_LIMIT: Duration = Duration::from_secs(120);
+const DEPLOY_USAGE: &str = "deploy HOST (--release TAG | --local | --rollback) [--instance NAME]";
+
 #[derive(Debug, PartialEq, Eq)]
 struct Deploy<'a> {
     host: &'a str,
     instance: Option<&'a str>,
-    rollback: bool,
+    source: Source<'a>,
+}
+
+/// Where the binary to install comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source<'a> {
+    /// A GitHub release of this repository, by tag.
+    Release(&'a str),
+    /// Built here with `dist`.
+    Local,
+    /// The binary installed before the current one.
+    Rollback,
 }
 
 fn parse_deploy<'a>(args: &[&'a str]) -> Result<Deploy<'a>> {
-    let usage = || "usage: cargo xtask deploy HOST [--instance NAME] [--rollback]".to_owned();
+    let usage = || format!("usage: cargo xtask {DEPLOY_USAGE}");
     let mut host = None;
     let mut instance = None;
-    let mut rollback = false;
+    let mut source = None;
+    let mut set = |s| match source.replace(s) {
+        None => Ok(()),
+        Some(_) => Err("give one of --release, --local and --rollback".to_owned()),
+    };
     let mut args = args.iter();
     while let Some(&a) = args.next() {
         match a {
-            "--rollback" => rollback = true,
+            "--rollback" => set(Source::Rollback)?,
+            "--local" => set(Source::Local)?,
+            "--release" => {
+                let tag = *args.next().ok_or_else(usage)?;
+                // Passed to gh and used as a directory name.
+                let valid = tag.strip_prefix('v').is_some_and(|v| {
+                    v.starts_with(|c: char| c.is_ascii_digit())
+                        && v.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+                });
+                if !valid {
+                    return Err(format!("release tags look like v0.1.0: {tag}"));
+                }
+                set(Source::Release(tag))?;
+            }
             "--instance" => {
                 let name = *args.next().ok_or_else(usage)?;
                 let valid = !name.is_empty()
@@ -275,6 +411,7 @@ fn parse_deploy<'a>(args: &[&'a str]) -> Result<Deploy<'a>> {
         }
     }
     let host = host.ok_or_else(usage)?;
+    let source = source.ok_or_else(usage)?;
     // Passed to ssh and scp as an argument and shown in commands; keep it plain.
     if !host
         .bytes()
@@ -285,8 +422,96 @@ fn parse_deploy<'a>(args: &[&'a str]) -> Result<Deploy<'a>> {
     Ok(Deploy {
         host,
         instance,
-        rollback,
+        source,
     })
+}
+
+/// `owner/name` of the GitHub repository `origin` points at.
+fn github_repo() -> Result<String> {
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    parse_github(&url).ok_or_else(|| format!("origin is not a GitHub repository: {url:?}"))
+}
+
+fn parse_github(url: &str) -> Option<String> {
+    let path = [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+    ]
+    .iter()
+    .find_map(|p| url.strip_prefix(p))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    (plain(owner) && plain(name)).then(|| format!("{owner}/{name}"))
+}
+
+/// Downloads release `tag` into `target/releases/<tag>`, checks its sha256 and its
+/// build attestation (made by this repository's release workflow for that tag) and
+/// unpacks it; returns the unpacked directory.
+fn fetch_release(tag: &str) -> Result<PathBuf> {
+    let repo = github_repo()?;
+    let version = tag.trim_start_matches('v');
+    let name = format!("piano-{version}-{DIST_PLATFORM}");
+    let archive = format!("{name}.tar.gz");
+    let dir = target_dir().join("releases").join(tag);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+
+    let mut download = Command::new("gh");
+    download
+        .args(["release", "download", tag, "--repo", &repo, "--dir"])
+        .arg(&dir)
+        .args([
+            "--pattern",
+            &archive,
+            "--pattern",
+            &format!("{archive}.sha256"),
+        ]);
+    run_bounded("download", download, DOWNLOAD_LIMIT, None)?;
+
+    let mut check = Command::new("sha256sum");
+    check
+        .args(["--check", "--quiet", &format!("{archive}.sha256")])
+        .current_dir(&dir);
+    run("checksum", check)?;
+
+    // The checksum comes from the same place as the archive; the attestation ties the
+    // archive to a run of the release workflow of this repository.
+    let mut attestation = Command::new("gh");
+    attestation
+        .args(["attestation", "verify"])
+        .arg(dir.join(&archive))
+        .args([
+            "--repo",
+            &repo,
+            "--signer-workflow",
+            &format!("{repo}/.github/workflows/release.yml"),
+            "--source-ref",
+            &format!("refs/tags/{tag}"),
+        ]);
+    run_bounded("attestation", attestation, ATTESTATION_LIMIT, None)?;
+
+    let mut unpack = Command::new("tar");
+    unpack
+        .arg("-xzf")
+        .arg(dir.join(&archive))
+        .arg("-C")
+        .arg(&dir);
+    run("unpack", unpack)?;
+    Ok(dir.join(name))
 }
 
 fn ssh(host: &str) -> Command {
@@ -296,23 +521,37 @@ fn ssh(host: &str) -> Command {
 }
 
 fn deploy(d: &Deploy<'_>) -> Result {
-    let mut files: Vec<PathBuf> = CONTRIB
-        .iter()
-        .map(|f| root().join("contrib").join(f))
-        .collect();
-    let binary = if d.rollback {
-        None
-    } else {
-        let built = dist()?;
-        let name = built
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or("dist produced no file name")?
-            .to_owned();
-        files.push(built.with_file_name(format!("{name}.sha256")));
-        files.push(built);
-        Some(name)
+    let contrib = |dir: &Path| -> Vec<PathBuf> { CONTRIB.iter().map(|f| dir.join(f)).collect() };
+    let (files, binary) = match d.source {
+        Source::Rollback => (contrib(&root().join("contrib")), None),
+        Source::Local => {
+            let built = dist()?;
+            let name = built
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or("dist produced no file name")?
+                .to_owned();
+            let mut files = contrib(&root().join("contrib"));
+            files.push(built.with_file_name(format!("{name}.sha256")));
+            files.push(built);
+            (files, Some(name))
+        }
+        Source::Release(tag) => {
+            // Everything the release ships, not what this checkout would ship: its
+            // service files and install script go with its binary.
+            let dir = fetch_release(tag)?;
+            write_sha256(&dir, "piano")?;
+            let files = std::fs::read_dir(&dir)
+                .and_then(|entries| {
+                    entries
+                        .map(|e| e.map(|e| e.path()))
+                        .collect::<std::io::Result<Vec<_>>>()
+                })
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+            (files, Some("piano".to_owned()))
+        }
     };
+    let rollback = d.source == Source::Rollback;
 
     let mut mktemp = ssh(d.host);
     mktemp.args(["mktemp", "-d", &format!("{REMOTE_DIR_PREFIX}XXXXXX")]);
@@ -350,7 +589,7 @@ fn deploy(d: &Deploy<'_>) -> Result {
         "sh",
         "-s",
         "--",
-        if d.rollback { "rollback" } else { "install" },
+        if rollback { "rollback" } else { "install" },
         &dir,
         d.instance.unwrap_or("-"),
     ]);
@@ -362,7 +601,7 @@ fn deploy(d: &Deploy<'_>) -> Result {
             .map_err(|e| format!("stdout: {e}"))?;
     }
     child_out?;
-    if !d.rollback {
+    if !rollback {
         let instance = d
             .instance
             .map(|i| format!(" --instance {i}"))
@@ -376,8 +615,12 @@ fn deploy(d: &Deploy<'_>) -> Result {
 }
 
 fn set_executable(path: &Path) -> Result {
+    set_mode(path, 0o755)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -450,28 +693,60 @@ mod tests {
     #[test]
     fn parses_deploy_arguments() {
         assert_eq!(
-            parse_deploy(&["relay-1", "--instance", "shadow"]).unwrap(),
+            parse_deploy(&["relay-1", "--instance", "shadow", "--release", "v0.1.0"]).unwrap(),
             Deploy {
                 host: "relay-1",
                 instance: Some("shadow"),
-                rollback: false
+                source: Source::Release("v0.1.0"),
             }
         );
-        assert!(
+        assert_eq!(
             parse_deploy(&["--rollback", "root@relay-1"])
                 .unwrap()
-                .rollback
+                .source,
+            Source::Rollback
+        );
+        assert_eq!(
+            parse_deploy(&["a", "--local"]).unwrap().source,
+            Source::Local
         );
         for bad in [
             &[][..],
-            &["-oProxyCommand=x"],
-            &["a", "b"],
-            &["a", "--instance"],
-            &["a", "--instance", "Bad/Name"],
-            &["a;b"],
+            &["a"],
+            &["-oProxyCommand=x", "--local"],
+            &["a", "b", "--local"],
+            &["a", "--local", "--instance"],
+            &["a", "--local", "--instance", "Bad/Name"],
+            &["a;b", "--local"],
             &["a", "--force"],
+            &["a", "--local", "--rollback"],
+            &["a", "--release"],
+            &["a", "--release", "0.1.0"],
+            &["a", "--release", "v../x"],
+            &["a", "--release", "v"],
         ] {
             assert!(parse_deploy(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn reads_github_remotes() {
+        for url in [
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo",
+            "https://github.com/owner/repo.git",
+            "https://github.com/owner/repo/",
+        ] {
+            assert_eq!(parse_github(url).as_deref(), Some("owner/repo"), "{url}");
+        }
+        for url in [
+            "",
+            "https://example.com/owner/repo",
+            "git@github.com:owner",
+            "git@github.com:owner/re po",
+            "git@github.com:owner/a/b",
+        ] {
+            assert_eq!(parse_github(url), None, "{url}");
         }
     }
 

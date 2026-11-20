@@ -7,7 +7,22 @@ public host name and relays every request — API calls, images and media stream
 the upstream server over a verified TLS connection. The upstream address is never
 exposed to clients.
 
-Status: early development. The relay core works; most features below are planned.
+Status: early development.
+
+## Releases
+
+Each `v*` tag is built by the release workflow into
+`piano-VERSION-x86_64-linux-musl.tar.gz` (the binary, the service files and the install
+script) with a `.sha256` file and a build provenance attestation:
+
+```sh
+gh release download v0.1.0 --repo stqfdyr/piano --pattern 'piano-*'
+sha256sum -c piano-0.1.0-x86_64-linux-musl.tar.gz.sha256
+gh attestation verify piano-0.1.0-x86_64-linux-musl.tar.gz --repo stqfdyr/piano
+```
+
+The binary is static, built for `x86_64-unknown-linux-musl` with
+`target-cpu=x86-64-v2`, so it runs on any x86-64 Linux host from about 2009 onwards.
 
 ## Build
 
@@ -15,13 +30,13 @@ Requires Rust 1.100 (pinned in `rust-toolchain.toml`).
 
 ```sh
 cargo xtask ci     # fmt, clippy, tests, dependency policy (needs cargo-deny)
-cargo xtask dist   # static musl binary in target/dist/
-cargo xtask deploy HOST [--instance NAME] [--rollback]
-                   # build, install on HOST over ssh, piano upgrade, verify
+cargo xtask dist   # static binary and release archive in target/dist/
+cargo xtask deploy HOST (--release TAG | --local | --rollback) [--instance NAME]
+                   # install on HOST over ssh, piano upgrade, verify
 ```
 
-The release binary is built for `x86_64-unknown-linux-musl` with
-`target-cpu=x86-64-v2`, so it runs on any x86-64 Linux host from about 2009 onwards.
+`deploy --release` installs a GitHub release (checked as above, needs `gh`);
+`--local` builds with `dist` first.
 
 ## Configure
 
@@ -71,11 +86,12 @@ check` passed with warnings.
 ## Install as a service
 
 `contrib/` holds a systemd unit, an OpenRC script and a logrotate file;
-`contrib/install.sh` installs them with the binary (as root, from a directory with the
-binary and the contrib files):
+`contrib/install.sh` installs them with the binary. As root, from the unpacked
+release archive:
 
 ```sh
-sh install.sh --binary ./piano-0.1.0-x86_64-linux-musl
+tar -xzf piano-0.1.0-x86_64-linux-musl.tar.gz
+sh piano-0.1.0-x86_64-linux-musl/install.sh
 ```
 
 It creates the `piano` user, installs `/usr/local/bin/piano`, the service and
