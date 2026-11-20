@@ -4,6 +4,7 @@
 
 mod admin;
 mod control;
+pub mod doctor;
 pub mod probe;
 mod procfs;
 mod reload;

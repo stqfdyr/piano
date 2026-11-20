@@ -244,6 +244,10 @@ impl Relay {
         self.dir.write(CONFIG_FILE, text);
     }
 
+    pub fn config_path(&self) -> std::path::PathBuf {
+        self.dir.path().join(CONFIG_FILE)
+    }
+
     /// The configuration file as written last.
     pub fn config(&self) -> piano_config::Config {
         piano_config::load(&self.dir.path().join(CONFIG_FILE)).unwrap()

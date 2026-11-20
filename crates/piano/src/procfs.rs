@@ -36,24 +36,27 @@ pub fn process() -> Process {
 /// `/proc/self/exe` still opens it after the file at its path has been replaced.
 fn binary_sha256() -> Option<String> {
     static SUM: OnceLock<Option<String>> = OnceLock::new();
-    SUM.get_or_init(|| {
-        let mut file = std::fs::File::open("/proc/self/exe").ok()?;
-        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut buf = vec![0; 64 * 1024];
-        loop {
-            let n = file.read(&mut buf).ok()?;
-            if n == 0 {
-                break;
-            }
-            ctx.update(&buf[..n]);
+    SUM.get_or_init(|| sha256_file(std::path::Path::new("/proc/self/exe")).ok())
+        .clone()
+}
+
+/// Hex sha256 of the file at `path`.
+pub(crate) fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
-        let mut hex = String::with_capacity(64);
-        for b in ctx.finish().as_ref() {
-            let _ = write!(hex, "{b:02x}");
-        }
-        Some(hex)
-    })
-    .clone()
+        ctx.update(&buf[..n]);
+    }
+    let mut hex = String::with_capacity(64);
+    for b in ctx.finish().as_ref() {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
 }
 
 #[cfg(test)]

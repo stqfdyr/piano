@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Certificates are renewed 30 days before they expire; 14 days left means renewal has
 /// been failing for two weeks.
-const CERT_WARN_DAYS: i64 = 14;
+pub(crate) const CERT_WARN_DAYS: i64 = 14;
 /// Few enough days left that clients will soon refuse the certificate.
-const CERT_ERROR_DAYS: i64 = 3;
+pub(crate) const CERT_ERROR_DAYS: i64 = 3;
 /// Share of a limit in use from which status warns.
 const NEAR_LIMIT_PERCENT: u64 = 80;
 

@@ -4,6 +4,7 @@
 
 mod access;
 mod control;
+mod doctor;
 mod follow;
 mod h2;
 mod headers;

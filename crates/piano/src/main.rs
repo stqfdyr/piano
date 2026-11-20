@@ -140,6 +140,15 @@ enum Command {
         #[arg(long = "ua", value_name = "UA")]
         user_agents: Vec<String>,
     },
+    /// Check what status cannot see: whether the daemon could start (configuration,
+    /// certificate, files the service user reads and writes, listening ports), whether
+    /// the configuration, certificate and binary on disk are the ones running, and
+    /// whether every upstream host completes a TLS handshake now.
+    Doctor {
+        /// The service user, when no daemon runs to take it from.
+        #[arg(long, default_value = "piano")]
+        user: String,
+    },
     /// Print the version.
     Version,
 }
@@ -226,6 +235,7 @@ fn main() -> ExitCode {
         } => cache_purge(&cli),
         Command::Upgrade { ref binary } => upgrade(&cli, binary.as_deref()),
         Command::Stop => stop(&cli),
+        Command::Doctor { ref user } => doctor(&cli, user),
         Command::Probe {
             ref site,
             login,
@@ -303,6 +313,64 @@ fn print_json<T: serde::Serialize>(v: &T) {
     match serde_json::to_string_pretty(v) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("cannot encode the reply: {e}"),
+    }
+}
+
+/// Longest the doctor may run; each upstream host has 10 s.
+const DOCTOR_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn doctor(cli: &Cli, user: &str) -> ExitCode {
+    use piano::doctor::Level;
+    // A daemon that does not answer is one of the findings, not a failure.
+    let socket = socket_path(cli);
+    let status: Option<Status> = socket.as_ref().and_then(|socket| {
+        let value = piano_ctl::call(socket, "status", STATUS_TIMEOUT).ok()?;
+        serde_json::from_value(value).ok()
+    });
+    let installed_sha256 = std::env::current_exe()
+        .ok()
+        .and_then(|exe| piano::doctor::file_sha256(&exe).ok());
+    let input = piano::doctor::Input {
+        config: &cli.config,
+        status: status.as_ref(),
+        socket: socket.as_deref(),
+        user,
+        installed_sha256,
+        resolver: Resolver::system(),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot start the runtime: {e}");
+            return ExitCode::from(exit::RUNTIME);
+        }
+    };
+    let Ok(report) = runtime
+        .block_on(async { tokio::time::timeout(DOCTOR_TIMEOUT, piano::doctor::run(&input)).await })
+    else {
+        eprintln!(
+            "the checks did not end within {}s",
+            DOCTOR_TIMEOUT.as_secs()
+        );
+        return ExitCode::from(exit::RUNTIME);
+    };
+    if cli.json {
+        print_json(&report);
+    } else {
+        print!("{}", render::doctor(&report, render::color(cli.no_color)));
+    }
+    let config_failed = report
+        .checks
+        .first()
+        .is_some_and(|c| c.group == "configuration" && c.level == Level::Error);
+    match report.worst() {
+        _ if config_failed => ExitCode::from(exit::CONFIG),
+        Level::Error => ExitCode::from(exit::RUNTIME),
+        Level::Warn => ExitCode::from(exit::WARNINGS),
+        Level::Ok | Level::Skip => ExitCode::SUCCESS,
     }
 }
 

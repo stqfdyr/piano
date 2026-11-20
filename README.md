@@ -121,6 +121,20 @@ upstream does with each `--ua`; upstreams may refuse User-Agents they do not kno
 including the default `piano/<version>`. Through the relay a step also fails when an
 answer names the upstream. Exit code 0 when every step passed, 1 otherwise.
 
+## Check the setup
+
+```sh
+piano doctor
+```
+
+checks what `piano status` cannot see: the configuration and certificate, whether the
+service user (the running daemon's, else `--user`, default `piano`) can read the
+configuration, certificate and key and write the log, state and socket directories,
+who holds the listening ports, whether the configuration, certificate files or
+binary on disk changed after the daemon loaded them, and whether every upstream host
+(aliases, mounts and exact `follow` names included) completes a TLS handshake. Exit
+code 0, 3 with warnings, 1 with errors, 2 when the configuration does not load.
+
 ## Logs
 
 ```toml

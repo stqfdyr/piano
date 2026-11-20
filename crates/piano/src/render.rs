@@ -83,6 +83,64 @@ pub fn millis(v: f64) -> String {
     }
 }
 
+/// `piano doctor`: checks under their group, problems coloured.
+pub fn doctor(r: &piano::doctor::Report, color: Color) -> String {
+    use piano::doctor::Level;
+    let mut out = String::new();
+    let mut group = "";
+    for c in &r.checks {
+        if c.group != group {
+            if !group.is_empty() {
+                out.push('\n');
+            }
+            let _ = writeln!(out, "{}", c.group);
+            group = c.group;
+        }
+        let tag = match c.level {
+            Level::Ok => "ok".to_owned(),
+            Level::Skip => "skip".to_owned(),
+            Level::Warn => color.yellow("warn"),
+            Level::Error => color.red("error"),
+        };
+        // Pad the plain word so colour codes do not shift the columns.
+        let pad = " ".repeat(6usize.saturating_sub(match c.level {
+            Level::Ok => 2,
+            Level::Skip => 4,
+            Level::Warn => 4,
+            Level::Error => 5,
+        }));
+        let line = if c.detail.is_empty() {
+            format!("  {tag}{pad}{}", c.what)
+        } else {
+            format!("  {tag}{pad}{}  {}", c.what, c.detail)
+        };
+        let _ = writeln!(out, "{}", line.trim_end());
+    }
+    let count = |l: Level| r.checks.iter().filter(|c| c.level == l).count();
+    let (errors, warnings) = (count(Level::Error), count(Level::Warn));
+    let _ = writeln!(out);
+    match (errors, warnings) {
+        (0, 0) => {
+            let _ = writeln!(out, "no problems found");
+        }
+        (0, w) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                color.yellow(&format!("{w} warning{}", plural(w)))
+            );
+        }
+        (e, w) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                color.red(&format!("{e} error{}, {w} warning{}", plural(e), plural(w)))
+            );
+        }
+    }
+    out
+}
+
 /// `piano probe`: one line per step, grouped by User-Agent when there are several.
 pub fn probe(r: &piano::probe::Report, color: Color) -> String {
     let mut out = format!(
