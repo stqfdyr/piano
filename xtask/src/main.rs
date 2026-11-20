@@ -249,13 +249,22 @@ fn package(out_dir: &Path, name: &str, binary: &Path) -> Result<String> {
     }
     let dir = stage.join(name);
     std::fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
+    set_mode(&dir, 0o755)?;
     let contrib = CONTRIB.iter().map(|f| (root().join("contrib").join(f), *f));
     let archived = ARCHIVED.iter().map(|f| (root().join(f), *f));
     for (from, to) in std::iter::once((binary.to_path_buf(), "piano"))
         .chain(contrib)
         .chain(archived)
     {
-        std::fs::copy(&from, dir.join(to)).map_err(|e| io(&from, e))?;
+        let staged = dir.join(to);
+        std::fs::copy(&from, &staged).map_err(|e| io(&from, e))?;
+        // Modes from the checkout depend on the umask of whoever made it.
+        let mode = if matches!(to, "piano" | "install.sh") {
+            0o755
+        } else {
+            0o644
+        };
+        set_mode(&staged, mode)?;
     }
 
     let tar_name = format!("{name}.tar");
@@ -265,7 +274,6 @@ fn package(out_dir: &Path, name: &str, binary: &Path) -> Result<String> {
         "--owner=0",
         "--group=0",
         "--numeric-owner",
-        "--mode=go-w",
         &format!("--mtime=@{}", source_date()?),
         "-cf",
     ])
@@ -281,7 +289,8 @@ fn package(out_dir: &Path, name: &str, binary: &Path) -> Result<String> {
     Ok(format!("{tar_name}.gz"))
 }
 
-/// `SOURCE_DATE_EPOCH` if set, else the time of the commit being built.
+/// `SOURCE_DATE_EPOCH` if set, else the time of the commit being built. A tree with
+/// uncommitted changes gets that commit's time too, with a warning.
 fn source_date() -> Result<String> {
     if let Some(t) = std::env::var_os("SOURCE_DATE_EPOCH") {
         return t
@@ -296,6 +305,14 @@ fn source_date() -> Result<String> {
     let t = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if !out.status.success() || t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
         return Err("no commit time: set SOURCE_DATE_EPOCH".into());
+    }
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(root())
+        .output()
+        .is_ok_and(|o| !o.stdout.is_empty());
+    if dirty {
+        eprintln!("    warning: uncommitted changes; the archive is dated as HEAD");
     }
     Ok(t)
 }
@@ -440,8 +457,8 @@ fn parse_github(url: &str) -> Option<String> {
 }
 
 /// Downloads release `tag` into `target/releases/<tag>`, checks its sha256 and its
-/// build attestation (made by this repository's release workflow) and unpacks it;
-/// returns the unpacked directory.
+/// build attestation (made by this repository's release workflow for that tag) and
+/// unpacks it; returns the unpacked directory.
 fn fetch_release(tag: &str) -> Result<PathBuf> {
     let repo = github_repo()?;
     let version = tag.trim_start_matches('v');
@@ -482,6 +499,8 @@ fn fetch_release(tag: &str) -> Result<PathBuf> {
             &repo,
             "--signer-workflow",
             &format!("{repo}/.github/workflows/release.yml"),
+            "--source-ref",
+            &format!("refs/tags/{tag}"),
         ]);
     run_bounded("attestation", attestation, ATTESTATION_LIMIT, None)?;
 
@@ -518,12 +537,17 @@ fn deploy(d: &Deploy<'_>) -> Result {
             (files, Some(name))
         }
         Source::Release(tag) => {
-            // The service files and install script of the release, not of this checkout.
+            // Everything the release ships, not what this checkout would ship: its
+            // service files and install script go with its binary.
             let dir = fetch_release(tag)?;
             write_sha256(&dir, "piano")?;
-            let mut files = contrib(&dir);
-            files.push(dir.join("piano.sha256"));
-            files.push(dir.join("piano"));
+            let files = std::fs::read_dir(&dir)
+                .and_then(|entries| {
+                    entries
+                        .map(|e| e.map(|e| e.path()))
+                        .collect::<std::io::Result<Vec<_>>>()
+                })
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
             (files, Some("piano".to_owned()))
         }
     };
@@ -591,8 +615,12 @@ fn deploy(d: &Deploy<'_>) -> Result {
 }
 
 fn set_executable(path: &Path) -> Result {
+    set_mode(path, 0o755)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
