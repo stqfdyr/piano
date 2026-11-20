@@ -63,10 +63,11 @@ impl Rewriter {
     /// `body` with every URL authority naming the upstream, or an IP literal after
     /// `http(s)://`, replaced by `authority` (scheme and escaping kept, `http` becoming
     /// `https`), and every upstream name standing alone as a JSON string replaced by
-    /// `host`. `None` if nothing was replaced.
-    pub fn rewrite(&self, body: &[u8], host: &str, authority: &str) -> Option<Vec<u8>> {
+    /// `host`; with the number of replacements. `None` if nothing was replaced.
+    pub fn rewrite(&self, body: &[u8], host: &str, authority: &str) -> Option<(Vec<u8>, usize)> {
         let mut out = Vec::new();
         let mut copied = 0;
+        let mut count = 0;
         for m in self.anchors.find_iter(body) {
             if m.start() < copied {
                 continue;
@@ -101,12 +102,13 @@ impl Rewriter {
                 out.extend_from_slice(part.as_bytes());
             }
             copied = end;
+            count += 1;
         }
-        if copied == 0 {
+        if count == 0 {
             return None;
         }
         out.extend_from_slice(&body[copied..]);
-        Some(out)
+        Some((out, count))
     }
 }
 
@@ -157,7 +159,15 @@ mod tests {
 
     fn rw(body: &str) -> String {
         let out = rewriter().rewrite(body.as_bytes(), HOST, PUBLIC);
-        String::from_utf8(out.unwrap_or_else(|| body.as_bytes().to_vec())).unwrap()
+        String::from_utf8(out.map_or_else(|| body.as_bytes().to_vec(), |(b, _)| b)).unwrap()
+    }
+
+    #[test]
+    fn counts_replacements() {
+        let body =
+            r#"{"a":"https://emby.example.net/x","b":"emby.example.net","c":"http://192.0.2.1"}"#;
+        let (_, n) = rewriter().rewrite(body.as_bytes(), HOST, PUBLIC).unwrap();
+        assert_eq!(n, 3);
     }
 
     #[test]

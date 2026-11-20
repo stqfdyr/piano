@@ -31,6 +31,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, ProxyWarnLogContext, Session};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Further attempts after failing to connect, each to the host's next address.
@@ -50,6 +51,13 @@ const FOLLOW_ADDR_TTL: Duration = Duration::from_secs(300);
 const FOLLOW: ErrorType = ErrorType::Custom("FollowRedirect");
 /// A redirect that is not followed; the client gets 502.
 const REFUSED: ErrorType = ErrorType::Custom("RedirectRefused");
+
+/// One in this many GET requests of the `api` class is rewritten like server
+/// information, to notice when the upstream starts naming itself in responses that are
+/// otherwise passed on unchanged. Such a request fetches the uncompressed body, about ten
+/// times the bytes, so only a sample is taken; at the observed rate of about 500 browsing
+/// requests a day per relay that is a few checks a day.
+const PROBE_EVERY: u64 = 100;
 
 /// Longest path, User-Agent, Range and error text written to the access log, in bytes.
 const MAX_PATH: usize = 2048;
@@ -101,6 +109,8 @@ struct AttemptLog {
 /// A response body being collected for rewriting.
 #[derive(Debug)]
 struct Rewrite {
+    /// A sampled response of a class that is not rewritten by default; see [`PROBE_EVERY`].
+    probe: bool,
     /// The site as the client addressed it: host, and port unless 443.
     authority: String,
     /// Set once the response qualifies; cleared when the body turns out too large.
@@ -130,6 +140,8 @@ pub struct Ctx {
     /// Attempts repeated because connecting failed.
     pub connect_retries: u8,
     rewrite: Option<Rewrite>,
+    /// Addresses replaced in the response body, once a collected body was rewritten.
+    rewritten: Option<usize>,
 }
 
 impl Ctx {
@@ -160,6 +172,8 @@ pub struct Relay {
     resolver: Resolver,
     follow_addrs: AddrCache,
     access: Arc<AccessLog>,
+    /// GET requests of the `api` class so far, for sampling probes.
+    api_gets: AtomicU64,
 }
 
 impl Relay {
@@ -169,7 +183,12 @@ impl Relay {
             resolver,
             follow_addrs: AddrCache::new(FOLLOW_ADDR_TTL),
             access,
+            api_gets: AtomicU64::new(0),
         }
+    }
+
+    fn probe_due(&self) -> bool {
+        (self.api_gets.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(PROBE_EVERY)
     }
 }
 
@@ -242,6 +261,13 @@ async fn respond_local(session: &mut Session, status: u16, body: &'static [u8]) 
     session
         .write_response_body(Some(Bytes::from_static(body)), true)
         .await
+}
+
+fn is_json(resp: &ResponseHeader) -> bool {
+    resp.headers.get(CONTENT_TYPE).is_some_and(|v| {
+        let v = v.as_bytes();
+        v.len() >= 16 && v[..16].eq_ignore_ascii_case(b"application/json")
+    })
 }
 
 /// Failures to reach the address at all, as opposed to failures of TLS with a server
@@ -361,6 +387,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: &str, ctx: &Ctx) -> St
     j.num("bytes_in", down.body_bytes_read() as u64);
     opt_num(&mut j, "dur_ms", ctx.start.map(|s| millis(s.elapsed())));
     opt_num(&mut j, "ttfb_ms", ctx.ttfb.map(millis));
+    opt_num(&mut j, "rewrite", ctx.rewritten.map(|n| n as u64));
     j.str("end", end);
     let err = e.map(|e| redact(clip(&e.to_string(), MAX_ERR)).into_owned());
     opt_str(&mut j, "err", err.as_deref());
@@ -454,6 +481,7 @@ impl ProxyHttp for Relay {
                 ServerDomains::Pass => {}
                 ServerDomains::Rewrite => {
                     ctx.rewrite = Some(Rewrite {
+                        probe: false,
                         authority: public,
                         collecting: false,
                         body: Vec::new(),
@@ -461,6 +489,17 @@ impl ProxyHttp for Relay {
                     enable_compression(session);
                 }
             }
+        } else if ctx.class == RouteClass::Api
+            && session.req_header().method == Method::GET
+            && self.probe_due()
+        {
+            ctx.rewrite = Some(Rewrite {
+                probe: true,
+                authority: public,
+                collecting: false,
+                body: Vec::new(),
+            });
+            enable_compression(session);
         }
         let downstream = session.as_downstream_mut();
         downstream.set_write_timeout(Some(ctx.class.downstream_write_timeout()));
@@ -677,6 +716,9 @@ impl ProxyHttp for Relay {
         if upstream_response.status != 200 || session.req_header().method == Method::HEAD {
             return Ok(());
         }
+        if rewrite.probe && !is_json(upstream_response) {
+            return Ok(());
+        }
         rewrite.collecting = true;
         upstream_response.remove_header(&CONTENT_LENGTH);
         upstream_response.insert_header(TRANSFER_ENCODING, "chunked")?;
@@ -712,14 +754,24 @@ impl ProxyHttp for Relay {
             return Ok(None);
         }
         rewrite.collecting = false;
+        let probe = rewrite.probe;
         let collected = std::mem::take(&mut rewrite.body);
         let authority = std::mem::take(&mut rewrite.authority);
         let site = ctx.site()?;
-        let out = site
+        let (out, n) = site
             .policy
             .rewriter
             .rewrite(&collected, &site.host, &authority)
-            .unwrap_or(collected);
+            .unwrap_or((collected, 0));
+        if probe && n > 0 {
+            warn!(
+                rid:% = ctx.rid, site = site.name.as_str();
+                "upstream named itself in {}, a response passed on unchanged by default; \
+                 {n} addresses replaced in this sampled copy",
+                logged_path(session.req_header())
+            );
+        }
+        ctx.rewritten = Some(n);
         *body = Some(Bytes::from(out));
         Ok(None)
     }

@@ -3,7 +3,7 @@
 use piano_e2e::client::{Proto, client};
 use piano_e2e::origin::{INFO_PUBLIC, Origin, SERVER_DOMAINS, gunzip, json_doc, unbrotli};
 use piano_e2e::pki::Ca;
-use piano_e2e::relay::{Relay, RelaySetup};
+use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
 
 const ALIAS: &str = "alias.example.net";
@@ -202,4 +202,27 @@ async fn server_domains_follow_the_site_setting() {
     let w = world("server_domains = \"pass\"").await;
     let r = w.send(Proto::H2, "GET", path, None).await;
     assert_eq!(r.text(), SERVER_DOMAINS);
+}
+
+#[tokio::test]
+async fn one_in_a_hundred_api_responses_is_checked_and_rewritten() {
+    let w = world("").await;
+    let original = json_doc(&w.origin_host(), 0);
+    for i in 1..=100 {
+        let r = w.send(Proto::H2, "GET", "/__json", None).await;
+        assert_eq!(r.status, 200);
+        if i == 100 {
+            assert_eq!(r.text(), w.rewritten_doc(), "request {i}");
+            assert_eq!(r.header("x-seen-accept-encoding"), "identity");
+        } else {
+            assert_eq!(r.text(), original, "request {i}");
+            assert_eq!(r.header("x-seen-accept-encoding"), "");
+        }
+    }
+    let lines = w.relay.access_lines(ACCESS_LOG, 100);
+    let rewritten: Vec<_> = lines.iter().map(|l| l["rewrite"].as_u64()).collect();
+    assert!(rewritten[..99].iter().all(Option::is_none));
+    // LocalAddress, Url, Esc, Rel and Bare.
+    assert_eq!(rewritten[99], Some(5));
+    assert_eq!(lines[99]["class"], "api");
 }
