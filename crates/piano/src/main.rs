@@ -122,6 +122,24 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Walk a site as an Emby client does and time each step: server info, and with
+    /// --login the libraries, the latest item, its image, playback info and the first MiB
+    /// of its stream. Goes through the relay on this host unless --direct.
+    Probe {
+        /// Site name or host.
+        site: String,
+        /// Log in with PIANO_PROBE_USER and PIANO_PROBE_PASSWORD, or the user and password
+        /// as two lines on standard input; logs out at the end.
+        #[arg(long)]
+        login: bool,
+        /// Go to the upstream itself, without the relay and the site's rules: what the
+        /// upstream does with each --ua.
+        #[arg(long)]
+        direct: bool,
+        /// Run the steps with this User-Agent; repeat to compare several.
+        #[arg(long = "ua", value_name = "UA")]
+        user_agents: Vec<String>,
+    },
     /// Print the version.
     Version,
 }
@@ -208,6 +226,12 @@ fn main() -> ExitCode {
         } => cache_purge(&cli),
         Command::Upgrade { ref binary } => upgrade(&cli, binary.as_deref()),
         Command::Stop => stop(&cli),
+        Command::Probe {
+            ref site,
+            login,
+            direct,
+            ref user_agents,
+        } => probe(&cli, site, login, direct, user_agents),
         Command::Run {
             ref pidfile,
             takeover,
@@ -280,6 +304,106 @@ fn print_json<T: serde::Serialize>(v: &T) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("cannot encode the reply: {e}"),
     }
+}
+
+/// Longest a probe may run, every step and User-Agent together.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn probe(cli: &Cli, site: &str, login: bool, direct: bool, user_agents: &[String]) -> ExitCode {
+    let config = match piano_config::load(&cli.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(exit::CONFIG);
+        }
+    };
+    let login = if login {
+        match probe_credentials() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(exit::CONFIG);
+            }
+        }
+    } else {
+        None
+    };
+    let args = piano::probe::Args {
+        site: site.to_owned(),
+        login,
+        direct,
+        user_agents: user_agents.to_vec(),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot start the runtime: {e}");
+            return ExitCode::from(exit::RUNTIME);
+        }
+    };
+    let resolver = Resolver::system();
+    let ran = runtime.block_on(async {
+        tokio::time::timeout(PROBE_TIMEOUT, piano::probe::run(&config, &resolver, &args)).await
+    });
+    let report = match ran {
+        Ok(Ok(r)) => r,
+        Ok(Err(e @ piano::probe::Error::UnknownSite(_))) => {
+            eprintln!("{e}");
+            return ExitCode::from(exit::CONFIG);
+        }
+        Ok(Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::from(exit::RUNTIME);
+        }
+        Err(_) => {
+            eprintln!("the probe did not end within {}s", PROBE_TIMEOUT.as_secs());
+            return ExitCode::from(exit::RUNTIME);
+        }
+    };
+    if cli.json {
+        print_json(&report);
+    } else {
+        print!("{}", render::probe(&report, render::color(cli.no_color)));
+    }
+    if report.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(exit::RUNTIME)
+    }
+}
+
+/// The account for `probe --login`: from the environment, else two lines on standard
+/// input (never the command line, which other users can read).
+fn probe_credentials() -> Result<piano::probe::Credentials, String> {
+    use std::io::{BufRead, IsTerminal};
+    if let (Ok(user), Ok(password)) = (
+        std::env::var("PIANO_PROBE_USER"),
+        std::env::var("PIANO_PROBE_PASSWORD"),
+    ) {
+        return Ok(piano::probe::Credentials { user, password });
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(
+            "--login needs PIANO_PROBE_USER and PIANO_PROBE_PASSWORD, or the user and the \
+             password as two lines on standard input"
+                .into(),
+        );
+    }
+    let mut lines = stdin.lock().lines();
+    let mut next = || -> Result<String, String> {
+        match lines.next() {
+            Some(Ok(l)) => Ok(l.trim_end_matches('\r').to_owned()),
+            Some(Err(e)) => Err(format!("standard input: {e}")),
+            None => Err("--login: expected the user and the password on standard input".into()),
+        }
+    };
+    let user = next()?;
+    let password = next()?;
+    Ok(piano::probe::Credentials { user, password })
 }
 
 fn status(cli: &Cli) -> ExitCode {

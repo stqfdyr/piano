@@ -146,6 +146,8 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
 
         [access]
         allow = [{allow}]
+        # Loopback follows the list, so a test can be refused.
+        loopback = false
 
         [upstream]
         connect_timeout = "2s"
@@ -240,6 +242,11 @@ impl Relay {
     /// Writes `text` as the configuration file.
     pub fn write_config_text(&self, text: &str) {
         self.dir.write(CONFIG_FILE, text);
+    }
+
+    /// The configuration file as written last.
+    pub fn config(&self) -> piano_config::Config {
+        piano_config::load(&self.dir.path().join(CONFIG_FILE)).unwrap()
     }
 
     pub fn control_socket(&self) -> std::path::PathBuf {

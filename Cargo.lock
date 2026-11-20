@@ -1719,6 +1719,7 @@ dependencies = [
  "piano-telemetry",
  "piano-upstream",
  "pingora-core",
+ "pingora-http",
  "pingora-proxy",
  "ratatui",
  "ring",

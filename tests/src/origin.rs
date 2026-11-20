@@ -33,6 +33,12 @@
 //!   last repeats; 429 carries `Retry-After` from `retry=N`, default 1), `moved=1` answers
 //!   301 to `/img/{key}`, `delay_ms=N` waits first. [`Origin::hits`] counts requests per
 //!   path.
+//! - A small Emby API for `piano probe` under `/emby`: `Users/AuthenticateByName` (POST,
+//!   accepts [`PROBE_USER`] / [`PROBE_PASSWORD`]), `Users/{PROBE_USER_ID}/Views` and `…/Items`,
+//!   `Items/{PROBE_ITEM}/PlaybackInfo` (a direct stream URL to `/videos/{PROBE_ITEM}/…`),
+//!   `Sessions/Logout`. Without the token they answer 401; a User-Agent starting with
+//!   [`BLOCKED_UA`] gets 403 on all but `System/Info/Public`, as an upstream's UA policy.
+//!   `/videos/` media paths are also served under `/emby`.
 //! - anything else: 404.
 
 use crate::pki::Leaf;
@@ -86,6 +92,16 @@ pub fn json_doc(host: &str, pad: usize) -> String {
     doc.push('}');
     doc
 }
+
+pub const PROBE_USER: &str = "probe";
+pub const PROBE_PASSWORD: &str = "secret";
+pub const PROBE_TOKEN: &str = "probe-token";
+pub const PROBE_USER_ID: &str = "probe-user";
+pub const PROBE_ITEM: &str = "probe1";
+/// Length of the probe item's media file.
+pub const PROBE_MEDIA_LEN: u64 = 3_000_000;
+/// User-Agent prefix the fake Emby API refuses with 403.
+pub const BLOCKED_UA: &str = "Blocked/";
 
 pub const INFO_PUBLIC: &str = r#"{"LocalAddress":"https://origin.example.net","ServerName":"fake","Version":"4.8.10.0","Id":"0123456789abcdef"}"#;
 
@@ -257,6 +273,9 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
     if req.uri().path().eq_ignore_ascii_case("/embywebsocket") {
         return Ok(websocket(&mut req));
     }
+    if let Some(response) = emby(&mut req).await {
+        return Ok(response);
+    }
     if let Some(key) = media_key(req.uri().path()) {
         return Ok(media(&req, key.to_owned(), &state).await);
     }
@@ -389,6 +408,106 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
             .body(full(Bytes::new()))
     };
     Ok(response.unwrap())
+}
+
+/// The Emby API routes for `piano probe`; `None` for other paths.
+async fn emby(req: &mut Request<Incoming>) -> Option<Response<ResBody>> {
+    let path = req.uri().path().to_owned();
+    let lower = path.to_ascii_lowercase();
+    let users = format!("/emby/users/{PROBE_USER_ID}/");
+    let item = format!("/emby/items/{PROBE_ITEM}/playbackinfo");
+    let known = lower == "/emby/users/authenticatebyname"
+        || lower == "/emby/sessions/logout"
+        || lower == item
+        || lower.starts_with(&users);
+    if !known {
+        return None;
+    }
+    let json = |status: StatusCode, body: String| {
+        Some(
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, "application/json; charset=utf-8")
+                .body(full(body))
+                .unwrap(),
+        )
+    };
+    let ua = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if ua.starts_with(BLOCKED_UA) {
+        return json(StatusCode::FORBIDDEN, "API policy denied".into());
+    }
+    if lower == "/emby/users/authenticatebyname" {
+        let body = req
+            .body_mut()
+            .collect()
+            .await
+            .map(|b| b.to_bytes())
+            .unwrap_or_default();
+        let login: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        if login["Username"] != PROBE_USER || login["Pw"] != PROBE_PASSWORD {
+            return json(
+                StatusCode::UNAUTHORIZED,
+                "Invalid username or password".into(),
+            );
+        }
+        return json(
+            StatusCode::OK,
+            format!(
+                r#"{{"AccessToken":"{PROBE_TOKEN}","User":{{"Id":"{PROBE_USER_ID}","Name":"{PROBE_USER}"}}}}"#
+            ),
+        );
+    }
+    let token = req
+        .headers()
+        .get("x-emby-token")
+        .and_then(|v| v.to_str().ok());
+    if token != Some(PROBE_TOKEN) {
+        return json(
+            StatusCode::UNAUTHORIZED,
+            "Access token is invalid or expired.".into(),
+        );
+    }
+    if lower == "/emby/sessions/logout" {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(full(Bytes::new()))
+                .unwrap(),
+        );
+    }
+    if lower == item {
+        return json(
+            StatusCode::OK,
+            format!(
+                concat!(
+                    r#"{{"MediaSources":[{{"Path":"https://{origin}/media/{item}.mkv","#,
+                    r#""DirectStreamUrl":"/videos/{item}/stream.mkv?len={len}&api_key={token}"}}],"#,
+                    r#""PlaySessionId":"s1"}}"#
+                ),
+                origin = crate::ORIGIN_HOST,
+                item = PROBE_ITEM,
+                len = PROBE_MEDIA_LEN,
+                token = PROBE_TOKEN,
+            ),
+        );
+    }
+    match lower.strip_prefix(&users) {
+        Some("views") => json(
+            StatusCode::OK,
+            r#"{"Items":[{"Name":"Movies"},{"Name":"Shows"}],"TotalRecordCount":2}"#.into(),
+        ),
+        Some("items") => json(
+            StatusCode::OK,
+            format!(
+                r#"{{"Items":[{{"Id":"{PROBE_ITEM}","Type":"Movie","ImageTags":{{"Primary":"t1"}}}}],"TotalRecordCount":1}}"#
+            ),
+        ),
+        _ => json(StatusCode::NOT_FOUND, String::new()),
+    }
 }
 
 /// The image routes; `None` for other paths.
@@ -556,6 +675,8 @@ fn pattern(pos: u64, end: u64) -> ResBody {
 /// The key of a scripted media path: `/videos/{key}/…` or `/__file/{key}`.
 fn media_key(path: &str) -> Option<&str> {
     let rest = path
+        .strip_prefix("/emby")
+        .unwrap_or(path)
         .strip_prefix("/videos/")
         .or_else(|| path.strip_prefix("/__file/"))?;
     let key = rest.split('/').next()?;

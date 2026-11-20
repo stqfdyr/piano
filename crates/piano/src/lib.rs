@@ -4,6 +4,7 @@
 
 mod admin;
 mod control;
+pub mod probe;
 mod procfs;
 mod reload;
 pub mod traffic;
@@ -307,7 +308,10 @@ pub fn build_with(
         config, &resolver, None, &metrics,
     )?));
     let accept = Arc::new(AcceptStats::default());
-    let access = Arc::new(AccessFilter::new(Acl::new(&config.access.allow)));
+    let access = Arc::new(AccessFilter::new(Acl::new(
+        &config.access.allow,
+        config.access.loopback,
+    )));
     let access_log = Arc::new(AccessLog::open(config.log.access_path()).map_err(Error::AccessLog)?);
 
     let threads = match config.server.threads {
@@ -514,7 +518,7 @@ impl Live {
         let table = source.load()?;
         let current = self.sites.load();
         let sites = build_sites(config, &self.resolver, Some(&current), &self.metrics)?;
-        let acl = Acl::new(&config.access.allow);
+        let acl = Acl::new(&config.access.allow, config.access.loopback);
         // Opens the new file, if any, before anything is replaced; the last step that can
         // fail.
         self.access_log

@@ -65,12 +65,25 @@ pub struct Tls {
 }
 
 /// Who may connect. Checked on the client address before the TLS handshake.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Access {
     /// Addresses and networks allowed to connect. Must not be empty: serving everyone
     /// has to be written out as `["0.0.0.0/0", "::/0"]`.
     pub allow: Vec<IpNet>,
+    /// Whether loopback addresses may connect whatever `allow` says: `piano probe`
+    /// reaches the relay that way, and a process on the host can read the configuration
+    /// and certificates anyway.
+    pub loopback: bool,
+}
+
+impl Default for Access {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            loopback: true,
+        }
+    }
 }
 
 /// Bounds on what clients may hold. The allow list keeps strangers out before TLS, so

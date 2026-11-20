@@ -15,11 +15,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Acl {
     v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,
+    /// Loopback addresses are allowed whatever the list says.
+    loopback: bool,
 }
 
 impl Acl {
-    pub fn new(allow: &[IpNet]) -> Self {
-        let mut acl = Self::default();
+    pub fn new(allow: &[IpNet], loopback: bool) -> Self {
+        let mut acl = Self {
+            loopback,
+            ..Self::default()
+        };
         for net in allow {
             match net.addr() {
                 IpAddr::V4(a) => {
@@ -41,7 +46,11 @@ impl Acl {
 
     /// Whether `ip` is allowed. IPv4-mapped IPv6 addresses are matched as IPv4.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        match canonical(ip) {
+        let ip = canonical(ip);
+        if self.loopback && ip.is_loopback() {
+            return true;
+        }
+        match ip {
             IpAddr::V4(a) => {
                 let a = u32::from(a);
                 self.v4.iter().any(|&(net, mask)| a & mask == net)
@@ -111,11 +120,21 @@ mod tests {
 
     fn acl(nets: &[&str]) -> Acl {
         let nets: Vec<IpNet> = nets.iter().map(|n| n.parse().unwrap()).collect();
-        Acl::new(&nets)
+        Acl::new(&nets, false)
     }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_is_allowed_only_when_asked() {
+        let nets: Vec<IpNet> = vec!["192.0.2.7".parse().unwrap()];
+        for lo in ["127.0.0.1", "127.3.2.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(Acl::new(&nets, true).allows(ip(lo)), "{lo}");
+            assert!(!Acl::new(&nets, false).allows(ip(lo)), "{lo}");
+        }
+        assert!(!Acl::new(&nets, true).allows(ip("192.0.2.8")));
     }
 
     #[test]

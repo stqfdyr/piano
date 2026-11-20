@@ -83,6 +83,64 @@ pub fn millis(v: f64) -> String {
     }
 }
 
+/// `piano probe`: one line per step, grouped by User-Agent when there are several.
+pub fn probe(r: &piano::probe::Report, color: Color) -> String {
+    let mut out = format!(
+        "{} via {} {} ({})\n",
+        r.site, r.via, r.address, r.server_name
+    );
+    let several = r
+        .steps
+        .iter()
+        .any(|s| s.user_agent != r.steps[0].user_agent);
+    let mut current: Option<&str> = None;
+    for s in &r.steps {
+        if several && current != Some(s.user_agent.as_str()) {
+            let _ = writeln!(out, "\n  {}", s.user_agent);
+            current = Some(&s.user_agent);
+        }
+        let status = s.status.map_or_else(|| "-".to_owned(), |c| c.to_string());
+        let first = s
+            .first_byte_ms
+            .map_or_else(|| "-".to_owned(), |v| millis(v as f64));
+        let total = if s.status.is_some() || s.total_ms > 0 {
+            millis(s.total_ms as f64)
+        } else {
+            "-".to_owned()
+        };
+        let line = format!(
+            "  {:<9} {:>4} {:>10} {:>7} {:>7}  {}",
+            s.name,
+            status,
+            if s.status.is_some() {
+                size(s.bytes)
+            } else {
+                "-".to_owned()
+            },
+            first,
+            total,
+            s.note
+        );
+        let line = line.trim_end();
+        if s.ok {
+            let _ = writeln!(out, "{line}");
+        } else {
+            let _ = writeln!(out, "{}", color.red(line));
+        }
+    }
+    let failed = r.steps.iter().filter(|s| !s.ok).count();
+    if failed == 0 {
+        let _ = writeln!(out, "\nall {} steps ok", r.steps.len());
+    } else {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            color.red(&format!("{failed} of {} steps failed", r.steps.len()))
+        );
+    }
+    out
+}
+
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }

@@ -11,6 +11,7 @@ mod images;
 mod limits;
 mod log;
 mod media;
+mod probe;
 mod retry;
 mod rewrite;
 mod routing;

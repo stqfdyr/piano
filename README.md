@@ -44,7 +44,8 @@ upstream = "https://emby.example.net"
 - `access.allow` lists the client addresses and networks that may connect; anyone else
   is disconnected before the TLS handshake. It must not be empty: to serve every
   address, write `allow = ["0.0.0.0/0", "::/0"]` (`config check` warns about it).
-  IPv4 clients of a dual-stack listener match IPv4 entries.
+  IPv4 clients of a dual-stack listener match IPv4 entries. `access.loopback` (default
+  `true`) also lets loopback addresses in, which is how `piano probe` reaches the relay.
 - The certificate must cover every site host. Connections without SNI, or for a host
   that is not a site, are refused during the TLS handshake.
 - Upstreams must be `https://` with a DNS name; certificate verification is always on.
@@ -100,6 +101,25 @@ the usual sandboxing (read-only system, private `/tmp`, a system call filter).
 - A second OpenRC instance (for example on another port): `install.sh --instance NAME`
   adds `piano.NAME` reading `/etc/piano/NAME.toml`, which needs its own
   `control.socket`, `log.access` and `traffic.file`.
+
+## Probe a site
+
+`piano probe` walks a site as an Emby client does and times each step, through the
+relay on this host (its first listening address, over loopback):
+
+```sh
+piano probe media.example.com           # server info
+piano probe media.example.com --login   # also libraries, latest item, its image,
+                                        # playback info and the first MiB of its stream
+piano probe media.example.com --direct --ua EmbyMini/0.1.0 --ua Mozilla/5.0
+```
+
+`--login` takes the account from `PIANO_PROBE_USER` and `PIANO_PROBE_PASSWORD`, or
+from two lines on standard input; it is never printed, and the probe logs out at the
+end. `--direct` goes to the upstream itself, without the site's rules, to see what the
+upstream does with each `--ua`; upstreams may refuse User-Agents they do not know,
+including the default `piano/<version>`. Through the relay a step also fails when an
+answer names the upstream. Exit code 0 when every step passed, 1 otherwise.
 
 ## Logs
 
