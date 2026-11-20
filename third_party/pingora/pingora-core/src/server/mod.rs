@@ -238,7 +238,15 @@ pub struct Server {
 
     /// Ends the grace period early once it returns true; see [`Self::set_drained_check`].
     drained: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+
+    /// Decides whether an upgrade goes ahead; see [`Self::set_upgrade_handoff`].
+    upgrade_handoff: Option<UpgradeHandoff>,
 }
+
+/// See [`Server::set_upgrade_handoff`].
+pub type UpgradeHandoff = Box<
+    dyn Fn(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
+>;
 
 // TODO: delete the pid when exit
 
@@ -255,6 +263,16 @@ impl Server {
     /// [ServerConf::grace_period_seconds], which then becomes the upper bound.
     pub fn set_drained_check(&mut self, drained: impl Fn() -> bool + Send + Sync + 'static) {
         self.drained = Some(Box::new(drained));
+    }
+
+    /// Lets the caller decide whether a graceful upgrade goes ahead once the listening
+    /// sockets were offered to the new process: `handoff` gets whether sending them
+    /// succeeded and resolves to true to stop accepting and shut down, typically once
+    /// the new process reports that it serves, or to false to abandon the upgrade and
+    /// keep serving. Without it, the server waits a fixed 5 s and shuts down even if the
+    /// sockets could not be sent.
+    pub fn set_upgrade_handoff(&mut self, handoff: UpgradeHandoff) {
+        self.upgrade_handoff = Some(handoff);
     }
 
     /// Waits up to `limit` for the drained check, or the whole `limit` without one.
@@ -285,86 +303,97 @@ impl Server {
             .send(ExecutionPhase::Running)
             .ok();
 
-        match run_args.shutdown_signal.recv().await {
-            ShutdownSignal::FastShutdown => {
-                info!("SIGINT received, exiting");
-                ShutdownType::Quick
-            }
-            ShutdownSignal::GracefulTerminate => {
-                // we receive a graceful terminate, all instances are instructed to stop
-                info!("SIGTERM received, gracefully exiting");
-                // graceful shutdown if there are listening sockets
-                info!("Broadcasting graceful shutdown");
-                match self.shutdown_watch.send(true) {
-                    Ok(_) => {
-                        info!("Graceful shutdown started!");
-                    }
-                    Err(e) => {
-                        error!("Graceful shutdown broadcast failed: {e}");
-                    }
+        loop {
+            match run_args.shutdown_signal.recv().await {
+                ShutdownSignal::FastShutdown => {
+                    info!("SIGINT received, exiting");
+                    return ShutdownType::Quick;
                 }
-                info!("Broadcast graceful shutdown complete");
+                ShutdownSignal::GracefulTerminate => {
+                    // we receive a graceful terminate, all instances are instructed to stop
+                    info!("SIGTERM received, gracefully exiting");
+                    // graceful shutdown if there are listening sockets
+                    info!("Broadcasting graceful shutdown");
+                    match self.shutdown_watch.send(true) {
+                        Ok(_) => {
+                            info!("Graceful shutdown started!");
+                        }
+                        Err(e) => {
+                            error!("Graceful shutdown broadcast failed: {e}");
+                        }
+                    }
+                    info!("Broadcast graceful shutdown complete");
 
-                self.execution_phase_watch
-                    .send(ExecutionPhase::GracefulTerminate)
-                    .ok();
+                    self.execution_phase_watch
+                        .send(ExecutionPhase::GracefulTerminate)
+                        .ok();
 
-                ShutdownType::Graceful
-            }
-            ShutdownSignal::GracefulUpgrade => {
-                // TODO: still need to select! on signals in case a fast shutdown is needed
-                // aka: move below to another task and only kick it off here
-                info!("SIGQUIT received, sending socks and gracefully exiting");
+                    return ShutdownType::Graceful;
+                }
+                ShutdownSignal::GracefulUpgrade => {
+                    info!("SIGQUIT received, sending socks and gracefully exiting");
 
-                self.execution_phase_watch
-                    .send(ExecutionPhase::GracefulUpgradeTransferringFds)
-                    .ok();
+                    self.execution_phase_watch
+                        .send(ExecutionPhase::GracefulUpgradeTransferringFds)
+                        .ok();
 
-                let sent_fds = {
-                    let fds = self.listen_fds();
-                    let fds = fds.lock();
-                    if fds.is_empty() {
-                        info!("No socks to send, shutting down.");
-                        false
-                    } else {
-                        info!("Trying to send socks");
-                        let conf = self.configuration.as_ref();
-                        match fds.send_to_sock_with_retry(
-                            conf.upgrade_sock.as_str(),
-                            conf.upgrade_sock_connect_accept_max_retries,
-                        ) {
-                            Ok(_) => {
-                                info!("listener sockets sent");
-                            }
-                            Err(e) => {
-                                error!("Unable to send listener sockets to new process: {e}");
-                                #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                                sentry::capture_error(&e);
+                    let sent = {
+                        let fds = self.listen_fds();
+                        let fds = fds.lock();
+                        if fds.is_empty() {
+                            info!("No socks to send, shutting down.");
+                            None
+                        } else {
+                            info!("Trying to send socks");
+                            let conf = self.configuration.as_ref();
+                            match fds.send_to_sock_with_retry(
+                                conf.upgrade_sock.as_str(),
+                                conf.upgrade_sock_connect_accept_max_retries,
+                            ) {
+                                Ok(_) => {
+                                    info!("listener sockets sent");
+                                    Some(true)
+                                }
+                                Err(e) => {
+                                    error!("Unable to send listener sockets to new process: {e}");
+                                    #[cfg(all(not(debug_assertions), feature = "sentry"))]
+                                    sentry::capture_error(&e);
+                                    Some(false)
+                                }
                             }
                         }
-                        true
+                    };
+                    if let Some(sent) = sent {
+                        if let Some(handoff) = &self.upgrade_handoff {
+                            if !handoff(sent).await {
+                                info!("Upgrade abandoned, still serving");
+                                self.execution_phase_watch
+                                    .send(ExecutionPhase::Running)
+                                    .ok();
+                                continue;
+                            }
+                        } else {
+                            self.execution_phase_watch
+                                .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
+                                .ok();
+                            sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
+                        }
                     }
-                };
-                if sent_fds {
-                    self.execution_phase_watch
-                        .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
-                        .ok();
-                    sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
+                    info!("Broadcasting graceful shutdown");
+                    // gracefully exiting
+                    match self.shutdown_watch.send(true) {
+                        Ok(_) => {
+                            info!("Graceful shutdown started!");
+                        }
+                        Err(e) => {
+                            error!("Graceful shutdown broadcast failed: {e}");
+                            // switch to fast shutdown
+                            return ShutdownType::Graceful;
+                        }
+                    }
+                    info!("Broadcast graceful shutdown complete");
+                    return ShutdownType::Graceful;
                 }
-                info!("Broadcasting graceful shutdown");
-                // gracefully exiting
-                match self.shutdown_watch.send(true) {
-                    Ok(_) => {
-                        info!("Graceful shutdown started!");
-                    }
-                    Err(e) => {
-                        error!("Graceful shutdown broadcast failed: {e}");
-                        // switch to fast shutdown
-                        return ShutdownType::Graceful;
-                    }
-                }
-                info!("Broadcast graceful shutdown complete");
-                ShutdownType::Graceful
             }
         }
     }
@@ -511,6 +540,7 @@ impl Server {
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             runtime_groups: HashMap::new(),
             drained: None,
+            upgrade_handoff: None,
             bootstrap,
         }
     }
@@ -561,6 +591,7 @@ impl Server {
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             runtime_groups: HashMap::new(),
             drained: None,
+            upgrade_handoff: None,
             bootstrap,
         })
     }

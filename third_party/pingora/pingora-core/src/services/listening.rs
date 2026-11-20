@@ -60,6 +60,8 @@ where
     runtime_group: Option<String>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
+    /// Turns true once every listening endpoint is open; see [`Self::watch_listening`].
+    listening: tokio::sync::watch::Sender<bool>,
 }
 
 impl<A, DS> Service<A, DS>
@@ -78,6 +80,7 @@ where
             runtime_group: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
+            listening: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -97,6 +100,7 @@ where
             runtime_group: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
+            listening: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -209,6 +213,13 @@ where
     /// Get a mutable reference to the application inside this service
     pub fn app_logic_mut(&mut self) -> Option<&mut A> {
         self.app_logic.as_mut()
+    }
+
+    /// Turns true once the service has opened or taken over all its listening endpoints
+    /// and accepts on them, which is when a process taking over from another can report
+    /// that it serves.
+    pub fn watch_listening(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.listening.subscribe()
     }
 }
 
@@ -370,6 +381,7 @@ where
             }
         });
 
+        self.listening.send_replace(true);
         futures::future::join_all(handlers).await;
         self.listeners.cleanup();
         app_logic.cleanup().await;
