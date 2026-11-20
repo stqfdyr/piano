@@ -106,6 +106,9 @@ pub struct Process {
     pub threads: Option<u64>,
     pub open_files: Option<u64>,
     pub max_open_files: Option<u64>,
+    /// Hex sha256 of the executable the process runs, which can differ from the file
+    /// now at its path.
+    pub binary_sha256: Option<String>,
 }
 
 /// Client connections, over all listening addresses.

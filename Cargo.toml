@@ -41,6 +41,8 @@ clap = { version = "4.5", default-features = false, features = ["std", "derive",
 http = "1"
 # Structured key-value pairs on diagnostic records (request ids).
 log = { version = "0.4", features = ["std", "kv"] }
+# sha256 of the running binary in status (already built for rustls).
+ring = { version = "0.17", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }

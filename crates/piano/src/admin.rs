@@ -602,6 +602,7 @@ mod tests {
                 threads: None,
                 open_files: Some(10),
                 max_open_files: Some(1024),
+                binary_sha256: None,
             },
             connections: Connections {
                 open: 1,

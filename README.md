@@ -16,6 +16,8 @@ Requires Rust 1.100 (pinned in `rust-toolchain.toml`).
 ```sh
 cargo xtask ci     # fmt, clippy, tests, dependency policy (needs cargo-deny)
 cargo xtask dist   # static musl binary in target/dist/
+cargo xtask deploy HOST [--instance NAME] [--rollback]
+                   # build, install on HOST over ssh, piano upgrade, verify
 ```
 
 The release binary is built for `x86_64-unknown-linux-musl` with
@@ -88,7 +90,9 @@ the usual sandboxing (read-only system, private `/tmp`, a system call filter).
 
 - **Upgrade**: run the script with the new binary, then `piano upgrade` (OpenRC:
   `rc-service piano upgrade`). The new process takes the listening sockets over; the
-  old one finishes its media streams, for `server.drain_timeout` at most.
+  old one finishes its media streams, for `server.drain_timeout` at most. The binary
+  replaced stays as `/usr/local/bin/piano.prev`: to go back, run the script with
+  `--binary /usr/local/bin/piano.prev` and upgrade again.
 - **Stop**: `systemctl stop piano` or `rc-service piano stop` run `piano stop`, which
   waits for the daemon and an old process still draining.
 - **Reload**: `systemctl reload piano` or `rc-service piano reload`; a configuration

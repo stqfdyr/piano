@@ -9,7 +9,8 @@
 #                   /etc/piano/NAME.toml
 # --no-cert-access  leave the permissions of certificate files alone
 #
-# Safe to run again: the binary is replaced in one step, the configuration and
+# Safe to run again: the binary is replaced in one step (the old one is kept as
+# piano.prev; --binary /usr/local/bin/piano.prev goes back), the configuration and
 # /etc/conf.d files are kept, the service is neither enabled nor restarted. To
 # switch a running service to a new binary without dropping streams, run
 # piano upgrade afterwards.
@@ -31,7 +32,7 @@ while [ $# -gt 0 ]; do
 	--binary) [ $# -ge 2 ] || die "--binary needs a path"; binary=$2; shift 2 ;;
 	--instance) [ $# -ge 2 ] || die "--instance needs a name"; instance=$2; shift 2 ;;
 	--no-cert-access) cert_access=no; shift ;;
-	-h | --help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h | --help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*) die "unknown argument: $1" ;;
 	esac
 done
@@ -90,6 +91,12 @@ fi
 if [ -n "$binary" ]; then
 	install -d -m 0755 "$bin_dir"
 	install -m 0755 "$binary" "$bin_dir/.piano.new"
+	# The binary replaced stays as piano.prev: --binary $piano.prev goes back.
+	if [ -f "$piano" ] && ! cmp -s "$piano" "$bin_dir/.piano.new"; then
+		ln -f "$piano" "$bin_dir/.piano.prev.new"
+		mv -f "$bin_dir/.piano.prev.new" "$piano.prev"
+		say "$piano.prev: the binary replaced"
+	fi
 	mv -f "$bin_dir/.piano.new" "$piano"
 	say "$piano: $version"
 fi

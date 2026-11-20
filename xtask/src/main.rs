@@ -2,13 +2,17 @@
 //!
 //! - `ci`: format check, clippy with warnings denied, tests, dependency policy.
 //! - `dist`: static musl release binary for x86-64-v2 hosts, with size and sha256.
+//! - `deploy HOST [--instance NAME] [--rollback]`: builds with `dist`, installs on HOST over
+//!   ssh with `contrib/install.sh` and switches a running daemon with `piano upgrade`;
+//!   `--rollback` goes back to the binary installed before.
 
 #![forbid(unsafe_code)]
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 const DIST_TARGET: &str = "x86_64-unknown-linux-musl";
@@ -22,9 +26,10 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["ci"] => ci(),
-        ["dist"] => dist(),
+        ["dist"] => dist().map(drop),
+        ["deploy", rest @ ..] => parse_deploy(rest).and_then(|d| deploy(&d)),
         _ => {
-            eprintln!("usage: cargo xtask <ci|dist>");
+            eprintln!("usage: cargo xtask <ci|dist|deploy HOST [--instance NAME] [--rollback]>");
             return ExitCode::from(2);
         }
     };
@@ -72,32 +77,54 @@ fn run(step: &str, mut cmd: Command) -> Result {
 const TEST_LIMIT: Duration = Duration::from_secs(120);
 
 /// Like [`run`], but kills the command and everything it started once `limit` passes.
-fn run_limited(step: &str, mut cmd: Command, limit: Duration) -> Result {
+fn run_limited(step: &str, cmd: Command, limit: Duration) -> Result {
+    run_bounded(step, cmd, limit, None).map(drop)
+}
+
+/// Runs `cmd` in its own process group with `input` (if any) on stdin, killing the
+/// group once `limit` passes. With `input`, returns what it printed on stdout; it must
+/// print little, as stdout is read only after it exits.
+fn run_bounded(
+    step: &str,
+    mut cmd: Command,
+    limit: Duration,
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     eprintln!("==> {step} (limit {}s)", limit.as_secs());
     let start = Instant::now();
-    // Its own process group, so the test binaries cargo starts go with it.
+    if input.is_some() {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+    }
+    // Its own process group, so what it starts goes with it.
     let mut child = cmd
         .process_group(0)
         .spawn()
         .map_err(|e| format!("{step}: cannot start: {e}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin
+            .write_all(input)
+            .map_err(|e| format!("{step}: writing its input: {e}"))?;
+    }
     loop {
         if let Some(status) = child.try_wait().map_err(|e| format!("{step}: {e}"))? {
+            let mut out = Vec::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                std::io::Read::read_to_end(&mut stdout, &mut out)
+                    .map_err(|e| format!("{step}: reading its output: {e}"))?;
+            }
             if !status.success() {
                 return Err(format!("{step} failed ({status})"));
             }
             eprintln!("    {step} ok in {:.1}s", start.elapsed().as_secs_f64());
-            return Ok(());
+            return Ok(out);
         }
         if start.elapsed() >= limit {
             let group = format!("-{}", child.id());
             let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
             let _ = child.wait();
-            return Err(format!(
-                "{step} killed after {}s: a test hangs",
-                limit.as_secs()
-            ));
+            return Err(format!("{step} killed after {}s", limit.as_secs()));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -132,7 +159,8 @@ fn ci() -> Result {
     run("deny", deny)
 }
 
-fn dist() -> Result {
+/// Builds the release binary into `target/dist` with its `.sha256` file; returns its path.
+fn dist() -> Result<PathBuf> {
     let mut build = cargo();
     build
         .args([
@@ -185,6 +213,165 @@ fn dist() -> Result {
     );
     println!("  static yes ({DIST_TARGET}, target-cpu={DIST_CPU})");
     print!("  sha256 {}", String::from_utf8_lossy(&sum.stdout));
+    Ok(out)
+}
+
+/// The remote half of `deploy`, run as `sh -s` on the host.
+const DEPLOY_SH: &str = include_str!("deploy.sh");
+/// Files of `contrib/` that `install.sh` installs next to the binary.
+const CONTRIB: [&str; 5] = [
+    "install.sh",
+    "piano.service",
+    "piano.initd",
+    "piano.confd",
+    "piano.logrotate",
+];
+/// Fail fast instead of waiting on a host that does not answer.
+const SSH_OPTIONS: [&str; 8] = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=10",
+    "-o",
+    "ServerAliveCountMax=3",
+];
+/// Copying a release binary of about 10 MiB.
+const COPY_LIMIT: Duration = Duration::from_secs(300);
+/// Installing and `piano upgrade`, which itself gives up after 120 s.
+const REMOTE_LIMIT: Duration = Duration::from_secs(300);
+const REMOTE_DIR_PREFIX: &str = "/tmp/piano-deploy.";
+
+#[derive(Debug, PartialEq, Eq)]
+struct Deploy<'a> {
+    host: &'a str,
+    instance: Option<&'a str>,
+    rollback: bool,
+}
+
+fn parse_deploy<'a>(args: &[&'a str]) -> Result<Deploy<'a>> {
+    let usage = || "usage: cargo xtask deploy HOST [--instance NAME] [--rollback]".to_owned();
+    let mut host = None;
+    let mut instance = None;
+    let mut rollback = false;
+    let mut args = args.iter();
+    while let Some(&a) = args.next() {
+        match a {
+            "--rollback" => rollback = true,
+            "--instance" => {
+                let name = *args.next().ok_or_else(usage)?;
+                let valid = !name.is_empty()
+                    && name.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b)
+                    });
+                if !valid {
+                    return Err(format!("instance names use a-z, 0-9, _ and -: {name}"));
+                }
+                instance = Some(name);
+            }
+            _ if host.is_none() && !a.starts_with('-') => host = Some(a),
+            _ => return Err(usage()),
+        }
+    }
+    let host = host.ok_or_else(usage)?;
+    // Passed to ssh and scp as an argument and shown in commands; keep it plain.
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._@-".contains(&b))
+    {
+        return Err(format!("not a plain host name: {host}"));
+    }
+    Ok(Deploy {
+        host,
+        instance,
+        rollback,
+    })
+}
+
+fn ssh(host: &str) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args(SSH_OPTIONS).arg(host);
+    cmd
+}
+
+fn deploy(d: &Deploy<'_>) -> Result {
+    let mut files: Vec<PathBuf> = CONTRIB
+        .iter()
+        .map(|f| root().join("contrib").join(f))
+        .collect();
+    let binary = if d.rollback {
+        None
+    } else {
+        let built = dist()?;
+        let name = built
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or("dist produced no file name")?
+            .to_owned();
+        files.push(built.with_file_name(format!("{name}.sha256")));
+        files.push(built);
+        Some(name)
+    };
+
+    let mut mktemp = ssh(d.host);
+    mktemp.args(["mktemp", "-d", &format!("{REMOTE_DIR_PREFIX}XXXXXX")]);
+    let out = run_bounded(
+        "remote directory",
+        mktemp,
+        Duration::from_secs(30),
+        Some(b""),
+    )?;
+    let dir = String::from_utf8_lossy(&out).trim().to_owned();
+    let plain = dir.starts_with(REMOTE_DIR_PREFIX)
+        && !dir.contains("..")
+        && dir
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
+    if !plain {
+        return Err(format!("unexpected remote directory: {dir:?}"));
+    }
+
+    let mut scp = Command::new("scp");
+    scp.arg("-q")
+        .args(SSH_OPTIONS)
+        .args(&files)
+        .arg(format!("{}:{dir}/", d.host));
+    if let Err(e) = run_bounded("copy", scp, COPY_LIMIT, None) {
+        let mut clean = ssh(d.host);
+        clean.args(["rm", "-rf", &dir]);
+        let _ = run_bounded("clean up", clean, Duration::from_secs(30), Some(b""));
+        return Err(e);
+    }
+
+    // The script removes the directory itself, whatever happens.
+    let mut remote = ssh(d.host);
+    remote.args([
+        "sh",
+        "-s",
+        "--",
+        if d.rollback { "rollback" } else { "install" },
+        &dir,
+        d.instance.unwrap_or("-"),
+    ]);
+    remote.args(binary.as_deref());
+    let mut child_out = run_bounded("install", remote, REMOTE_LIMIT, Some(DEPLOY_SH.as_bytes()));
+    if let Ok(out) = child_out.as_mut() {
+        std::io::stdout()
+            .write_all(out)
+            .map_err(|e| format!("stdout: {e}"))?;
+    }
+    child_out?;
+    if !d.rollback {
+        let instance = d
+            .instance
+            .map(|i| format!(" --instance {i}"))
+            .unwrap_or_default();
+        println!(
+            "to go back: cargo xtask deploy {}{instance} --rollback",
+            d.host
+        );
+    }
     Ok(())
 }
 
@@ -258,6 +445,34 @@ mod tests {
             assert!(has_interpreter(&exe).unwrap());
         }
         assert!(has_interpreter(b"not elf").is_err());
+    }
+
+    #[test]
+    fn parses_deploy_arguments() {
+        assert_eq!(
+            parse_deploy(&["relay-1", "--instance", "shadow"]).unwrap(),
+            Deploy {
+                host: "relay-1",
+                instance: Some("shadow"),
+                rollback: false
+            }
+        );
+        assert!(
+            parse_deploy(&["--rollback", "root@relay-1"])
+                .unwrap()
+                .rollback
+        );
+        for bad in [
+            &[][..],
+            &["-oProxyCommand=x"],
+            &["a", "b"],
+            &["a", "--instance"],
+            &["a", "--instance", "Bad/Name"],
+            &["a;b"],
+            &["a", "--force"],
+        ] {
+            assert!(parse_deploy(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
