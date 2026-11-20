@@ -8,6 +8,7 @@ mod follow;
 mod headers;
 mod limits;
 mod log;
+mod media;
 mod retry;
 mod rewrite;
 mod routing;

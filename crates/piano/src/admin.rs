@@ -180,6 +180,7 @@ impl Admin {
                 handshake_timeouts: accept.handshake_timeouts(),
                 handshake_errors: accept.handshake_errors(),
                 denied: live.denied_connections(),
+                media_streams: live.streams.len() as u64,
             },
             certificate: Certificate {
                 names: cert.names,
@@ -427,6 +428,7 @@ mod tests {
                 handshake_timeouts: 0,
                 handshake_errors: 0,
                 denied: 0,
+                media_streams: 0,
             },
             certificate: Certificate {
                 names: Vec::new(),

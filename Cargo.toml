@@ -14,6 +14,7 @@ publish = false
 piano-config = { path = "crates/piano-config" }
 piano-ctl = { path = "crates/piano-ctl" }
 piano-edge = { path = "crates/piano-edge" }
+piano-media = { path = "crates/piano-media" }
 piano-proxy = { path = "crates/piano-proxy" }
 piano-telemetry = { path = "crates/piano-telemetry" }
 piano-upstream = { path = "crates/piano-upstream" }

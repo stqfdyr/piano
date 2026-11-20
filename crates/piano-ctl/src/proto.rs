@@ -109,6 +109,9 @@ pub struct Connections {
     pub handshake_errors: u64,
     /// Refused by the allow list.
     pub denied: u64,
+    /// Media streams being relayed now.
+    #[serde(default)]
+    pub media_streams: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

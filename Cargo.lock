@@ -1445,6 +1445,7 @@ dependencies = [
  "piano-config",
  "piano-ctl",
  "piano-edge",
+ "piano-media",
  "piano-proxy",
  "piano-telemetry",
  "piano-upstream",
@@ -1527,6 +1528,9 @@ dependencies = [
 [[package]]
 name = "piano-media"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "piano-proxy"
@@ -1540,6 +1544,7 @@ dependencies = [
  "log",
  "piano-config",
  "piano-edge",
+ "piano-media",
  "piano-telemetry",
  "piano-upstream",
  "pingora-core",
@@ -1548,6 +1553,7 @@ dependencies = [
  "pingora-proxy",
  "regex",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

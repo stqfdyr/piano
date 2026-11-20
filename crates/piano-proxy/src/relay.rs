@@ -1,7 +1,11 @@
 //! The `ProxyHttp` implementation.
 
-use crate::follow::{self, MAX_HOPS, Target, TargetKind};
+use crate::follow::{self, Target, TargetKind};
 use crate::headers;
+use crate::media;
+use crate::reach::{
+    self, AttemptLog, CONNECT_RETRIES, Hop, REFUSED, Reach, clip, is_connect_failure,
+};
 use crate::rewrite::MAX_BODY;
 use crate::route::{self, HEALTH_PATH, RouteClass};
 use crate::{Site, Sites};
@@ -11,17 +15,19 @@ use bytes::Bytes;
 use http::HeaderValue;
 use http::Method;
 use http::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
-    COOKIE, ETAG, HOST, LOCATION, TRANSFER_ENCODING,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST,
+    LOCATION, TRANSFER_ENCODING,
 };
 use log::{debug, error, warn};
 use piano_config::ServerDomains;
 use piano_edge::acl::canonical;
 use piano_edge::tls::Conn;
+use piano_media::Streams;
 use piano_telemetry::json::JsonLine;
 use piano_telemetry::logger::utc_timestamp;
 use piano_telemetry::{AccessLog, End, Id, SiteCounters, redact};
-use piano_upstream::{AddrCache, Addrs, Origin, Resolver};
+use piano_upstream::{Addrs, Resolver};
+use pingora_core::connectors::ConnectorOptions;
 use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::Digest;
 use pingora_core::protocols::http::compression::Algorithm;
@@ -34,24 +40,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Further attempts after failing to connect, each to the host's next address.
-const CONNECT_RETRIES: u8 = 2;
-
-/// Total upstream attempts per request: the first, every redirect hop and every
-/// connection retry. A status the upstream answered with is never retried: the
-/// upstreams sit behind a CDN whose 502, 503 and 504 report the state of the server
-/// behind it, which an immediate repeat does not change. Failures on a reused pooled
-/// connection are retried by pingora itself and also count here.
-pub const MAX_ATTEMPTS: usize = 1 + MAX_HOPS as usize + CONNECT_RETRIES as usize;
-
-/// How long a redirect target keeps the address it was first resolved to.
-const FOLLOW_ADDR_TTL: Duration = Duration::from_secs(300);
-
 /// Marks the error that makes pingora run another attempt towards a redirect target.
 const FOLLOW: ErrorType = ErrorType::Custom("FollowRedirect");
-/// A redirect that is not followed; the client gets 502.
-const REFUSED: ErrorType = ErrorType::Custom("RedirectRefused");
-
 /// One in this many GET requests of the `api` class is rewritten like server
 /// information, to notice when the upstream starts naming itself in responses that are
 /// otherwise passed on unchanged. Such a request fetches the uncompressed body, about ten
@@ -69,41 +59,11 @@ const MAX_ERR: usize = 512;
 const GZIP_LEVEL: u32 = 6;
 const BROTLI_LEVEL: u32 = 5;
 
-/// Client credentials, sent only to the upstream server itself.
-const CREDENTIAL_HEADERS: [&str; 3] = [
-    "x-emby-authorization",
-    "x-emby-token",
-    "x-mediabrowser-token",
-];
-
-/// A redirect being followed.
-#[derive(Debug)]
-struct Hop {
-    target: Target,
-    kind: TargetKind,
-}
-
 /// The address the current attempt connects to.
 #[derive(Debug)]
 struct Attempt {
     addrs: Arc<Addrs>,
     addr: SocketAddr,
-}
-
-/// What one upstream attempt did, for the access log.
-#[derive(Debug)]
-struct AttemptLog {
-    host: String,
-    addr: SocketAddr,
-    issued: Instant,
-    /// Unset until a connection was obtained.
-    reused: Option<bool>,
-    /// Time to set up a new connection, TCP and TLS.
-    connect: Option<Duration>,
-    /// Status of the response header the upstream sent.
-    status: Option<u16>,
-    /// What ended the attempt, if it failed.
-    error: Option<&'static str>,
 }
 
 /// A response body being collected for rewriting.
@@ -123,17 +83,17 @@ struct Rewrite {
 pub struct Ctx {
     pub rid: Id,
     /// When the request header had been read.
-    start: Option<Instant>,
+    pub(crate) start: Option<Instant>,
     /// Every upstream attempt, in order.
-    attempts: Vec<AttemptLog>,
+    pub(crate) attempts: Vec<AttemptLog>,
     /// From the request to the upstream response header the client got.
-    ttfb: Option<Duration>,
-    cf_ray: Option<HeaderValue>,
+    pub(crate) ttfb: Option<Duration>,
+    pub(crate) cf_ray: Option<HeaderValue>,
     /// The site table taken when the request started; a reload does not change it.
-    sites: Option<Arc<Sites>>,
-    site: usize,
+    pub(crate) sites: Option<Arc<Sites>>,
+    pub(crate) site: usize,
     pub class: RouteClass,
-    hop: Option<Hop>,
+    pub(crate) hop: Option<Hop>,
     /// Redirects followed so far.
     pub hops: u8,
     attempt: Option<Attempt>,
@@ -145,7 +105,7 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn site(&self) -> Result<&Site> {
+    pub(crate) fn site(&self) -> Result<&Site> {
         self.sites
             .as_deref()
             .and_then(|s| s.get(self.site))
@@ -169,8 +129,8 @@ impl Ctx {
 #[derive(Debug)]
 pub struct Relay {
     sites: Arc<ArcSwap<Sites>>,
-    resolver: Resolver,
-    follow_addrs: AddrCache,
+    pub(crate) reach: Arc<Reach>,
+    pub(crate) streams: Arc<Streams>,
     access: Arc<AccessLog>,
     /// Requests for a host that is no site.
     unrouted: Arc<SiteCounters>,
@@ -179,16 +139,20 @@ pub struct Relay {
 }
 
 impl Relay {
+    /// `client` configures the connections of media streams, which the relay makes
+    /// itself; `streams` lists those streams while they run.
     pub fn new(
         sites: Arc<ArcSwap<Sites>>,
         resolver: Resolver,
+        client: ConnectorOptions,
+        streams: Arc<Streams>,
         access: Arc<AccessLog>,
         unrouted: Arc<SiteCounters>,
     ) -> Self {
         Self {
             sites,
-            resolver,
-            follow_addrs: AddrCache::new(FOLLOW_ADDR_TTL),
+            reach: Arc::new(Reach::new(resolver, client)),
+            streams,
             access,
             unrouted,
             api_gets: AtomicU64::new(0),
@@ -278,26 +242,6 @@ fn is_json(resp: &ResponseHeader) -> bool {
     })
 }
 
-/// Failures to reach the address at all, as opposed to failures of TLS with a server
-/// that answered.
-fn is_connect_failure(e: &ErrorType) -> bool {
-    matches!(
-        e,
-        ErrorType::ConnectTimedout
-            | ErrorType::ConnectRefused
-            | ErrorType::ConnectNoRoute
-            | ErrorType::ConnectError
-            | ErrorType::TLSHandshakeTimedout
-    )
-}
-
-/// A redirect that will not be followed: the client gets 502, never the Location.
-/// The reason ends up in the access log and the diagnostic log; it must name hosts
-/// only, since redirect targets carry signed paths.
-fn refuse_redirect(reason: String) -> Box<Error> {
-    Error::create(REFUSED, ErrorSource::Upstream, Some(reason.into()), None)
-}
-
 /// How a request ended, as logged in `end`.
 fn end_reason(e: Option<&Error>) -> End {
     use ErrorType::*;
@@ -321,18 +265,6 @@ fn end_reason(e: Option<&Error>) -> End {
         (ErrorSource::Upstream, _) => End::UpstreamError,
         _ => End::Internal,
     }
-}
-
-/// The longest prefix of `s` within `max` bytes that ends on a char boundary.
-fn clip(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 fn header_text(req: &RequestHeader, name: http::header::HeaderName, max: usize) -> Option<String> {
@@ -402,6 +334,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
     j.array("up");
     for a in &ctx.attempts {
         j.object();
+        j.num("src", u64::from(a.src));
         j.str("host", &a.host).str("addr", &a.addr.to_string());
         match a.reused {
             Some(r) => j.bool("reused", r),
@@ -531,52 +464,23 @@ impl ProxyHttp for Relay {
         if ctx.class.may_idle() {
             downstream.set_read_timeout(None);
         }
+        if ctx.class == RouteClass::Media && media::takes(session) {
+            media::relay(self, session, ctx).await?;
+            return Ok(true);
+        }
         Ok(false)
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         let host = ctx.target_host()?.to_owned();
         let site = ctx.site()?;
-        let (mut peer, addrs, addr) = match &ctx.hop {
-            None => {
-                let addr = site.origin.addrs.current();
-                let peer = site.origin.peer(addr)?;
-                (peer, Arc::clone(&site.origin.addrs), addr)
-            }
-            Some(hop) => {
-                let t = &hop.target;
-                let addrs = if t.host == site.origin.host && t.port == site.origin.port {
-                    Arc::clone(&site.origin.addrs)
-                } else {
-                    self.follow_addrs
-                        .get(&self.resolver, &t.host, t.port)
-                        .await
-                        .map_err(|e| refuse_redirect(format!("{}: {e}", t.host)))?
-                };
-                let origin = Origin {
-                    host: t.host.clone(),
-                    port: t.port,
-                    addrs,
-                    options: site.origin.options,
-                };
-                let addr = origin.addrs.current();
-                (origin.peer(addr)?, origin.addrs, addr)
-            }
-        };
+        let (mut peer, addrs, addr) = self.reach.peer(site, ctx.hop.as_ref()).await?;
         if ctx.class.may_idle() {
             peer.options.read_timeout = None;
             peer.options.write_timeout = None;
         }
         ctx.attempt = Some(Attempt { addrs, addr });
-        ctx.attempts.push(AttemptLog {
-            host,
-            addr,
-            issued: Instant::now(),
-            reused: None,
-            connect: None,
-            status: None,
-            error: None,
-        });
+        ctx.attempts.push(AttemptLog::new(0, host, addr));
         Ok(Box::new(peer))
     }
 
@@ -590,10 +494,7 @@ impl ProxyHttp for Relay {
         ctx: &mut Ctx,
     ) -> Result<()> {
         if let Some(a) = ctx.attempts.last_mut() {
-            a.reused = Some(reused);
-            if !reused {
-                a.connect = Some(a.issued.elapsed());
-            }
+            a.connected(reused);
         }
         Ok(())
     }
@@ -630,27 +531,10 @@ impl ProxyHttp for Relay {
         upstream_request: &mut RequestHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        let site = ctx.site()?;
-        match &ctx.hop {
-            None => upstream_request.insert_header(HOST, site.upstream_host.clone())?,
-            Some(hop) => {
-                upstream_request.set_raw_path(&hop.target.path)?;
-                upstream_request.insert_header(HOST, hop.target.authority())?;
-                if hop.kind == TargetKind::Follow {
-                    upstream_request.remove_header(&COOKIE);
-                    upstream_request.remove_header(&AUTHORIZATION);
-                    for name in CREDENTIAL_HEADERS {
-                        upstream_request.remove_header(name);
-                    }
-                }
-            }
-        }
+        reach::prepare_request(ctx.site()?, ctx.hop.as_ref(), upstream_request)?;
         if ctx.rewrite.is_some() {
             upstream_request.insert_header(ACCEPT_ENCODING, "identity")?;
         }
-        headers::scrub_request(upstream_request);
-        headers::rewrite_user_agent(&site.policy.ua, upstream_request)?;
-        headers::join_cookies(upstream_request)?;
         Ok(())
     }
 
@@ -672,44 +556,18 @@ impl ProxyHttp for Relay {
         let Some(location) = upstream_response.headers.get(LOCATION) else {
             return Ok(());
         };
-        let site = ctx.site()?;
-        let method = &session.req_header().method;
-        if method != Method::GET && method != Method::HEAD {
-            return Err(refuse_redirect(format!("{} request redirected", method)));
-        }
-        if ctx.hops >= MAX_HOPS {
-            return Err(refuse_redirect(format!("more than {MAX_HOPS} redirects")));
-        }
-        let base = match &ctx.hop {
-            Some(h) => h.target.clone(),
-            None => Target {
-                host: site.origin.host.clone(),
-                port: site.origin.port,
-                path: session.req_header().raw_path().to_vec(),
-            },
-        };
-        let target = follow::resolve(location.as_bytes(), &base).map_err(|e| {
-            let shown = String::from_utf8_lossy(location.as_bytes());
-            refuse_redirect(format!("{e}: {:?}", clip(&shown, 200)))
-        })?;
-        // A site of this relay would receive the request again and could loop.
-        if ctx
-            .sites
-            .as_deref()
-            .is_some_and(|s| s.find(target.host.as_bytes()).is_some())
-        {
-            return Err(refuse_redirect(format!(
-                "site {}: redirect to {}, a site of this relay",
-                site.name, target.host
-            )));
-        }
-        let Some(kind) = site.policy.follow.kind(&target.host) else {
-            return Err(refuse_redirect(format!(
-                "site {}: {} is not in follow",
-                site.name, target.host
-            )));
-        };
-        ctx.hop = Some(Hop { target, kind });
+        let hop = reach::redirect(
+            ctx.sites
+                .as_deref()
+                .ok_or_else(|| Error::explain(ErrorType::InternalError, "no sites"))?,
+            ctx.site()?,
+            &session.req_header().method,
+            ctx.hops,
+            ctx.hop.as_ref(),
+            session.req_header().raw_path(),
+            location.as_bytes(),
+        )?;
+        ctx.hop = Some(hop);
         ctx.hops += 1;
         let mut e = Error::new(FOLLOW);
         e.set_retry(true);

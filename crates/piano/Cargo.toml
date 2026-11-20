@@ -16,6 +16,7 @@ nix.workspace = true
 piano-config.workspace = true
 piano-ctl.workspace = true
 piano-edge.workspace = true
+piano-media.workspace = true
 piano-proxy.workspace = true
 piano-telemetry.workspace = true
 piano-upstream.workspace = true

@@ -16,6 +16,7 @@ http.workspace = true
 log.workspace = true
 piano-config.workspace = true
 piano-edge.workspace = true
+piano-media.workspace = true
 piano-telemetry.workspace = true
 piano-upstream.workspace = true
 pingora-core.workspace = true
@@ -24,6 +25,9 @@ pingora-http.workspace = true
 pingora-proxy.workspace = true
 regex.workspace = true
 thiserror.workspace = true
+# Media streams: one task per upstream request, a queue between them and the stream,
+# and the hedge and stall timers. Already in the tree through pingora.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 
 [lints]
 workspace = true

@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
+use piano_media::Streams;
 use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
 use piano_telemetry::{AccessLog, Metrics};
 use piano_upstream::{Origin, PeerOptions, Resolver};
@@ -30,7 +31,8 @@ pub use control::ControlService;
 pub use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 pub use reload::Reloader;
 
-/// Pingora's own pool cap is per worker; one worker per CPU on small hosts.
+/// Idle upstream connections kept per pool; pingora's proxy and the media engine each
+/// have one.
 const UPSTREAM_POOL_SIZE: usize = 128;
 
 /// All services share one runtime: one worker per CPU, no extra threads.
@@ -124,6 +126,7 @@ pub struct Live {
     fixed: Fixed,
     metrics: Arc<Metrics>,
     accept: Arc<AcceptStats>,
+    streams: Arc<Streams>,
 }
 
 /// Settings read once at startup; a reload that changes them only warns.
@@ -191,7 +194,7 @@ pub fn level_filter(level: piano_config::LogLevel) -> log::LevelFilter {
 
 /// Raises the soft limit on open files to the hard limit, and warns when even that
 /// cannot hold `limits.max_connections` client connections with one upstream connection
-/// each, plus the upstream pool. Process-wide, so it belongs to the daemon's startup.
+/// each, plus both upstream pools. Process-wide, so it belongs to the daemon's startup.
 pub fn raise_open_file_limit(config: &Config) {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
@@ -209,7 +212,7 @@ pub fn raise_open_file_limit(config: &Config) {
         }
     }
     let conns = config.limits.max_connections as u64 * config.server.listen.len() as u64;
-    let need = conns * 2 + UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS;
+    let need = conns * 2 + 2 * UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS;
     if limit < need {
         log::warn!(
             "open file limit {limit} is below the {need} that limits.max_connections = {} \
@@ -252,12 +255,15 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
 
     let mut client = ConnectorOptions::from_server_conf(&conf);
     client.rustls_client_config = Some((client_tls.config, client_tls.roots));
+    let streams = Arc::new(Streams::default());
 
     let mut service = ProxyServiceBuilder::new(
         &conf,
         Relay::new(
             Arc::clone(&sites),
             resolver.clone(),
+            client.clone(),
+            Arc::clone(&streams),
             Arc::clone(&access_log),
             metrics.unrouted(),
         ),
@@ -298,6 +304,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         fixed: Fixed::of(config),
         metrics,
         accept,
+        streams,
     });
     Ok(Daemon { server, live })
 }

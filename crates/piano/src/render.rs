@@ -127,11 +127,12 @@ pub fn status(s: &Status, color: Color) -> String {
     let c = &s.connections;
     let _ = writeln!(
         o,
-        "  conns    {} open of {} · {} in handshake · since start: {} denied, {} handshake \
-         timeouts, {} handshake errors, {} closed at limit",
+        "  conns    {} open of {} · {} in handshake · {} media streams · since start: {} \
+         denied, {} handshake timeouts, {} handshake errors, {} closed at limit",
         c.open,
         c.limit,
         c.handshaking,
+        c.media_streams,
         c.denied,
         c.handshake_timeouts,
         c.handshake_errors,

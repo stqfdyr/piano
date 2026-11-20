@@ -22,6 +22,10 @@
 //!   (no websocket framing); without, 400.
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
 //!   single-range `Range` support; stands in for a media file.
+//! - `/videos/{key}/…` and `/__file/{key}`: a scripted media file of `len` pattern bytes
+//!   (query `len=N`), with single-range support; see [`Plan`] for `plan=…`. With
+//!   `redirect=1`, `/videos/…` answers 302 to `/__file/{key}` with the other
+//!   parameters. [`Origin::seen`] lists the `Range` of each file request per key.
 //! - anything else: 404.
 
 use crate::pki::Leaf;
@@ -44,8 +48,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio::time::Sleep;
 use tokio_rustls::TlsAcceptor;
 
 /// The body of `/System/Ext/ServerDomains`.
@@ -89,14 +95,24 @@ pub fn pattern_byte(offset: u64) -> u8 {
 static PATTERN: LazyLock<Vec<u8>> =
     LazyLock::new(|| (0..CHUNK as u64 + PERIOD).map(pattern_byte).collect());
 
-type ResBody = BoxBody<Bytes, Infallible>;
+type ResBody = BoxBody<Bytes, std::io::Error>;
 
-/// Requests seen per `/__seq` key.
+/// Requests seen per `/__seq` key, and per scripted media key (`key#r` for its redirects).
 type Seqs = Arc<Mutex<HashMap<String, usize>>>;
+
+/// The `Range` header of every scripted media file request, per key.
+type Seen = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
+
+#[derive(Clone, Default)]
+struct State {
+    seqs: Seqs,
+    seen: Seen,
+}
 
 pub struct Origin {
     pub addr: SocketAddr,
     requests: Arc<AtomicUsize>,
+    state: State,
     task: JoinHandle<()>,
 }
 
@@ -126,7 +142,8 @@ impl Origin {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
-        let seqs = Seqs::default();
+        let state = State::default();
+        let shared = state.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else {
@@ -134,14 +151,14 @@ impl Origin {
                 };
                 let acceptor = acceptor.clone();
                 let counter = Arc::clone(&counter);
-                let seqs = Arc::clone(&seqs);
+                let state = shared.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
                     let service = service_fn(move |req| {
                         counter.fetch_add(1, Ordering::Relaxed);
-                        handle(req, Arc::clone(&seqs))
+                        handle(req, state.clone())
                     });
                     let _ = auto::Builder::new(TokioExecutor::new())
                         .serve_connection_with_upgrades(TokioIo::new(tls), service)
@@ -152,6 +169,7 @@ impl Origin {
         Self {
             addr,
             requests,
+            state,
             task,
         }
     }
@@ -159,6 +177,18 @@ impl Origin {
     /// Requests served so far.
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::Relaxed)
+    }
+
+    /// The `Range` header of each scripted media file request for `key`, in order.
+    pub fn seen(&self, key: &str) -> Vec<Option<String>> {
+        let seen = self.state.seen.lock().unwrap();
+        seen.get(key).cloned().unwrap_or_default()
+    }
+
+    /// Redirects answered for scripted media `key`.
+    pub fn redirects(&self, key: &str) -> usize {
+        let seqs = self.state.seqs.lock().unwrap();
+        seqs.get(&format!("{key}#r")).copied().unwrap_or(0)
     }
 }
 
@@ -169,13 +199,19 @@ impl Drop for Origin {
 }
 
 fn full(body: impl Into<Bytes>) -> ResBody {
-    Full::new(body.into()).boxed()
+    Full::new(body.into())
+        .map_err(|never: Infallible| match never {})
+        .boxed()
 }
 
-async fn handle(mut req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBody>, Infallible> {
+async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<ResBody>, Infallible> {
     if req.uri().path().eq_ignore_ascii_case("/embywebsocket") {
         return Ok(websocket(&mut req));
     }
+    if let Some(key) = media_key(req.uri().path()) {
+        return Ok(media(&req, key.to_owned(), &state).await);
+    }
+    let seqs = state.seqs;
     let path = req.uri().path();
     let response = if path.eq_ignore_ascii_case("/System/Info/Public")
         || path.eq_ignore_ascii_case("/emby/System/Info/Public")
@@ -357,18 +393,230 @@ fn bytes_response(total: u64, headers: &HeaderMap) -> Response<ResBody> {
     let response = match range.map(|r| parse_range(r, total)) {
         None => builder
             .header(CONTENT_LENGTH, total)
-            .body(Pattern { pos: 0, end: total }.boxed()),
+            .body(pattern(0, total)),
         Some(Some((start, end))) => builder
             .status(StatusCode::PARTIAL_CONTENT)
             .header(CONTENT_LENGTH, end - start)
             .header(CONTENT_RANGE, format!("bytes {start}-{}/{total}", end - 1))
-            .body(Pattern { pos: start, end }.boxed()),
+            .body(pattern(start, end)),
         Some(None) => builder
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(CONTENT_RANGE, format!("bytes */{total}"))
             .body(full(Bytes::new())),
     };
     response.unwrap()
+}
+
+fn pattern(pos: u64, end: u64) -> ResBody {
+    Pattern { pos, end }
+        .map_err(|never: Infallible| match never {})
+        .boxed()
+}
+
+/// The key of a scripted media path: `/videos/{key}/…` or `/__file/{key}`.
+fn media_key(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("/videos/")
+        .or_else(|| path.strip_prefix("/__file/"))?;
+    let key = rest.split('/').next()?;
+    (!key.is_empty()).then_some(key)
+}
+
+/// What one request of a scripted media file does; `plan=` holds one per request,
+/// comma-separated, the last repeating. Tokens, dot-separated: `hMS` waits before the
+/// head, `bMS` before the first body byte; `cN` breaks the connection at file offset
+/// N; `sN:MS` pauses at file offset N; `eTAG` sets the ETag (default `v1`); `x`
+/// ignores `Range` and does not advertise ranges; `u` sends no length (like a live
+/// transcode); `-` is a plain request.
+#[derive(Debug, Default, Clone)]
+struct Plan {
+    head_delay: u64,
+    body_delay: u64,
+    cut: Option<u64>,
+    pause: Option<(u64, u64)>,
+    etag: Option<String>,
+    no_ranges: bool,
+    unknown_length: bool,
+}
+
+impl Plan {
+    fn parse(spec: &str) -> Self {
+        let mut p = Plan::default();
+        for t in spec.split('.').filter(|t| !t.is_empty() && *t != "-") {
+            let (k, v) = t.split_at(1);
+            match k {
+                "h" => p.head_delay = v.parse().unwrap(),
+                "b" => p.body_delay = v.parse().unwrap(),
+                "c" => p.cut = Some(v.parse().unwrap()),
+                "s" => {
+                    let (at, ms) = v.split_once(':').unwrap();
+                    p.pause = Some((at.parse().unwrap(), ms.parse().unwrap()));
+                }
+                "e" => p.etag = Some(v.to_owned()),
+                "x" => p.no_ranges = true,
+                "u" => p.unknown_length = true,
+                _ => panic!("unknown plan token {t}"),
+            }
+        }
+        p
+    }
+}
+
+async fn media(req: &Request<Incoming>, key: String, state: &State) -> Response<ResBody> {
+    let query = req.uri().query().unwrap_or_default();
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+    };
+    if req.uri().path().starts_with("/videos/") && param("redirect") == Some("1") {
+        *state
+            .seqs
+            .lock()
+            .unwrap()
+            .entry(format!("{key}#r"))
+            .or_default() += 1;
+        let rest: Vec<&str> = query
+            .split('&')
+            .filter(|kv| !kv.starts_with("redirect="))
+            .collect();
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header("location", format!("/__file/{key}?{}", rest.join("&")))
+            .body(full("moved"))
+            .unwrap();
+    }
+    let total: u64 = param("len").and_then(|l| l.parse().ok()).unwrap_or(1 << 20);
+    let range = req
+        .headers()
+        .get(RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let n = {
+        let mut seen = state.seen.lock().unwrap();
+        let list = seen.entry(key).or_default();
+        list.push(range.clone());
+        list.len()
+    };
+    let plans: Vec<&str> = param("plan").unwrap_or("-").split(',').collect();
+    let plan = Plan::parse(plans[(n - 1).min(plans.len() - 1)]);
+    if plan.head_delay > 0 {
+        tokio::time::sleep(Duration::from_millis(plan.head_delay)).await;
+    }
+    let mut builder = Response::builder()
+        .header(CONTENT_TYPE, "video/x-matroska")
+        .header(
+            "etag",
+            format!("\"{}\"", plan.etag.as_deref().unwrap_or("v1")),
+        );
+    if !plan.no_ranges && !plan.unknown_length {
+        builder = builder.header(ACCEPT_RANGES, "bytes");
+    }
+    let wanted = range.filter(|_| !plan.no_ranges && !plan.unknown_length);
+    let (start, end) = match wanted.map(|r| parse_range(&r, total)) {
+        None => (0, total),
+        Some(Some(r)) => {
+            builder = builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_RANGE, format!("bytes {}-{}/{total}", r.0, r.1 - 1));
+            r
+        }
+        Some(None) => {
+            return builder
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(CONTENT_RANGE, format!("bytes */{total}"))
+                .body(full(Bytes::new()))
+                .unwrap();
+        }
+    };
+    let body = Scripted {
+        pos: start,
+        end,
+        first_delay: (plan.body_delay > 0).then(|| Duration::from_millis(plan.body_delay)),
+        cut: plan.cut,
+        flushed: false,
+        pause: plan.pause,
+        exact: !plan.unknown_length,
+        sleep: None,
+    };
+    builder.body(body.boxed()).unwrap()
+}
+
+/// Pattern bytes in `[pos, end)` delivered as a [`Plan`] says.
+struct Scripted {
+    pos: u64,
+    end: u64,
+    first_delay: Option<Duration>,
+    cut: Option<u64>,
+    /// Set once the bytes before the cut had time to leave.
+    flushed: bool,
+    pause: Option<(u64, u64)>,
+    exact: bool,
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl Body for Scripted {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        loop {
+            if let Some(s) = self.sleep.as_mut() {
+                if s.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.sleep = None;
+            }
+            if let Some(d) = self.first_delay.take() {
+                self.sleep = Some(Box::pin(tokio::time::sleep(d)));
+                continue;
+            }
+            // Without a pause the server would drop bytes still in its buffer.
+            if !self.flushed && self.cut.is_some_and(|c| c <= self.pos) {
+                self.flushed = true;
+                self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+                continue;
+            }
+            if self.pause.is_some_and(|(at, _)| at <= self.pos) {
+                let (_, ms) = self.pause.take().unwrap();
+                self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                continue;
+            }
+            break;
+        }
+        if self.pos >= self.end {
+            return Poll::Ready(None);
+        }
+        if self.cut.is_some_and(|c| c <= self.pos) {
+            return Poll::Ready(Some(Err(std::io::Error::other("scripted cut"))));
+        }
+        let mut stop = self.end;
+        for at in [self.cut, self.pause.map(|p| p.0)].into_iter().flatten() {
+            if at > self.pos {
+                stop = stop.min(at);
+            }
+        }
+        let len = (stop - self.pos).min(CHUNK as u64) as usize;
+        let from = (self.pos % PERIOD) as usize;
+        let chunk = Bytes::copy_from_slice(&PATTERN[from..from + len]);
+        self.pos += len as u64;
+        Poll::Ready(Some(Ok(Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.pos >= self.end
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.exact {
+            SizeHint::with_exact(self.end - self.pos)
+        } else {
+            SizeHint::default()
+        }
+    }
 }
 
 /// Decodes `%XX` escapes; anything else is kept as is.
