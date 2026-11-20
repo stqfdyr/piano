@@ -295,7 +295,7 @@ mod tests {
     fn minimal_config_gets_defaults() {
         let c = parse(MINIMAL).unwrap();
         assert_eq!(c.server.listen, ["[::]:443"]);
-        assert_eq!(c.upstream.connect_timeout.get().as_secs(), 5);
+        assert_eq!(c.upstream.connect_timeout.get().as_secs(), 3);
         let site = &c.sites[0];
         assert_eq!(site.name, "media");
         assert_eq!(

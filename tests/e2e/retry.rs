@@ -1,4 +1,4 @@
-//! Upstream attempts repeated before the response starts.
+//! Upstream attempts repeated before the response starts: only when no upstream answered.
 
 use piano_e2e::client::{Proto, client};
 use piano_e2e::origin::Origin;
@@ -46,34 +46,14 @@ fn ip(last: u8) -> IpAddr {
 }
 
 #[tokio::test]
-async fn bad_gateway_and_gateway_timeout_are_retried_once() {
+async fn upstream_error_statuses_are_passed_on_without_retrying() {
     let w = world(&[]).await;
     for proto in [Proto::H1, Proto::H2] {
-        for code in [502, 504] {
-            let once = format!("/__seq/{proto:?}-once-{code}/{code},200");
-            assert_eq!(w.send(proto, "GET", &once).await, (200, "2".into()));
-            let twice = format!("/__seq/{proto:?}-twice-{code}/{code},{code},200");
-            assert_eq!(w.send(proto, "GET", &twice).await, (code, "2".into()));
+        for code in [500, 502, 503, 504] {
+            let path = format!("/__seq/{proto:?}-{code}/{code},200");
+            assert_eq!(w.send(proto, "GET", &path).await, (code, "1".into()));
         }
     }
-}
-
-#[tokio::test]
-async fn service_unavailable_is_not_retried() {
-    let w = world(&[]).await;
-    assert_eq!(
-        w.send(Proto::H1, "GET", "/__seq/503/503,200").await,
-        (503, "1".into())
-    );
-}
-
-#[tokio::test]
-async fn non_idempotent_requests_are_not_retried_on_status() {
-    let w = world(&[]).await;
-    assert_eq!(
-        w.send(Proto::H1, "POST", "/__seq/post/502,200").await,
-        (502, "1".into())
-    );
 }
 
 #[tokio::test]

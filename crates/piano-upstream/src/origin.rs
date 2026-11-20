@@ -3,10 +3,27 @@
 use crate::resolve::Addrs;
 use pingora_core::Result;
 use pingora_core::protocols::ALPN;
+use pingora_core::protocols::l4::ext::TcpKeepalive;
 use pingora_core::upstreams::peer::HttpPeer;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// TCP keepalive for every connection, client and upstream side alike. It tells a
+/// silent peer from a vanished one (a phone that changed networks, a host that went
+/// away without closing), which no read timeout can: a dead connection is closed about
+/// two minutes after its last traffic, a quiet live one never.
+pub fn tcp_keepalive() -> TcpKeepalive {
+    TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(10),
+        count: 6,
+        // 0 keeps the system default. A finite value would also close a connection
+        // whose peer stopped reading but is alive, such as a paused player.
+        #[cfg(target_os = "linux")]
+        user_timeout: Duration::ZERO,
+    }
+}
 
 /// Timeouts applied to every connection to an origin.
 #[derive(Debug, Clone, Copy)]
@@ -55,10 +72,11 @@ impl Origin {
         o.verify_cert = true;
         o.verify_hostname = true;
         o.connection_timeout = Some(self.options.connect_timeout);
-        o.total_connection_timeout = Some(self.options.connect_timeout * 2);
+        o.total_connection_timeout = Some(self.options.connect_timeout);
         o.read_timeout = Some(self.options.read_timeout);
         o.write_timeout = Some(self.options.read_timeout);
         o.idle_timeout = Some(self.options.idle_timeout);
+        o.tcp_keepalive = Some(tcp_keepalive());
         Ok(peer)
     }
 }

@@ -91,20 +91,27 @@ async fn request_policy_hides_the_client_and_applies_site_rules() {
 }
 
 #[tokio::test]
-async fn response_policy_hides_cdn_headers_and_moves_cookies() {
+async fn response_policy_hides_reporting_and_moves_cookies() {
     let w = world().await;
     for proto in [Proto::H1, Proto::H2] {
         let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto);
         let res = c.get(url(&w, "/__cdn")).send().await.unwrap();
         let h = res.headers();
-        for hidden in ["server", "cf-ray", "alt-svc", "via"] {
+        for hidden in ["alt-svc", "nel", "report-to"] {
             assert!(h.get(hidden).is_none(), "{proto:?}: {hidden}");
+        }
+        for (name, value) in [
+            ("server", "cloudflare"),
+            ("cf-ray", "0123456789abcdef-LAX"),
+            ("via", "1.1 cdn"),
+            ("x-frame-options", "DENY"),
+        ] {
+            assert_eq!(h[name], value, "{proto:?}: {name}");
         }
         assert_eq!(
             h["strict-transport-security"],
             "max-age=31536000; includeSubDomains"
         );
-        assert_eq!(h["x-frame-options"], "SAMEORIGIN");
         let cookies: Vec<_> = h.get_all("set-cookie").iter().collect();
         assert_eq!(
             cookies,
@@ -118,9 +125,12 @@ async fn response_policy_hides_cdn_headers_and_moves_cookies() {
 }
 
 #[tokio::test]
-async fn local_answers_carry_security_headers() {
+async fn local_answers_carry_hsts() {
     let w = world().await;
     let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1);
     let res = c.get(url(&w, "/__piano/health")).send().await.unwrap();
-    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        res.headers()["strict-transport-security"],
+        "max-age=31536000; includeSubDomains"
+    );
 }

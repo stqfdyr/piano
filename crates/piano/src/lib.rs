@@ -11,6 +11,7 @@ use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::connectors::ConnectorOptions;
+use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
@@ -135,7 +136,9 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     for addr in &config.server.listen {
         let mut tls = TlsSettings::with_server_config(Arc::clone(&server_tls));
         tls.set_callbacks(Box::new(SniRecorder));
-        service.add_tls_with_settings(addr, None, tls);
+        let mut sock = TcpSocketOptions::default();
+        sock.tcp_keepalive = Some(piano_upstream::tcp_keepalive());
+        service.add_tls_with_settings(addr, Some(sock), tls);
     }
     server.add_service(service);
 

@@ -30,24 +30,18 @@ use std::time::Duration;
 /// Further attempts after failing to connect, each to the host's next address.
 const CONNECT_RETRIES: u8 = 2;
 
-/// Further attempts after the upstream answers 502 or 504. Never after 503: upstreams
-/// use it for deliberate refusals that a retry would only repeat.
-const STATUS_RETRIES: u8 = 1;
-
-/// Total upstream attempts per request: the first, every redirect hop and every retry.
-pub const MAX_ATTEMPTS: usize =
-    1 + MAX_HOPS as usize + CONNECT_RETRIES as usize + STATUS_RETRIES as usize;
+/// Total upstream attempts per request: the first, every redirect hop and every
+/// connection retry. A status the upstream answered with is never retried: the
+/// upstreams sit behind a CDN whose 502, 503 and 504 report the state of the server
+/// behind it, which an immediate repeat does not change. Failures on a reused pooled
+/// connection are retried by pingora itself and also count here.
+pub const MAX_ATTEMPTS: usize = 1 + MAX_HOPS as usize + CONNECT_RETRIES as usize;
 
 /// How long a redirect target keeps the address it was first resolved to.
 const FOLLOW_ADDR_TTL: Duration = Duration::from_secs(300);
 
 /// Marks the error that makes pingora run another attempt towards a redirect target.
 const FOLLOW: ErrorType = ErrorType::Custom("FollowRedirect");
-
-/// Marks the error that makes pingora repeat an attempt the upstream answered with 502
-/// or 504.
-const STATUS_RETRY: ErrorType = ErrorType::Custom("UpstreamStatusRetry");
-
 /// Compression levels for rewritten bodies, which can no longer pass on the upstream's
 /// compressed bytes.
 const GZIP_LEVEL: u32 = 6;
@@ -97,8 +91,6 @@ pub struct Ctx {
     attempt: Option<Attempt>,
     /// Attempts repeated because connecting failed.
     pub connect_retries: u8,
-    /// Attempts repeated because the upstream answered 502 or 504.
-    pub status_retries: u8,
     rewrite: Option<Rewrite>,
 }
 
@@ -196,7 +188,7 @@ async fn respond_local(session: &mut Session, status: u16, body: &'static [u8]) 
     resp.insert_header(CONTENT_TYPE, "text/plain")?;
     resp.insert_header(CONTENT_LENGTH, body.len())?;
     resp.insert_header(CACHE_CONTROL, "no-store")?;
-    headers::add_security_headers(&mut resp)?;
+    headers::add_hsts(&mut resp)?;
     session.write_response_header(Box::new(resp), false).await?;
     session
         .write_response_body(Some(Bytes::from_static(body)), true)
@@ -287,8 +279,8 @@ impl ProxyHttp for Relay {
         }
         let downstream = session.as_downstream_mut();
         downstream.set_write_timeout(Some(ctx.class.downstream_write_timeout()));
-        if let Some(t) = ctx.class.idle_read_timeout() {
-            downstream.set_read_timeout(Some(t));
+        if ctx.class.may_idle() {
+            downstream.set_read_timeout(None);
         }
         Ok(false)
     }
@@ -321,9 +313,9 @@ impl ProxyHttp for Relay {
                 (origin.peer(addr)?, origin.addrs, addr)
             }
         };
-        if let Some(t) = ctx.class.idle_read_timeout() {
-            peer.options.read_timeout = Some(t);
-            peer.options.write_timeout = Some(t);
+        if ctx.class.may_idle() {
+            peer.options.read_timeout = None;
+            peer.options.write_timeout = None;
         }
         ctx.attempt = Some(Attempt { addrs, addr });
         Ok(Box::new(peer))
@@ -387,15 +379,6 @@ impl ProxyHttp for Relay {
         ctx: &mut Ctx,
     ) -> Result<()> {
         let status = upstream_response.status.as_u16();
-        if matches!(status, 502 | 504)
-            && ctx.status_retries < STATUS_RETRIES
-            && session.req_header().method.is_idempotent()
-        {
-            ctx.status_retries += 1;
-            let mut e = Error::explain(STATUS_RETRY, format!("upstream answered {status}"));
-            e.set_retry(true);
-            return Err(e);
-        }
         if !follow::is_redirect(status) {
             return Ok(());
         }

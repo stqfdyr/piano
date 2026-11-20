@@ -9,7 +9,8 @@
 //!   percent-decoded `to` as `Location`.
 //! - `/__loop/N`: 302 to `/__loop/N-1`, until `/__loop/0` answers 200 `done`.
 //! - `/__cdn`: an empty 200 carrying the headers a CDN-fronted Emby sends (`server`,
-//!   `cf-ray`, `alt-svc`, its own HSTS) and two cookies, one scoped to the origin host.
+//!   `cf-ray`, `alt-svc`, `nel`, `report-to`, its own HSTS and frame policy) and two
+//!   cookies, one scoped to the origin host.
 //! - `/__seq/{key}/{codes}`: the n-th request for `key` gets the n-th status of the
 //!   comma-separated `codes` (the last one repeats) and `n` as its body.
 //! - `…/PlaybackInfo` and `/__json…`: [`json_doc`] for the request's `Host`, with
@@ -278,6 +279,12 @@ async fn handle(mut req: Request<Incoming>, seqs: Seqs) -> Result<Response<ResBo
             .header("alt-svc", "h3=\":443\"; ma=86400")
             .header("via", "1.1 cdn")
             .header("strict-transport-security", "max-age=1")
+            .header("nel", r#"{"report_to":"cf-nel","max_age":604800}"#)
+            .header(
+                "report-to",
+                r#"{"group":"cf-nel","endpoints":[{"url":"https://a.nel.example.net/report"}]}"#,
+            )
+            .header("x-frame-options", "DENY")
             .header("set-cookie", "s=1; Path=/; Domain=origin.example.net")
             .header("set-cookie", "t=2; Path=/")
             .body(full(Bytes::new()))

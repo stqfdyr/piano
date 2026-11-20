@@ -22,36 +22,26 @@ pub const CLIENT_IP_HEADERS: [&str; 12] = [
     "fastly-client-ip",
 ];
 
-/// Upstream response headers not passed to clients: CDN internals, or headers the relay
-/// sets itself.
-pub const HIDDEN_RESPONSE_HEADERS: [&str; 15] = [
+/// Upstream response headers not passed to clients. Each is removed for a reason of
+/// the relay's own; every other header reaches the client as the upstream sent it.
+pub const HIDDEN_RESPONSE_HEADERS: [&str; 6] = [
+    // Advertises protocols on the site's host that the relay does not serve.
     "alt-svc",
-    "cf-cache-status",
-    "cf-ray",
+    // Make browsers send error reports, which carry their addresses, to an endpoint
+    // the upstream chooses.
     "nel",
-    "private-network-access-id",
     "report-to",
-    "referrer-policy",
-    "server",
+    "reporting-endpoints",
+    // Makes browsers fetch a URL the upstream chooses, possibly on its own host.
     "speculation-rules",
+    // Transport policy for the site's host is the relay's to set; see `HSTS`.
     "strict-transport-security",
-    "via",
-    "x-content-type-options",
-    "x-frame-options",
-    "x-powered-by",
-    "x-xss-protection",
 ];
 
-/// Added to every response, including those piano answers itself.
-pub const SECURITY_HEADERS: [(&str, &str); 4] = [
-    (
-        "strict-transport-security",
-        "max-age=31536000; includeSubDomains",
-    ),
-    ("x-frame-options", "SAMEORIGIN"),
-    ("x-content-type-options", "nosniff"),
-    ("referrer-policy", "strict-origin-when-cross-origin"),
-];
+/// Strict-Transport-Security for every response, local answers included. The site is
+/// only served over TLS. One year is the shortest lifetime the browsers' preload lists
+/// accept, the common floor for a policy meant to stay.
+pub const HSTS: &str = "max-age=31536000; includeSubDomains";
 
 /// Ordered User-Agent rewrites; the first matching rule wins.
 #[derive(Debug, Default)]
@@ -179,9 +169,8 @@ fn rewrite_cookie_domain(value: &[u8], from: &str, to: &str) -> Option<Vec<u8>> 
     changed.then_some(out)
 }
 
-/// Applies the response policy to an upstream response: hides CDN and upstream
-/// headers, moves cookies set for the upstream host to the site host, and adds the
-/// security headers.
+/// Applies the response policy to an upstream response: removes the hidden headers,
+/// moves cookies set for the upstream host to the site host, and sets HSTS.
 pub fn scrub_response(
     resp: &mut ResponseHeader,
     upstream_host: &str,
@@ -209,14 +198,11 @@ pub fn scrub_response(
             resp.append_header(SET_COOKIE, v)?;
         }
     }
-    add_security_headers(resp)
+    add_hsts(resp)
 }
 
-pub fn add_security_headers(resp: &mut ResponseHeader) -> Result<()> {
-    for (name, value) in SECURITY_HEADERS {
-        resp.insert_header(name, value)?;
-    }
-    Ok(())
+pub fn add_hsts(resp: &mut ResponseHeader) -> Result<()> {
+    resp.insert_header(http::header::STRICT_TRANSPORT_SECURITY, HSTS)
 }
 
 #[cfg(test)]
@@ -335,6 +321,8 @@ mod tests {
             ("Server", "cloudflare"),
             ("CF-RAY", "x"),
             ("alt-svc", "h3"),
+            ("NEL", "{}"),
+            ("x-frame-options", "DENY"),
             ("strict-transport-security", "max-age=1"),
             ("set-cookie", "a=1; Domain=emby.example.net"),
             ("set-cookie", "b=2"),
@@ -344,14 +332,11 @@ mod tests {
         }
         scrub_response(&mut resp, "emby.example.net", "media.example.com").unwrap();
         let h = &resp.headers;
-        assert!(
-            h.get("server").is_none() && h.get("cf-ray").is_none() && h.get("alt-svc").is_none()
-        );
-        assert_eq!(
-            h["strict-transport-security"],
-            "max-age=31536000; includeSubDomains"
-        );
-        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert!(h.get("alt-svc").is_none() && h.get("nel").is_none());
+        assert_eq!(h["server"], "cloudflare");
+        assert_eq!(h["cf-ray"], "x");
+        assert_eq!(h["x-frame-options"], "DENY");
+        assert_eq!(h["strict-transport-security"], HSTS);
         let cookies: Vec<_> = h.get_all("set-cookie").iter().collect();
         assert_eq!(cookies, ["a=1; Domain=media.example.com", "b=2"]);
         assert_eq!(h["content-type"], "application/json");
