@@ -23,7 +23,7 @@ use log::{debug, warn};
 use piano_cache::Budget;
 use piano_edge::acl::canonical;
 use piano_media::{ByteRange, Head, Resume, Stream, StreamGuard};
-use piano_telemetry::{Id, Kind, SiteCounters, redact};
+use piano_telemetry::{Id, Kind, SiteCounters, Ttfb, redact};
 use pingora_core::protocols::http::v1::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
@@ -450,6 +450,8 @@ impl Engine {
         ctx.ttfb = ctx.start.map(|s| s.elapsed());
         if let Some(t) = ctx.ttfb {
             self.stream.set_ttfb(t);
+            self.spec.counters.record_ttfb(Ttfb::Media, t);
+            ctx.ttfb_counted = true;
         }
         ctx.cf_ray = resp.headers.get("cf-ray").cloned();
         self.head_sent = true;

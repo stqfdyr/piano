@@ -108,6 +108,9 @@ pub struct Ctx {
     pub(crate) cache: Option<&'static str>,
     /// The bytes sent to the client were counted as they went, by the media engine.
     pub(crate) sent_counted: bool,
+    /// The time to first byte was counted when the head went out, by the media engine,
+    /// so that a stream lasting hours shows in the percentiles at once.
+    pub(crate) ttfb_counted: bool,
 }
 
 impl Ctx {
@@ -760,6 +763,11 @@ impl ProxyHttp for Relay {
             counters.add_sent(ctx.class.kind(), sent);
         }
         counters.record(status, end, ctx.attempts.len(), reused);
+        if !ctx.ttfb_counted
+            && let (Some(t), Some(kind)) = (ctx.ttfb, ctx.class.ttfb(&session.req_header().method))
+        {
+            counters.record_ttfb(kind, t);
+        }
         if let Some(e) = e {
             let site = ctx.site_name().unwrap_or("-");
             let path = logged_path(session.req_header());

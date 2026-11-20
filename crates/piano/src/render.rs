@@ -2,7 +2,7 @@
 
 use chrono::{Days, NaiveDate};
 use piano::traffic::{Record, SiteBytes, sum_since};
-use piano_ctl::proto::{CacheStats, Counts, Level, ReloadReply, Status};
+use piano_ctl::proto::{CacheStats, Counts, Latency, Level, ReloadReply, Status};
 use piano_telemetry::Kind;
 use piano_telemetry::metrics::End;
 use std::collections::BTreeMap;
@@ -44,7 +44,7 @@ impl Color {
 }
 
 /// `3d 4h`, `2h 5m`, `5m`, `40s`.
-fn duration(secs: u64) -> String {
+pub fn duration(secs: u64) -> String {
     let (d, h, m) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60);
     match () {
         () if d > 0 => format!("{d}d {h}h"),
@@ -74,6 +74,15 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+/// `85ms`, `1.3s`, `12s`.
+pub fn millis(v: f64) -> String {
+    match v {
+        v if v < 1000.0 => format!("{v:.0}ms"),
+        v if v < 10_000.0 => format!("{:.1}s", v / 1000.0),
+        v => format!("{:.0}s", v / 1000.0),
+    }
+}
+
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
@@ -90,7 +99,7 @@ fn opt(v: Option<u64>) -> String {
 }
 
 /// Requests that failed on the upstream side or inside piano.
-fn failed(c: &Counts) -> u64 {
+pub fn failed(c: &Counts) -> u64 {
     End::ALL
         .iter()
         .filter(|e| e.is_upstream_failure() || **e == End::Internal)
@@ -233,6 +242,37 @@ pub fn status(s: &Status, color: Color) -> String {
             size(r.bytes_sent),
             size(r.bytes_fetched),
         );
+    }
+    let timed = s.sites.iter().any(|x| x.ttfb.values().any(|l| l.count > 0));
+    if timed {
+        let _ = writeln!(
+            o,
+            "\n  time to first byte, p50 / p95, last {}",
+            duration(s.ttfb_secs.max(1))
+        );
+        let _ = writeln!(
+            o,
+            "  {:<w$} {:>15} {:>15} {:>15}",
+            "site", "browse", "image", "media"
+        );
+        for x in &s.sites {
+            let cell = |k: &str| match x.ttfb.get(k) {
+                Some(Latency {
+                    p50_ms: Some(a),
+                    p95_ms: Some(b),
+                    ..
+                }) => format!("{} / {}", millis(*a), millis(*b)),
+                _ => "-".to_owned(),
+            };
+            let _ = writeln!(
+                o,
+                "  {:<w$} {:>15} {:>15} {:>15}",
+                x.name,
+                cell("browse"),
+                cell("image"),
+                cell("media")
+            );
+        }
     }
     if !s.findings.is_empty() {
         o.push('\n');

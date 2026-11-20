@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::latency::{self, Buckets, Histogram, Ttfb};
+
 /// How a request ended; logged as `end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
@@ -123,7 +125,11 @@ pub struct SiteCounters {
     reused: AtomicU64,
     sent: [AtomicU64; Kind::ALL.len()],
     fetched: [AtomicU64; Kind::ALL.len()],
+    ttfb: [Histogram; Ttfb::ALL.len()],
 }
+
+/// Time-to-first-byte histograms by [`Ttfb::ALL`] index.
+pub type TtfbBuckets = [Buckets; Ttfb::ALL.len()];
 
 impl SiteCounters {
     /// Counts a finished request: the status sent to the client, how it ended, its
@@ -144,6 +150,15 @@ impl SiteCounters {
     /// Counts response body bytes read from an upstream.
     pub fn add_fetched(&self, kind: Kind, n: u64) {
         self.fetched[kind.index()].fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Counts the time from a request to the response head its client got.
+    pub fn record_ttfb(&self, kind: Ttfb, d: Duration) {
+        self.ttfb[kind.index()].record(d);
+    }
+
+    pub fn ttfb(&self) -> TtfbBuckets {
+        self.ttfb.each_ref().map(Histogram::read)
     }
 
     pub fn counts(&self) -> Counts {
@@ -201,11 +216,28 @@ impl Counts {
 /// How far back the recent counts reach.
 pub const RECENT: Duration = Duration::from_secs(3600);
 
+/// How often histograms are kept for the recent percentiles. Every five minutes keeps
+/// about 13 sets per site instead of 61; the recent span is then 60 to 65 minutes.
+const TTFB_EVERY: Duration = Duration::from_secs(300);
+
 #[derive(Debug)]
-struct Snapshot {
+struct Snapshot<T> {
     at: Instant,
-    sites: BTreeMap<String, Counts>,
-    unrouted: Counts,
+    sites: BTreeMap<String, T>,
+    unrouted: T,
+}
+
+/// Keeps `snap` and drops snapshots no longer needed: the newest one at least
+/// [`RECENT`] old stays, with every later one.
+fn keep<T>(history: &mut VecDeque<Snapshot<T>>, snap: Snapshot<T>) {
+    let now = snap.at;
+    history.push_back(snap);
+    while history
+        .get(1)
+        .is_some_and(|s| now.saturating_duration_since(s.at) >= RECENT)
+    {
+        history.pop_front();
+    }
 }
 
 /// Since-start and recent counts of one site.
@@ -215,6 +247,8 @@ pub struct SiteReport {
     pub total: Counts,
     /// Counts over [`Report::span`].
     pub recent: Counts,
+    /// Time-to-first-byte histograms over [`Report::ttfb_span`].
+    pub ttfb_recent: TtfbBuckets,
 }
 
 /// All counters, read at once.
@@ -222,6 +256,8 @@ pub struct SiteReport {
 pub struct Report {
     /// How far back `recent` reaches: [`RECENT`] once the process has run that long.
     pub span: Duration,
+    /// How far back `ttfb_recent` reaches, a little longer than `span`.
+    pub ttfb_span: Duration,
     pub sites: Vec<SiteReport>,
     /// Requests for a host that is no site.
     pub unrouted: SiteReport,
@@ -233,7 +269,8 @@ pub struct Report {
 pub struct Metrics {
     sites: Mutex<BTreeMap<String, Arc<SiteCounters>>>,
     unrouted: Arc<SiteCounters>,
-    history: Mutex<VecDeque<Snapshot>>,
+    history: Mutex<VecDeque<Snapshot<Counts>>>,
+    ttfb_history: Mutex<VecDeque<Snapshot<TtfbBuckets>>>,
 }
 
 impl Default for Metrics {
@@ -248,6 +285,7 @@ impl Metrics {
             sites: Mutex::new(BTreeMap::new()),
             unrouted: Arc::new(SiteCounters::default()),
             history: Mutex::new(VecDeque::new()),
+            ttfb_history: Mutex::new(VecDeque::new()),
         };
         m.tick();
         m
@@ -269,6 +307,11 @@ impl Metrics {
         self.read().0
     }
 
+    fn read_ttfb(&self) -> BTreeMap<String, TtfbBuckets> {
+        let sites = self.sites.lock().unwrap_or_else(PoisonError::into_inner);
+        sites.iter().map(|(n, c)| (n.clone(), c.ttfb())).collect()
+    }
+
     fn read(&self) -> (BTreeMap<String, Counts>, Counts) {
         let sites = self.sites.lock().unwrap_or_else(PoisonError::into_inner);
         let counts = sites.iter().map(|(n, c)| (n.clone(), c.counts())).collect();
@@ -284,16 +327,32 @@ impl Metrics {
     fn tick_at(&self, now: Instant) {
         let (sites, unrouted) = self.read();
         let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        history.push_back(Snapshot {
-            at: now,
-            sites,
-            unrouted,
-        });
-        while history
-            .get(1)
-            .is_some_and(|s| now.saturating_duration_since(s.at) >= RECENT)
-        {
-            history.pop_front();
+        keep(
+            &mut history,
+            Snapshot {
+                at: now,
+                sites,
+                unrouted,
+            },
+        );
+        drop(history);
+        let mut ttfb = self
+            .ttfb_history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let due = ttfb
+            .back()
+            .is_none_or(|s| now.saturating_duration_since(s.at) >= TTFB_EVERY);
+        if due {
+            let sites = self.read_ttfb();
+            keep(
+                &mut ttfb,
+                Snapshot {
+                    at: now,
+                    sites,
+                    unrouted: self.unrouted.ttfb(),
+                },
+            );
         }
     }
 
@@ -303,16 +362,31 @@ impl Metrics {
 
     fn report_at(&self, now: Instant) -> Report {
         let (sites, unrouted) = self.read();
+        let ttfb_now = self.read_ttfb();
         let history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        let ttfb_history = self
+            .ttfb_history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let base = history.front();
+        let ttfb_base = ttfb_history.front();
         let span = base.map_or(Duration::ZERO, |b| now.saturating_duration_since(b.at));
+        let ttfb_span = ttfb_base.map_or(Duration::ZERO, |b| now.saturating_duration_since(b.at));
         let zero = Counts::default();
+        let no_ttfb: TtfbBuckets = [[0; latency::BUCKETS]; Ttfb::ALL.len()];
         let sites = sites
             .into_iter()
             .map(|(name, total)| {
                 let before = base.and_then(|b| b.sites.get(&name)).unwrap_or(&zero);
+                let ttfb_before = ttfb_base
+                    .and_then(|b| b.sites.get(&name))
+                    .unwrap_or(&no_ttfb);
+                let ttfb_total = ttfb_now.get(&name).unwrap_or(&no_ttfb);
                 SiteReport {
                     recent: total.since(before),
+                    ttfb_recent: std::array::from_fn(|i| {
+                        latency::since(&ttfb_total[i], &ttfb_before[i])
+                    }),
                     name,
                     total,
                 }
@@ -321,11 +395,13 @@ impl Metrics {
         let before = base.map_or(&zero, |b| &b.unrouted);
         Report {
             span,
+            ttfb_span,
             sites,
             unrouted: SiteReport {
                 name: String::new(),
                 recent: unrouted.since(before),
                 total: unrouted,
+                ttfb_recent: no_ttfb,
             },
         }
     }
@@ -415,6 +491,26 @@ mod tests {
         assert_eq!(r.sites[0].recent.requests, 1);
         assert_eq!(r.sites[0].recent.status[4], 1);
         assert_eq!(r.unrouted.recent.requests, 1);
+    }
+
+    #[test]
+    fn recent_histograms_come_from_snapshots_five_minutes_apart() {
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        let a = m.site("a");
+        a.record_ttfb(Ttfb::Media, Duration::from_millis(200));
+        for minute in 1..=70u64 {
+            m.tick_at(t0 + Duration::from_secs(minute * 60));
+            a.record_ttfb(Ttfb::Browse, Duration::from_millis(50));
+        }
+        let r = m.report_at(t0 + Duration::from_secs(70 * 60 + 30));
+        // Histograms kept at minutes 0, 5, … 70; the newest an hour old is minute 10.
+        assert_eq!(r.ttfb_span, Duration::from_secs(60 * 60 + 30));
+        let recent = &r.sites[0].ttfb_recent;
+        // Recorded after the ticks of minutes 10 to 70.
+        assert_eq!(recent[Ttfb::Browse.index()].iter().sum::<u64>(), 61);
+        assert_eq!(recent[Ttfb::Media.index()].iter().sum::<u64>(), 0);
+        assert_eq!(a.ttfb()[Ttfb::Media.index()].iter().sum::<u64>(), 1);
     }
 
     #[test]

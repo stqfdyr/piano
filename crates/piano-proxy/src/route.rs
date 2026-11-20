@@ -3,7 +3,8 @@
 //! Matching ignores ASCII case and an optional leading `/emby` segment, and does not
 //! allocate.
 
-use piano_telemetry::Kind;
+use http::Method;
+use piano_telemetry::{Kind, Ttfb};
 use std::time::Duration;
 
 /// What a request is; decides timeouts, retries, caching and rewriting.
@@ -45,6 +46,19 @@ impl RouteClass {
             Self::Image => Kind::Image,
             Self::Socket => Kind::Socket,
             _ => Kind::Other,
+        }
+    }
+
+    /// Which time-to-first-byte histogram a request counts in. Browsing is what a
+    /// client waits on: API reads, server and playback information. Writes such as
+    /// playback progress reports are quick and frequent and would hide it.
+    pub fn ttfb(self, method: &Method) -> Option<Ttfb> {
+        match self {
+            Self::Media => Some(Ttfb::Media),
+            Self::Image => Some(Ttfb::Image),
+            Self::PlaybackInfo | Self::Info => Some(Ttfb::Browse),
+            Self::Api if method == Method::GET => Some(Ttfb::Browse),
+            _ => None,
         }
     }
 

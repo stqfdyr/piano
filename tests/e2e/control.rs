@@ -100,6 +100,11 @@ async fn status_counts_requests_and_describes_the_daemon() {
     assert!(s.access_log.path.unwrap().ends_with("access.log"));
     assert!(s.process.rss_bytes.unwrap() > 0);
     assert!(s.config.last_reload.is_none());
+    // Both requests are browsing reads, timed to their first byte.
+    assert_eq!(site.ttfb["browse"].count, 2);
+    assert!(site.ttfb["browse"].p95_ms.is_some());
+    assert_eq!(site.ttfb["media"].count, 0);
+    assert!(s.ttfb_secs <= 1, "{}", s.ttfb_secs);
     assert!(s.findings.is_empty(), "{:#?}", s.findings);
 }
 

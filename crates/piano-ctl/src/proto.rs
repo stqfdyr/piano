@@ -68,6 +68,10 @@ pub struct Status {
     pub sites: Vec<SiteStatus>,
     /// Requests whose host is no site.
     pub unrouted: Traffic,
+    /// How far back each site's `ttfb` reaches: 60 to 65 minutes once the daemon has
+    /// run that long.
+    #[serde(default)]
+    pub ttfb_secs: u64,
     /// Problems worth acting on, most severe first.
     pub findings: Vec<Finding>,
 }
@@ -141,6 +145,19 @@ pub struct SiteStatus {
     pub address: String,
     #[serde(flatten)]
     pub traffic: Traffic,
+    /// Time to first byte over the last `ttfb_secs`, by `browse`, `image` and
+    /// `media`. Every key is present.
+    #[serde(default)]
+    pub ttfb: BTreeMap<String, Latency>,
+}
+
+/// Percentiles of the time to first byte.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Latency {
+    pub count: u64,
+    /// `None` without requests.
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

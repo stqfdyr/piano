@@ -3,15 +3,17 @@
 use crate::{Live, procfs};
 use log::{LevelFilter, error, info, warn};
 use piano_ctl::proto::{
-    self, CACHE_SCHEMA, CacheStats, Certificate, ConfigState, Connections, Finding, Level,
+    self, CACHE_SCHEMA, CacheStats, Certificate, ConfigState, Connections, Finding, Latency, Level,
     PurgeReply, RELOAD_SCHEMA, ReloadRecord, ReloadReply, STATUS_SCHEMA, SiteStatus, Status,
     Traffic, UpstreamBudget,
 };
+use piano_telemetry::Ttfb;
+use piano_telemetry::latency::{self, Buckets};
 use piano_telemetry::logger;
-use piano_telemetry::metrics::{Counts, End, STATUS_CLASSES};
+use piano_telemetry::metrics::{Counts, End, STATUS_CLASSES, TtfbBuckets};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Certificates are renewed 30 days before they expire; 14 days left means renewal has
 /// been failing for two weeks.
@@ -186,6 +188,7 @@ impl Admin {
             .map(|s| {
                 let counts = report.sites.iter().find(|r| r.name == s.name);
                 SiteStatus {
+                    ttfb: latencies(counts.map(|c| &c.ttfb_recent)),
                     name: s.name.clone(),
                     host: s.host.clone(),
                     upstream: format!("{}:{}", s.origin.host, s.origin.port),
@@ -246,6 +249,7 @@ impl Admin {
                 total: wire(&report.unrouted.total),
                 recent: wire(&report.unrouted.recent),
             },
+            ttfb_secs: report.ttfb_span.as_secs(),
             findings: Vec::new(),
         };
         drop(state);
@@ -294,6 +298,23 @@ fn wire(c: &Counts) -> proto::Counts {
         bytes_sent: c.sent.iter().sum(),
         bytes_fetched: c.fetched.iter().sum(),
     }
+}
+
+/// Percentiles of each histogram, every key present.
+fn latencies(ttfb: Option<&TtfbBuckets>) -> std::collections::BTreeMap<String, Latency> {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    Ttfb::ALL
+        .iter()
+        .map(|k| {
+            let b: Option<&Buckets> = ttfb.map(|t| &t[*k as usize]);
+            let l = b.map_or_else(Latency::default, |b| Latency {
+                count: b.iter().sum(),
+                p50_ms: latency::quantile(b, 0.5).map(ms),
+                p95_ms: latency::quantile(b, 0.95).map(ms),
+            });
+            (k.as_str().to_owned(), l)
+        })
+        .collect()
 }
 
 fn near_limit(used: u64, limit: u64) -> bool {
@@ -508,12 +529,14 @@ mod tests {
                 host: "a.example.com".into(),
                 upstream: "emby.example.net:443".into(),
                 address: "192.0.2.1:443".into(),
+                ttfb: latencies(None),
                 traffic: Traffic {
                     total: wire(&Counts::default()),
                     recent: wire(&Counts::default()),
                 },
             }],
             unrouted: Traffic::default(),
+            ttfb_secs: 0,
             findings: Vec::new(),
         }
     }
