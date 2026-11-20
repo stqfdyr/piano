@@ -589,6 +589,12 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
+                // An upgraded session (websocket) has no end of its own; the client
+                // reconnects to whichever process accepts next.
+                _ = self.await_shutdown(), if upgraded => {
+                    return Error::e_explain(SHUTDOWN_ENDED, "upgraded session ended at shutdown");
+                },
+
                 // only try to send to pipe if there is capacity to avoid deadlock
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
                 // on sending to their corresponding pipes which are both full.

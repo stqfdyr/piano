@@ -70,6 +70,8 @@ const EXIT_TIMEOUT: u64 = 60 * 5;
 /* Time to wait before shutting down listening sockets.
 This is the graceful period for the new service to get ready */
 const CLOSE_TIMEOUT: u64 = 5;
+/* How often the grace period checks whether the work has drained. */
+const DRAIN_POLL: Duration = Duration::from_millis(50);
 
 enum ShutdownType {
     Graceful,
@@ -233,6 +235,9 @@ pub struct Server {
     pub configuration: Arc<ServerConf>,
     /// The parser command line options
     pub options: Option<Opt>,
+
+    /// Ends the grace period early once it returns true; see [`Self::set_drained_check`].
+    drained: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 // TODO: delete the pid when exit
@@ -243,6 +248,33 @@ impl Server {
     /// The receiver will produce values for each transition.
     pub fn watch_execution_phase(&self) -> broadcast::Receiver<ExecutionPhase> {
         self.execution_phase_watch.subscribe()
+    }
+
+    /// Ends the grace period of a graceful shutdown as soon as `drained` returns true,
+    /// typically once no downstream connection is open, instead of always waiting for
+    /// [ServerConf::grace_period_seconds], which then becomes the upper bound.
+    pub fn set_drained_check(&mut self, drained: impl Fn() -> bool + Send + Sync + 'static) {
+        self.drained = Some(Box::new(drained));
+    }
+
+    /// Waits up to `limit` for the drained check, or the whole `limit` without one.
+    /// Returns whether the work drained.
+    fn wait_drained(&self, limit: Duration) -> bool {
+        let Some(drained) = &self.drained else {
+            thread::sleep(limit);
+            return false;
+        };
+        let deadline = Instant::now() + limit;
+        loop {
+            if drained() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            thread::sleep(DRAIN_POLL.min(deadline - now));
+        }
     }
 
     #[cfg(unix)]
@@ -478,6 +510,7 @@ impl Server {
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             runtime_groups: HashMap::new(),
+            drained: None,
             bootstrap,
         }
     }
@@ -527,6 +560,7 @@ impl Server {
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             runtime_groups: HashMap::new(),
+            drained: None,
             bootstrap,
         })
     }
@@ -897,8 +931,12 @@ impl Server {
                 .grace_period_seconds
                 .unwrap_or(EXIT_TIMEOUT);
             info!("Graceful shutdown: grace period {}s starts", exit_timeout);
-            thread::sleep(Duration::from_secs(exit_timeout));
-            info!("Graceful shutdown: grace period ends");
+            let start = Instant::now();
+            if self.wait_drained(Duration::from_secs(exit_timeout)) {
+                info!("Graceful shutdown: drained after {:?}", start.elapsed());
+            } else {
+                info!("Graceful shutdown: grace period ends");
+            }
         }
 
         // Give tokio runtimes time to exit
