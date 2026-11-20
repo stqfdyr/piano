@@ -45,7 +45,7 @@ pub fn install_default_crypto_provider() {
     let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 }
 pub use rustls_native_certs::load_native_certs;
-use rustls_pemfile::Item;
+use rustls_pki_types::pem::{self, PemObject, SectionKind};
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -65,19 +65,21 @@ where
         .map(BufReader::new)
 }
 
-/// Read the pem file at the given path from disk
-fn load_pem_file<P>(path: P) -> Result<Vec<Item>>
+/// Read the pem file at the given path from disk: every section with its kind and DER
+/// contents
+fn load_pem_file<P>(path: P) -> Result<Vec<(SectionKind, Vec<u8>)>>
 where
     P: AsRef<Path>,
 {
-    rustls_pemfile::read_all(&mut load_file(path)?)
-        .map(|item_res| {
-            item_res.or_err(
-                ErrorType::InvalidCert,
-                "Certificate in pem file could not be read",
-            )
-        })
-        .collect()
+    let mut reader = load_file(path)?;
+    let mut items = Vec::new();
+    while let Some(item) = pem::from_buf(&mut reader).or_err(
+        ErrorType::InvalidCert,
+        "Certificate in pem file could not be read",
+    )? {
+        items.push(item);
+    }
+    Ok(items)
 }
 
 /// Load the certificates from the given pem file path into the given
@@ -88,13 +90,13 @@ where
 {
     for pem_item in load_pem_file(path)? {
         // only loading certificates, handling a CA file
-        let Item::X509Certificate(content) = pem_item else {
+        let (SectionKind::Certificate, content) = pem_item else {
             return Error::e_explain(
                 ErrorType::InvalidCert,
                 "Pem file contains un-loadable certificate type",
             );
         };
-        cert_store.add(content).or_err(
+        cert_store.add(CertificateDer::from(content)).or_err(
             ErrorType::InvalidCert,
             "Failed to load X509 certificate into root store",
         )?;
@@ -106,10 +108,14 @@ where
 /// Attempt to load the native cas into the given root-certificate store
 pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> Result<()> {
     // this includes handling of ENV vars SSL_CERT_FILE & SSL_CERT_DIR
-    for cert in load_native_certs()
-        .or_err(ErrorType::InvalidCert, "Failed to load native certificates")?
-        .into_iter()
-    {
+    let native = load_native_certs();
+    if native.certs.is_empty() && !native.errors.is_empty() {
+        return Error::e_explain(
+            ErrorType::InvalidCert,
+            format!("Failed to load native certificates: {:?}", native.errors),
+        );
+    }
+    for cert in native.certs {
         ca_certs.add(cert).or_err(
             ErrorType::InvalidCert,
             "Failed to load native certificate into root store",
@@ -129,12 +135,9 @@ pub fn load_certs_and_key_files<'a>(
 
     let certs = certs_file
         .into_iter()
-        .filter_map(|item| {
-            if let Item::X509Certificate(cert) = item {
-                Some(cert)
-            } else {
-                None
-            }
+        .filter_map(|(kind, der)| match kind {
+            SectionKind::Certificate => Some(CertificateDer::from(der)),
+            _ => None,
         })
         .collect::<Vec<_>>();
 
@@ -142,10 +145,10 @@ pub fn load_certs_and_key_files<'a>(
     // [https://doc.servo.org/rustls/key/struct.PrivateKey.html]
     let private_key_opt = key_file
         .into_iter()
-        .filter_map(|key_item| match key_item {
-            Item::Pkcs1Key(key) => Some(PrivateKeyDer::from(key)),
-            Item::Pkcs8Key(key) => Some(PrivateKeyDer::from(key)),
-            Item::Sec1Key(key) => Some(PrivateKeyDer::from(key)),
+        .filter_map(|(kind, der)| match kind {
+            SectionKind::RsaPrivateKey => Some(PrivateKeyDer::Pkcs1(der.into())),
+            SectionKind::PrivateKey => Some(PrivateKeyDer::Pkcs8(der.into())),
+            SectionKind::EcPrivateKey => Some(PrivateKeyDer::Sec1(der.into())),
             _ => None,
         })
         .next();
@@ -160,29 +163,25 @@ pub fn load_certs_and_key_files<'a>(
 /// Load the certificate
 pub fn load_pem_file_ca(path: &String) -> Result<Vec<u8>> {
     let mut reader = load_file(path)?;
-    let cas_file_items = rustls_pemfile::certs(&mut reader)
-        .map(|item_res| {
-            item_res.or_err(
-                ErrorType::InvalidCert,
-                "Failed to load certificate from file",
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(cas_file_items
-        .first()
-        .map(|ca| ca.to_vec())
-        .unwrap_or_default())
+    let first = CertificateDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
+        .or_err(
+            ErrorType::InvalidCert,
+            "Failed to load certificate from file",
+        )?;
+    Ok(first.map(|ca| ca.to_vec()).unwrap_or_default())
 }
 
 pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
-    Ok(rustls_pemfile::private_key(&mut load_file(path)?)
-        .or_err(
+    match PrivateKeyDer::from_pem_reader(&mut load_file(path)?) {
+        Ok(key) => Ok(key.secret_der().to_vec()),
+        Err(pem::Error::NoItemsFound) => Ok(Vec::new()),
+        Err(e) => Err(e).or_err(
             ErrorType::InvalidCert,
             "Failed to load private key from file",
-        )?
-        .map(|key| key.secret_der().to_vec())
-        .unwrap_or_default())
+        ),
+    }
 }
 
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {

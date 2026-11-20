@@ -17,14 +17,12 @@
 mod bootstrap_services;
 pub mod configuration;
 #[cfg(unix)]
-mod daemon;
 mod runtime_group;
 #[cfg(unix)]
 pub(crate) mod transfer_fd;
 
 use async_trait::async_trait;
 #[cfg(unix)]
-use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{error, info, warn};
 use parking_lot::Mutex;
@@ -566,8 +564,12 @@ impl Server {
                     })
                 },
                 |_| {
-                    // options and conf loaded
-                    ServerConf::load_yaml_with_opt_override(opt)
+                    // Configuration files are not supported in this fork; build a
+                    // ServerConf and use Server::new_with_opt_and_conf.
+                    Error::e_explain(
+                        ErrorType::ReadError,
+                        "configuration files are not supported",
+                    )
                 },
             )
         } else {
@@ -759,22 +761,10 @@ impl Server {
 
         let conf = self.configuration.as_ref();
 
-        #[cfg(unix)]
+        // Daemonizing is removed from this fork: run in the foreground under a service
+        // manager.
         if conf.daemon {
-            info!("Daemonizing the server");
-            fast_timeout::pause_for_fork();
-            let daemonize_result = daemonize(&self.configuration);
-            fast_timeout::unpause();
-            // If daemon_wait_for_ready is enabled, pass the parent PID to bootstrap so it
-            // can send SIGUSR1 to the parent after bootstrap completes.
-            if let Some(pid) = daemonize_result.notify_parent_pid {
-                self.bootstrap.lock().set_notify_parent_pid(pid);
-            }
-        }
-
-        #[cfg(windows)]
-        if conf.daemon {
-            panic!("Daemonizing under windows is not supported");
+            panic!("daemonizing is not supported");
         }
 
         let blocking_opts = BlockingPoolOpts {

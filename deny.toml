@@ -8,10 +8,7 @@ yanked = "deny"
 # Unmaintained crates reached only through the vendored pingora fork; each goes away
 # with a fork patch that drops or replaces the dependency.
 ignore = [
-    { id = "RUSTSEC-2024-0388", reason = "derivative: pingora-core derives" },
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: pingora-core YAML config loading, unused" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: pingora-rustls PEM helpers, unused" },
-    { id = "RUSTSEC-2026-0543", reason = "chrono: pingora-core timestamps" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono (unmaintained, no vulnerability): local dates of the traffic record and times shown by top" },
 ]
 
 [licenses]

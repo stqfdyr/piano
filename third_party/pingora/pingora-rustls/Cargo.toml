@@ -24,9 +24,10 @@ rustls = { version = "0.23.12", default-features = false, features = [
     "std",
     "tls12",
 ] }
-rustls-native-certs = "0.7.1"
-rustls-pemfile = "2.1.2"
-rustls-pki-types = "1.7.0"
+# 0.8 parses PEM through rustls-pki-types instead of rustls-pemfile.
+rustls-native-certs = "0.8"
+# PEM parsing (PemObject) needs 1.9 and the std feature.
+rustls-pki-types = { version = "1.9", features = ["std"] }
 tokio-rustls = { version = "0.26.0", default-features = false, features = [
     "ring",
     "logging",

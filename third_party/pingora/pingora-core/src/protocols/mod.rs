@@ -138,35 +138,39 @@ pub type Stream = Box<dyn IO>;
 // Implement IO trait for 3rd party types, mostly for testing
 mod ext_io_impl {
     use super::*;
-    use tokio_test::io::Mock;
+    #[cfg(test)]
+    mod mock {
+        use super::*;
+        use tokio_test::io::Mock;
 
-    #[async_trait]
-    impl Shutdown for Mock {
-        async fn shutdown(&mut self) -> () {}
-    }
-    impl UniqueID for Mock {
-        fn id(&self) -> UniqueIDType {
-            0
+        #[async_trait]
+        impl Shutdown for Mock {
+            async fn shutdown(&mut self) -> () {}
         }
-    }
-    impl Ssl for Mock {}
-    impl GetTimingDigest for Mock {
-        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-            vec![]
+        impl UniqueID for Mock {
+            fn id(&self) -> UniqueIDType {
+                0
+            }
         }
-    }
-    impl GetProxyDigest for Mock {
-        fn get_proxy_digest(&self) -> Option<Arc<raw_connect::ProxyDigest>> {
-            None
+        impl Ssl for Mock {}
+        impl GetTimingDigest for Mock {
+            fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+                vec![]
+            }
         }
-    }
-    impl GetSocketDigest for Mock {
-        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-            None
+        impl GetProxyDigest for Mock {
+            fn get_proxy_digest(&self) -> Option<Arc<raw_connect::ProxyDigest>> {
+                None
+            }
         }
-    }
+        impl GetSocketDigest for Mock {
+            fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+                None
+            }
+        }
 
-    impl Peek for Mock {}
+        impl Peek for Mock {}
+    }
 
     use std::io::Cursor;
 

@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::DateTime;
 use http::header::HeaderValue;
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime};
 
 fn to_date_string(epoch_sec: i64) -> String {
-    let dt = DateTime::from_timestamp(epoch_sec, 0).unwrap();
-    dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    let secs = u64::try_from(epoch_sec).unwrap_or(0);
+    httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 struct CacheableDate {

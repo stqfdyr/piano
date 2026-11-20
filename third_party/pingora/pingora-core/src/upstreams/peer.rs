@@ -26,7 +26,6 @@ use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
-use derivative::Derivative;
 use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
@@ -506,8 +505,7 @@ pub enum H1UpgradePolicy {
 ///
 /// See [`Peer`] for the meaning of the fields
 #[non_exhaustive]
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone)]
 pub struct PeerOptions {
     pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
@@ -573,17 +571,14 @@ pub struct PeerOptions {
     pub tracer: Option<Tracer>,
     /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
-    #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
-    #[derivative(Debug = "ignore")]
     pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
     /// Hook that allows returning an optional `SslDigestExtension`.
     /// Any returned value will be saved into the `SslDigest`.
     ///
     /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
     #[cfg(feature = "openssl_derived")]
-    #[derivative(Debug = "ignore")]
     pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
     /// Callback run while the upstream's certificate chain is verified, with the semantics of an
     /// `SSL_set_verify` callback.
@@ -611,8 +606,54 @@ pub struct PeerOptions {
     ///
     /// [`X509StoreContextRef::chain`]: crate::tls::x509::X509StoreContextRef::chain
     #[cfg(feature = "openssl_derived")]
-    #[derivative(Debug = "ignore")]
     pub upstream_tls_verify_callback: Option<VerifyCallback>,
+}
+
+// Hand-written so the hook fields, which hold closures, can be left out.
+impl std::fmt::Debug for PeerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("PeerOptions");
+        d.field("bind_to", &self.bind_to)
+            .field("connection_timeout", &self.connection_timeout)
+            .field("total_connection_timeout", &self.total_connection_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("verify_cert", &self.verify_cert)
+            .field("verify_hostname", &self.verify_hostname);
+        #[cfg(feature = "s2n")]
+        d.field("use_system_certs", &self.use_system_certs);
+        d.field("alternative_cn", &self.alternative_cn)
+            .field("alpn", &self.alpn)
+            .field("ca", &self.ca)
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("tcp_recv_buf", &self.tcp_recv_buf)
+            .field("dscp", &self.dscp)
+            .field("h2_ping_interval", &self.h2_ping_interval);
+        #[cfg(feature = "s2n")]
+        d.field("psk", &self.psk)
+            .field("s2n_security_policy", &self.s2n_security_policy)
+            .field("max_blinding_delay", &self.max_blinding_delay);
+        d.field("max_h2_streams", &self.max_h2_streams)
+            .field("h2_stream_window_size", &self.h2_stream_window_size)
+            .field("h2_connection_window_size", &self.h2_connection_window_size)
+            .field(
+                "allow_h1_response_invalid_content_length",
+                &self.allow_h1_response_invalid_content_length,
+            )
+            .field(
+                "http_upstream_request_policy",
+                &self.http_upstream_request_policy,
+            )
+            .field("extra_proxy_headers", &self.extra_proxy_headers)
+            .field("curves", &self.curves)
+            .field("second_keyshare", &self.second_keyshare)
+            .field("tcp_fast_open", &self.tcp_fast_open)
+            .field("tls_write_coalescing", &self.tls_write_coalescing)
+            .field("tracer", &self.tracer)
+            .field("custom_l4", &self.custom_l4)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PeerOptions {
