@@ -1794,7 +1794,7 @@ dependencies = [
  "rustls",
  "thiserror 2.0.21",
  "tokio",
- "x509-parser 0.16.0",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]

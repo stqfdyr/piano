@@ -32,7 +32,7 @@ nix = { version = "0.31", default-features = false, features = ["resource", "sig
 
 # Expiry and names of the served certificate, for status; already in the tree through
 # pingora-core.
-x509-parser = { version = "0.16", default-features = false }
+x509-parser = { version = "0.18", default-features = false }
 
 # Atomically replaced configuration snapshots (sites, ACL, certificates).
 arc-swap = "1"
