@@ -23,9 +23,16 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{Notify, oneshot};
 
-/// Attempts, one second apart, to hand the listening sockets to the new process, which
-/// first loads its configuration and resolves the upstreams.
-pub const HANDOFF_ATTEMPTS: usize = 30;
+/// Attempts, one second apart, to hand the listening sockets to the new process once it
+/// listens for them; the new process waits as many seconds for them. pingora's main loop
+/// handles no signal while it tries, so a new process that dies just then must not hold
+/// it up for long.
+pub const HANDOFF_ATTEMPTS: usize = 5;
+/// How long the new process has to load its configuration, resolve the upstreams and
+/// listen for the sockets.
+const LISTEN_WAIT: Duration = Duration::from_secs(30);
+/// How often to look for the new process's socket.
+const LISTEN_POLL: Duration = Duration::from_millis(50);
 /// How long the old process waits for the sockets to be handed over, attempts included.
 const HANDOFF_WAIT: Duration = Duration::from_secs(HANDOFF_ATTEMPTS as u64 + 15);
 /// How long the new process has, once it holds the sockets, to accept on them.
@@ -195,6 +202,11 @@ async fn hand_over(
     reply: &mut UpgradeReply,
 ) -> Result<(), String> {
     let started = Instant::now();
+    let listen_path = live
+        .upgrade_socket()
+        .ok_or("upgrading needs the control socket (control.socket)")?;
+    // Left over from an upgrade that failed, it would look like the new process listening.
+    let _ = std::fs::remove_file(&listen_path);
     let mut cmd = Command::new(exe);
     cmd.arg("-c").arg(&relaunch.config);
     if let Some(level) = &relaunch.log_level {
@@ -211,6 +223,18 @@ async fn hand_over(
     let pid = child.id().ok_or("the new process is already gone")?;
     reply.new_pid = Some(pid);
     info!("upgrade: started {} as pid {pid}", exe.display());
+
+    // Offered only once the new process listens: pingora then sends them at once.
+    let listening = tokio::select! {
+        r = tokio::time::timeout(LISTEN_WAIT, appears(&listen_path)) => r.is_ok(),
+        status = child.wait() => return Err(exited(status)),
+    };
+    if !listening {
+        stop(&mut child).await;
+        return Err(format!(
+            "the new process did not get ready for the listening sockets within {LISTEN_WAIT:?}"
+        ));
+    }
 
     let (tx, rx) = oneshot::channel();
     *live.upgrader.report_slot() = Some(tx);
@@ -259,6 +283,13 @@ fn exited(status: std::io::Result<std::process::ExitStatus>) -> String {
     match status {
         Ok(s) => format!("the new process exited before serving ({s}); see its log"),
         Err(e) => format!("the new process is gone: {e}"),
+    }
+}
+
+/// Resolves once `path` exists.
+async fn appears(path: &Path) {
+    while !path.exists() {
+        tokio::time::sleep(LISTEN_POLL).await;
     }
 }
 

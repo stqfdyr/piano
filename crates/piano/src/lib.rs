@@ -616,6 +616,12 @@ impl Live {
         next_to(self.control.as_deref(), ".ready")
     }
 
+    /// Where a new process listens for the listening sockets during an upgrade
+    /// (`ServerConf::upgrade_sock`).
+    fn upgrade_socket(&self) -> Option<PathBuf> {
+        next_to(self.control.as_deref(), ".upgrade")
+    }
+
     /// The upgrade to the binary this process started from, or `binary`.
     pub async fn upgrade(
         self: &Arc<Self>,
