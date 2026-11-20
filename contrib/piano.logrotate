@@ -1,0 +1,29 @@
+# piano logs. The access log is reopened on SIGUSR1; a process still draining
+# after an upgrade keeps writing the rotated file until it exits.
+/var/log/piano/*access.log {
+	daily
+	rotate 60
+	compress
+	delaycompress
+	missingok
+	notifempty
+	create 0640 piano piano
+	sharedscripts
+	postrotate
+		for f in /run/piano/*.pid; do
+			[ -s "$f" ] && kill -USR1 "$(cat "$f")" 2>/dev/null
+		done
+		true
+	endscript
+}
+
+# Diagnostic log under OpenRC (systemd keeps it in the journal); piano cannot
+# reopen stderr, so the file is truncated in place.
+/var/log/piano/piano.log /var/log/piano/piano.*.log {
+	weekly
+	rotate 8
+	compress
+	missingok
+	notifempty
+	copytruncate
+}

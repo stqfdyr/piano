@@ -1,0 +1,10 @@
+# Settings for /etc/init.d/piano (and instances: /etc/conf.d/piano.NAME).
+
+# Configuration file.
+#PIANO_CONFIG="/etc/piano/piano.toml"
+
+# Seconds to wait at start for piano to load its configuration and serve.
+#PIANO_START_WAIT=30
+
+# Open file limit; piano raises its soft limit to this hard limit.
+#rc_ulimit="-n 65536"

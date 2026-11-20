@@ -1,0 +1,102 @@
+#!/sbin/openrc-run
+# OpenRC service for piano. Installed by contrib/install.sh as /etc/init.d/piano;
+# settings go in /etc/conf.d/piano. A second instance:
+#   ln -s piano /etc/init.d/piano.NAME
+# with PIANO_CONFIG in /etc/conf.d/piano.NAME and its own control.socket.
+#
+# Not supervise-daemon: after an upgrade (piano upgrade) the serving process is
+# not the supervisor's child, and the supervisor would start another one when
+# the old process exits.
+
+name="piano"
+description="Emby relay"
+extra_commands="checkconfig"
+extra_started_commands="reload upgrade"
+
+: "${PIANO_CONFIG:=/etc/piano/piano.toml}"
+: "${PIANO_USER:=piano}"
+: "${PIANO_START_WAIT:=30}"
+rc_ulimit="${rc_ulimit:--n 65536}"
+
+command="/usr/local/bin/piano"
+pidfile="/run/piano/${RC_SVCNAME}.pid"
+piano_log="/var/log/piano/${RC_SVCNAME}.log"
+required_files="${PIANO_CONFIG}"
+
+depend() {
+	need net
+	use dns logger
+	after firewall
+}
+
+checkconfig() {
+	ebegin "Checking ${RC_SVCNAME} configuration"
+	rc=0
+	"${command}" -c "${PIANO_CONFIG}" config check || rc=$?
+	# 3: valid, with warnings
+	[ "${rc}" -eq 0 ] || [ "${rc}" -eq 3 ]
+	eend $?
+}
+
+start_pre() {
+	checkpath -d -m 0750 -o "${PIANO_USER}:${PIANO_USER}" /run/piano /var/lib/piano /var/log/piano
+	checkpath -f -m 0640 -o "${PIANO_USER}:${PIANO_USER}" "${piano_log}"
+}
+
+# start-stop-daemon writes the pid file at once; piano replaces it (a new file
+# with the same pid) once it serves, and again after an upgrade. Start waits for
+# that instead of reporting success while piano may still fail on its
+# configuration.
+start() {
+	ebegin "Starting ${RC_SVCNAME}"
+	rm -f "${pidfile}"
+	if ! start-stop-daemon --start --background \
+		--make-pidfile --pidfile "${pidfile}" \
+		--user "${PIANO_USER}:${PIANO_USER}" --capabilities "^cap_net_bind_service" \
+		--stdout "${piano_log}" --stderr "${piano_log}" \
+		--exec "${command}" -- -c "${PIANO_CONFIG}" run --pidfile "${pidfile}"; then
+		eend 1
+		return 1
+	fi
+	pid=$(cat "${pidfile}" 2>/dev/null)
+	first=$(stat -c %i "${pidfile}" 2>/dev/null)
+	waited=0
+	limit=$((PIANO_START_WAIT * 10))
+	while [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null &&
+		[ "$(stat -c %i "${pidfile}" 2>/dev/null)" = "${first}" ]; do
+		if [ "${waited}" -ge "${limit}" ]; then
+			kill "${pid}" 2>/dev/null
+			eend 1 "not serving after ${PIANO_START_WAIT}s; see ${piano_log}"
+			return 1
+		fi
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null || [ ! -s "${pidfile}" ]; then
+		eend 1 "exited at start; see ${piano_log}"
+		return 1
+	fi
+	eend 0
+}
+
+# piano stop waits for the serving process and a predecessor still draining; the
+# signal is the fallback when the control socket is off or does not answer.
+stop() {
+	ebegin "Stopping ${RC_SVCNAME}"
+	if ! "${command}" -c "${PIANO_CONFIG}" stop >/dev/null; then
+		start-stop-daemon --stop --pidfile "${pidfile}" --retry TERM/60/KILL/5
+	fi
+	eend $?
+}
+
+reload() {
+	ebegin "Reloading ${RC_SVCNAME}"
+	"${command}" -c "${PIANO_CONFIG}" reload
+	eend $?
+}
+
+upgrade() {
+	ebegin "Upgrading ${RC_SVCNAME}"
+	"${command}" -c "${PIANO_CONFIG}" upgrade
+	eend $?
+}

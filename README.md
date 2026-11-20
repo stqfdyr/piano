@@ -53,7 +53,7 @@ upstream = "https://emby.example.net"
 
 ```sh
 piano config check     # validate without starting anything
-piano run              # run in the foreground (for systemd or OpenRC)
+piano run              # run in the foreground (the service runs this)
 piano version
 ```
 
@@ -64,6 +64,38 @@ Changes to `server` settings and `upstream.extra_roots` need a restart.
 
 Exit codes: 0 success, 1 runtime error, 2 usage or configuration error, 3 `config
 check` passed with warnings.
+
+## Install as a service
+
+`contrib/` holds a systemd unit, an OpenRC script and a logrotate file;
+`contrib/install.sh` installs them with the binary (as root, from a directory with the
+binary and the contrib files):
+
+```sh
+sh install.sh --binary ./piano-0.1.0-x86_64-linux-musl
+```
+
+It creates the `piano` user, installs `/usr/local/bin/piano`, the service and
+`/etc/logrotate.d/piano`, and on the first run writes an example
+`/etc/piano/piano.toml`. Edit that and run the script again: it checks the
+configuration and lets the `piano` group read the certificate and key files named in
+it (and enter the directories above them; certbot keeps a key's group when it renews
+the key). `--no-cert-access` leaves file permissions alone. The script neither enables
+nor restarts the service; it prints what to run next.
+
+The daemon runs as `piano` with only `CAP_NET_BIND_SERVICE`; the systemd unit adds
+the usual sandboxing (read-only system, private `/tmp`, a system call filter).
+
+- **Upgrade**: run the script with the new binary, then `piano upgrade` (OpenRC:
+  `rc-service piano upgrade`). The new process takes the listening sockets over; the
+  old one finishes its media streams, for `server.drain_timeout` at most.
+- **Stop**: `systemctl stop piano` or `rc-service piano stop` run `piano stop`, which
+  waits for the daemon and an old process still draining.
+- **Reload**: `systemctl reload piano` or `rc-service piano reload`; a configuration
+  error is printed and the running configuration stays.
+- A second OpenRC instance (for example on another port): `install.sh --instance NAME`
+  adds `piano.NAME` reading `/etc/piano/NAME.toml`, which needs its own
+  `control.socket`, `log.access` and `traffic.file`.
 
 ## Logs
 
