@@ -28,7 +28,7 @@ pingora-error = { path = "third_party/pingora/pingora-error" }
 pingora-http = { path = "third_party/pingora/pingora-http" }
 
 # Raising the open file limit at startup; already in the tree through pingora-core.
-nix = { version = "0.31", default-features = false, features = ["resource", "signal", "user"] }
+nix = { version = "0.32", default-features = false, features = ["resource", "signal", "user"] }
 
 # Expiry and names of the served certificate, for status; already in the tree through
 # pingora-core.
