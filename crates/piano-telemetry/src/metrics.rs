@@ -25,11 +25,13 @@ pub enum End {
     UpstreamTimeout,
     UpstreamClosed,
     UpstreamError,
+    /// Ended because the process stops: a media stream or websocket on terminate.
+    Shutdown,
     Internal,
 }
 
 impl End {
-    pub const ALL: [End; 10] = [
+    pub const ALL: [End; 11] = [
         End::Ok,
         End::ClientClosed,
         End::ClientTimeout,
@@ -39,6 +41,7 @@ impl End {
         End::UpstreamTimeout,
         End::UpstreamClosed,
         End::UpstreamError,
+        End::Shutdown,
         End::Internal,
     ];
 
@@ -53,6 +56,7 @@ impl End {
             End::UpstreamTimeout => "upstream_timeout",
             End::UpstreamClosed => "upstream_closed",
             End::UpstreamError => "upstream_error",
+            End::Shutdown => "shutdown",
             End::Internal => "internal",
         }
     }

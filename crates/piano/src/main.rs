@@ -546,8 +546,10 @@ fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
         config.sites.len(),
         config.server.listen.join(", ")
     );
-    server.run(piano::RunArgs::default());
-    // Streams that drained after the last minute's write.
-    live.record_traffic();
+    server.run(piano::RunArgs {
+        shutdown_signal: live.signals(Box::new(piano::UnixShutdownSignalWatch)),
+    });
+    live.stopped();
+    log::info!("stopped");
     ExitCode::SUCCESS
 }

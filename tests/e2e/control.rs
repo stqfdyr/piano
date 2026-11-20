@@ -89,7 +89,7 @@ async fn status_counts_requests_and_describes_the_daemon() {
     }
     // Every class and end is listed, so scripts can rely on the keys.
     assert_eq!(site.traffic.total.status.len(), 6);
-    assert_eq!(site.traffic.total.ends.len(), 10);
+    assert_eq!(site.traffic.total.ends.len(), 11);
     assert_eq!(s.certificate.names, [SITE_HOST]);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

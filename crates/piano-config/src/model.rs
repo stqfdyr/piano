@@ -37,6 +37,8 @@ pub struct Server {
     pub listen: Vec<String>,
     /// Worker threads; 0 means one per CPU.
     pub threads: usize,
+    /// After a terminate signal, the longest wait for requests in progress; media
+    /// streams and websockets end at once instead.
     pub shutdown_timeout: Duration,
 }
 
@@ -45,7 +47,7 @@ impl Default for Server {
         Self {
             listen: vec!["[::]:443".to_owned()],
             threads: 0,
-            shutdown_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(10),
         }
     }
 }

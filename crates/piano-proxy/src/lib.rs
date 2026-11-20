@@ -11,8 +11,10 @@ mod relay;
 pub mod rewrite;
 pub mod route;
 mod sites;
+mod stop;
 
 pub use image::{ImageStats, Images, Purged};
 pub use reach::MAX_ATTEMPTS;
 pub use relay::{Ctx, Relay};
 pub use sites::{Mounts, Policy, Site, SiteError, Sites};
+pub use stop::{Stop, TERMINATED};

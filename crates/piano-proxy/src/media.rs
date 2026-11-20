@@ -12,7 +12,7 @@
 use crate::follow;
 use crate::reach::{self, AttemptLog, CONNECT_RETRIES, Hop, MAX_ATTEMPTS, Reach};
 use crate::relay::Ctx;
-use crate::{Relay, Site, Sites, headers};
+use crate::{Relay, Site, Sites, TERMINATED, headers};
 use bytes::Bytes;
 use http::header::{
     ACCEPT_RANGES, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
@@ -31,7 +31,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// A resumable body that has not progressed for this long gets another request for the
@@ -147,6 +147,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         stream,
         serving: None,
         rid: ctx.rid,
+        stop: relay.stop.watch(),
     };
     engine.launch(range, Request::First);
     let result = engine.run(session, ctx).await;
@@ -271,11 +272,15 @@ enum Event {
     Msg(Option<(u32, Msg)>),
     /// The client went away, or sent something it should not have.
     Client(Option<Box<Error>>),
+    /// The process terminates.
+    Stop,
     Timer,
 }
 
 struct Engine {
     spec: Arc<Spec>,
+    /// Resolves once the process terminates.
+    stop: watch::Receiver<bool>,
     tx: mpsc::Sender<(u32, Msg)>,
     rx: mpsc::Receiver<(u32, Msg)>,
     sources: Vec<Source>,
@@ -369,6 +374,7 @@ impl Engine {
                 m = self.rx.recv() => Event::Msg(m),
                 r = session.as_downstream_mut().read_body_or_idle(true) => Event::Client(r.err()),
                 () = tokio::time::sleep_until(wake.into()) => Event::Timer,
+                _ = self.stop.wait_for(|t| *t) => Event::Stop,
             };
             match event {
                 Event::Msg(Some((id, msg))) => {
@@ -387,6 +393,9 @@ impl Engine {
                         Error::explain(ErrorType::ConnectionClosed, "client sent data mid-response")
                     });
                     return Err(e.into_down());
+                }
+                Event::Stop => {
+                    return Error::e_explain(TERMINATED, "media stream ended at shutdown");
                 }
                 Event::Timer if Instant::now() >= stall_at => {
                     let what = if self.head_sent { "body" } else { "response" };

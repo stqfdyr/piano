@@ -14,6 +14,7 @@ mod media;
 mod retry;
 mod rewrite;
 mod routing;
+mod shutdown;
 mod socket;
 mod traffic;
 

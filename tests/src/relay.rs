@@ -60,6 +60,9 @@ impl<'a> RelaySetup<'a> {
     }
 }
 
+/// The relay's `server.shutdown_timeout`.
+pub const SHUTDOWN_TIMEOUT_SECS: u64 = 3;
+
 /// Default access log file name.
 pub const ACCESS_LOG: &str = "access.log";
 
@@ -72,20 +75,32 @@ pub const TRAFFIC_FILE: &str = "traffic.json";
 pub struct Relay {
     pub addr: SocketAddr,
     live: Arc<Live>,
-    stop: watch::Sender<bool>,
+    stop: watch::Sender<Option<Stop>>,
     thread: Option<JoinHandle<()>>,
     dir: TempDir,
     generation: AtomicU32,
 }
 
-struct StopSignal(watch::Receiver<bool>);
+/// How the relay is told to stop.
+#[derive(Clone, Copy)]
+enum Stop {
+    /// As on SIGINT: everything ends at once.
+    Fast,
+    /// As on SIGTERM.
+    Terminate,
+}
+
+struct StopSignal(watch::Receiver<Option<Stop>>);
 
 #[async_trait]
 impl ShutdownSignalWatch for StopSignal {
     async fn recv(&self) -> ShutdownSignal {
         let mut rx = self.0.clone();
-        let _ = rx.wait_for(|stop| *stop).await;
-        ShutdownSignal::FastShutdown
+        let stop = rx.wait_for(Option::is_some).await.ok().and_then(|s| *s);
+        match stop {
+            Some(Stop::Terminate) => ShutdownSignal::GracefulTerminate,
+            _ => ShutdownSignal::FastShutdown,
+        }
     }
 }
 
@@ -123,7 +138,7 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         [server]
         listen = ["127.0.0.1:{port}"]
         threads = 1
-        shutdown_timeout = "1s"
+        shutdown_timeout = "{SHUTDOWN_TIMEOUT_SECS}s"
 
         [tls]
         cert = {cert:?}
@@ -184,11 +199,15 @@ impl Relay {
             server.add_service(piano::ControlService::new(admin, bound));
         }
 
-        let (stop, rx) = watch::channel(false);
-        let thread = std::thread::spawn(move || {
-            server.run(RunArgs {
-                shutdown_signal: Box::new(StopSignal(rx)),
-            });
+        let (stop, rx) = watch::channel(None);
+        let thread = std::thread::spawn({
+            let live = Arc::clone(&live);
+            move || {
+                server.run(RunArgs {
+                    shutdown_signal: live.signals(Box::new(StopSignal(rx))),
+                });
+                live.stopped();
+            }
         });
         let addr = loopback(port);
         wait_listening(addr);
@@ -290,9 +309,27 @@ impl Relay {
     }
 }
 
+impl Relay {
+    /// Stops the relay as SIGTERM does and returns how long it took. Its files stay
+    /// readable.
+    pub fn terminate(&mut self) -> Duration {
+        let started = Instant::now();
+        let _ = self.stop.send(Some(Stop::Terminate));
+        if let Some(t) = self.thread.take() {
+            t.join().unwrap();
+        }
+        started.elapsed()
+    }
+
+    /// The text of access log file `name` once the relay has stopped.
+    pub fn stopped_access_text(&self, name: &str) -> String {
+        std::fs::read_to_string(self.log_path(name)).unwrap_or_default()
+    }
+}
+
 impl Drop for Relay {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
+        let _ = self.stop.send(Some(Stop::Fast));
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }

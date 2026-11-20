@@ -9,7 +9,7 @@ use crate::reach::{
 };
 use crate::rewrite::MAX_BODY;
 use crate::route::{self, HEALTH_PATH, RouteClass};
-use crate::{Site, Sites};
+use crate::{Site, Sites, Stop, TERMINATED};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,7 +35,7 @@ use pingora_core::protocols::http::compression::Algorithm;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, ProxyWarnLogContext, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, SHUTDOWN_ENDED, Session};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,6 +146,7 @@ pub struct Relay {
     unrouted: Arc<SiteCounters>,
     /// GET requests of the `api` class so far, for sampling probes.
     api_gets: AtomicU64,
+    pub(crate) stop: Arc<Stop>,
 }
 
 impl Relay {
@@ -168,7 +169,15 @@ impl Relay {
             access,
             unrouted,
             api_gets: AtomicU64::new(0),
+            stop: Arc::default(),
         }
+    }
+
+    /// Ends media streams once `stop` terminates.
+    #[must_use]
+    pub fn with_stop(mut self, stop: Arc<Stop>) -> Self {
+        self.stop = stop;
+        self
     }
 
     fn probe_due(&self) -> bool {
@@ -262,6 +271,9 @@ fn end_reason(e: Option<&Error>) -> End {
     };
     if *e.etype() == REFUSED {
         return End::RedirectRefused;
+    }
+    if *e.etype() == TERMINATED || *e.etype() == SHUTDOWN_ENDED {
+        return End::Shutdown;
     }
     match (e.esource(), e.etype()) {
         (ErrorSource::Downstream, ReadTimedout | WriteTimedout) => End::ClientTimeout,
@@ -731,6 +743,30 @@ impl ProxyHttp for Relay {
 
     /// Each attempt's outcome is in the access log; the final error is logged by
     /// [`Self::logging`] with the request id and a level that follows its cause.
+    async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Ctx) -> FailToProxy {
+        use ErrorType::*;
+        let code = match e.etype() {
+            HTTPStatus(code) => *code,
+            // Retryable at once: the next process is about to listen.
+            _ if *e.etype() == TERMINATED => 503,
+            _ => match e.esource() {
+                ErrorSource::Upstream => 502,
+                ErrorSource::Downstream => match e.etype() {
+                    WriteError | ReadError | ConnectionClosed => 0,
+                    _ => 400,
+                },
+                ErrorSource::Internal | ErrorSource::Unset => 500,
+            },
+        };
+        if code > 0 && session.response_written().is_none() {
+            let _ = session.respond_error(code).await;
+        }
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
+    }
+
     fn suppress_proxy_warn_log(
         &self,
         _session: &Session,
@@ -778,7 +814,7 @@ impl ProxyHttp for Relay {
             let path = logged_path(session.req_header());
             let reason = end.as_str();
             match end {
-                End::ClientClosed | End::ClientTimeout => {
+                End::ClientClosed | End::ClientTimeout | End::Shutdown => {
                     debug!(rid:% = ctx.rid, site, end = reason; "{path}: {e}");
                 }
                 End::Internal => error!(rid:% = ctx.rid, site, end = reason; "{path}: {e}"),

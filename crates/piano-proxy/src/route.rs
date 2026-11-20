@@ -62,7 +62,9 @@ impl RouteClass {
         }
     }
 
-    /// Longest wait for the client to accept more response bytes.
+    /// Longest wait for the client to accept more response bytes. Players stop reading
+    /// once their buffer is full, for well over a minute; a shorter limit cuts them only
+    /// to have them reconnect at once.
     pub fn downstream_write_timeout(self) -> Duration {
         match self {
             Self::Media => Duration::from_secs(300),

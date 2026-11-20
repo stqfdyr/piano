@@ -13,7 +13,7 @@ use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_media::Streams;
-use piano_proxy::{Images, MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
+use piano_proxy::{Images, MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites, Stop};
 use piano_telemetry::{AccessLog, Metrics};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::apps::HttpServerOptions;
@@ -24,12 +24,15 @@ use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::ProxyServiceBuilder;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub use admin::Admin;
 pub use control::ControlService;
-pub use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
+pub use pingora_core::server::{
+    RunArgs, ShutdownSignal, ShutdownSignalWatch, UnixShutdownSignalWatch,
+};
 pub use reload::Reloader;
 
 /// Idle upstream connections kept per pool. pingora's proxy, the media engine and the
@@ -47,6 +50,10 @@ const RUNTIME_GROUP: &str = "piano";
 /// the middle of sending a head has its data ready; like the handshake timeout, this
 /// leaves room for three retransmissions.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long runtimes wait for blocking tasks once the connections are gone; a stuck
+/// name lookup must not hold the exit back.
+const RUNTIME_EXIT_WAIT: u64 = 1;
 
 /// File descriptors kept for everything but client and upstream connections: listeners,
 /// log files, the resolver, the signal and timer machinery.
@@ -134,6 +141,9 @@ pub struct Live {
     streams: Arc<Streams>,
     images: Arc<Images>,
     ledger: traffic::Ledger,
+    stop: Arc<Stop>,
+    /// Client connections open when the shutdown's grace period last looked.
+    left_open: Arc<AtomicUsize>,
 }
 
 /// Settings read once at startup; a reload that changes them only warns.
@@ -256,8 +266,8 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         work_stealing: false,
         upstream_keepalive_pool_size: UPSTREAM_POOL_SIZE,
         max_retries: MAX_ATTEMPTS,
-        grace_period_seconds: Some(0),
-        graceful_shutdown_timeout_seconds: Some(config.server.shutdown_timeout.get().as_secs()),
+        grace_period_seconds: Some(shutdown_secs(config)),
+        graceful_shutdown_timeout_seconds: Some(RUNTIME_EXIT_WAIT),
         pid_file: "/run/piano/piano.pid".to_owned(),
         upgrade_sock: "/run/piano/upgrade.sock".to_owned(),
         ..ServerConf::default()
@@ -269,6 +279,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     client.rustls_client_config = Some((client_tls.config, client_tls.roots));
     let streams = Arc::new(Streams::default());
     let images = Arc::new(Images::new(image_memory(config)));
+    let stop = Arc::new(Stop::default());
 
     let mut service = ProxyServiceBuilder::new(
         &conf,
@@ -280,7 +291,8 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
             Arc::clone(&images),
             Arc::clone(&access_log),
             metrics.unrouted(),
-        ),
+        )
+        .with_stop(Arc::clone(&stop)),
     )
     .name("piano")
     .client_options(client)
@@ -307,6 +319,16 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         );
     }
     server.add_service(service);
+    let left_open = Arc::new(AtomicUsize::new(0));
+    server.set_drained_check({
+        let accept = Arc::clone(&accept);
+        let left_open = Arc::clone(&left_open);
+        move || {
+            let open = accept.open_connections();
+            left_open.store(open, Ordering::Relaxed);
+            open == 0
+        }
+    });
 
     let (ledger, warning) = traffic::Ledger::open(config.traffic.file_path());
     if let Some(w) = warning {
@@ -325,8 +347,39 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         streams,
         images,
         ledger,
+        stop,
+        left_open,
     });
     Ok(Daemon { server, live })
+}
+
+/// The longest wait for open requests after a terminate signal, in whole seconds.
+fn shutdown_secs(config: &Config) -> u64 {
+    let ms = config.server.shutdown_timeout.get().as_millis();
+    u64::try_from(ms.div_ceil(1000)).unwrap_or(u64::MAX)
+}
+
+/// Passes on the shutdown signals of `inner`; on terminate, first ends the work that
+/// would otherwise hold the shutdown back for its whole timeout.
+struct Signals {
+    inner: Box<dyn ShutdownSignalWatch + Send + Sync>,
+    live: Arc<Live>,
+}
+
+#[async_trait::async_trait]
+impl ShutdownSignalWatch for Signals {
+    async fn recv(&self) -> ShutdownSignal {
+        let signal = self.inner.recv().await;
+        if matches!(signal, ShutdownSignal::GracefulTerminate) {
+            self.live.stop.terminate();
+            log::info!(
+                "stopping: {} client connections open, waiting up to {}s for their requests",
+                self.live.accept.open_connections(),
+                self.live.fixed.shutdown_timeout.get().as_secs_f64(),
+            );
+        }
+        signal
+    }
 }
 
 /// Bytes of image bodies the configuration allows.
@@ -393,6 +446,32 @@ impl Live {
     /// Starts a new access log file at the same path, after logrotate moved the old one.
     pub fn reopen_access_log(&self) -> std::io::Result<()> {
         self.access_log.reopen()
+    }
+
+    /// The shutdown signal source for [`pingora_core::server::Server::run`]: `inner`'s
+    /// signals, with media streams ended on terminate.
+    pub fn signals(
+        self: &Arc<Self>,
+        inner: Box<dyn ShutdownSignalWatch + Send + Sync>,
+    ) -> Box<dyn ShutdownSignalWatch> {
+        Box::new(Signals {
+            inner,
+            live: Arc::clone(self),
+        })
+    }
+
+    /// Call once the server has stopped: reports connections cut at the shutdown
+    /// timeout, then writes the traffic record and the access log.
+    pub fn stopped(&self) {
+        let cut = self.left_open.swap(0, Ordering::Relaxed);
+        if cut > 0 {
+            log::warn!(
+                "stopped with {cut} client connections still open after {}s; they were cut",
+                self.fixed.shutdown_timeout.get().as_secs_f64()
+            );
+        }
+        self.record_traffic();
+        self.flush_access_log();
     }
 
     /// Waits until the access log lines queued so far are written.
