@@ -6,9 +6,10 @@
 #![forbid(unsafe_code)]
 
 use std::ffi::OsStr;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DIST_TARGET: &str = "x86_64-unknown-linux-musl";
 /// Oldest production CPU has no AVX2.
@@ -66,6 +67,40 @@ fn run(step: &str, mut cmd: Command) -> Result {
     Ok(())
 }
 
+/// Upper bound on running the tests, about three times what the whole suite takes. A
+/// hung test fails the run instead of holding it open.
+const TEST_LIMIT: Duration = Duration::from_secs(120);
+
+/// Like [`run`], but kills the command and everything it started once `limit` passes.
+fn run_limited(step: &str, mut cmd: Command, limit: Duration) -> Result {
+    eprintln!("==> {step} (limit {}s)", limit.as_secs());
+    let start = Instant::now();
+    // Its own process group, so the test binaries cargo starts go with it.
+    let mut child = cmd
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("{step}: cannot start: {e}"))?;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("{step}: {e}"))? {
+            if !status.success() {
+                return Err(format!("{step} failed ({status})"));
+            }
+            eprintln!("    {step} ok in {:.1}s", start.elapsed().as_secs_f64());
+            return Ok(());
+        }
+        if start.elapsed() >= limit {
+            let group = format!("-{}", child.id());
+            let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+            let _ = child.wait();
+            return Err(format!(
+                "{step} killed after {}s: a test hangs",
+                limit.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn ci() -> Result {
     let mut fmt = cargo();
     // No --all: that would also reformat the vendored fork.
@@ -84,9 +119,13 @@ fn ci() -> Result {
     ]);
     run("clippy", clippy)?;
 
+    let mut build = cargo();
+    build.args(["test", "--workspace", "--locked", "--no-run"]);
+    run("build tests", build)?;
+
     let mut test = cargo();
     test.args(["test", "--workspace", "--locked"]);
-    run("test", test)?;
+    run_limited("test", test, TEST_LIMIT)?;
 
     let mut deny = cargo();
     deny.args(["deny", "--locked", "check"]);
