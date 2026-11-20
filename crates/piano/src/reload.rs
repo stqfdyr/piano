@@ -17,8 +17,8 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 const CERT_CHECK_EVERY: Duration = Duration::from_secs(3600);
 
 /// Applies configuration reloads and log reopening to the running daemon, picks up
-/// renewed certificates, snapshots the request counters and writes out the summaries of
-/// rate-limited log records.
+/// renewed certificates, snapshots the request counters, writes the traffic record and
+/// writes out the summaries of rate-limited log records.
 pub struct Reloader {
     admin: Arc<Admin>,
 }
@@ -37,6 +37,13 @@ impl Reloader {
                 "certificate files changed but cannot be loaded, keeping the current certificate: {e}"
             ),
             Err(e) => error!("certificate check task failed: {e}"),
+        }
+    }
+
+    async fn record_traffic(&self) {
+        let live = Arc::clone(self.admin.live());
+        if let Err(e) = tokio::task::spawn_blocking(move || live.record_traffic()).await {
+            error!("traffic record task failed: {e}");
         }
     }
 
@@ -95,12 +102,14 @@ impl ServiceWithDependents for Reloader {
                 _ = tick.tick() => {
                     logger::flush_aggregated(false);
                     self.admin.live().metrics().tick();
+                    self.record_traffic().await;
                 }
                 _ = certs.tick() => self.refresh_certs().await,
                 _ = shutdown.changed() => break,
             }
         }
         logger::flush_aggregated(true);
+        self.record_traffic().await;
     }
 
     fn name(&self) -> &str {

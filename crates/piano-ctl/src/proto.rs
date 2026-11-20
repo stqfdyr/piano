@@ -164,6 +164,12 @@ pub struct Counts {
     pub upstream_attempts: u64,
     /// Attempts that reused a pooled connection.
     pub reused: u64,
+    /// Response body bytes written to clients.
+    #[serde(default)]
+    pub bytes_sent: u64,
+    /// Response body bytes read from upstreams, retried and hedged requests included.
+    #[serde(default)]
+    pub bytes_fetched: u64,
 }
 
 impl Counts {

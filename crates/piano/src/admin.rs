@@ -250,6 +250,18 @@ impl Admin {
         };
         drop(state);
         status.findings = findings(&status, unix(now));
+        if let (Some(path), Some(error)) = live.traffic_state() {
+            status.findings.push(finding(
+                Level::Warn,
+                "traffic_unsaved",
+                format!("the traffic record cannot be written: {error}"),
+                Some(&format!(
+                    "the daemon retries every minute; {} must be writable",
+                    path.display()
+                )),
+            ));
+            status.findings.sort_by_key(|f| std::cmp::Reverse(f.level));
+        }
         status
     }
 }
@@ -279,6 +291,8 @@ fn wire(c: &Counts) -> proto::Counts {
             .collect(),
         upstream_attempts: c.attempts,
         reused: c.reused,
+        bytes_sent: c.sent.iter().sum(),
+        bytes_fetched: c.fetched.iter().sum(),
     }
 }
 

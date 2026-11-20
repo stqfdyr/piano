@@ -1,7 +1,11 @@
 //! Text output of the management commands.
 
+use chrono::{Days, NaiveDate};
+use piano::traffic::{Record, SiteBytes, sum_since};
 use piano_ctl::proto::{CacheStats, Counts, Level, ReloadReply, Status};
+use piano_telemetry::Kind;
 use piano_telemetry::metrics::End;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::io::IsTerminal;
 use std::time::{Duration, UNIX_EPOCH};
@@ -52,6 +56,22 @@ fn duration(secs: u64) -> String {
 
 fn ago(now: u64, then: u64) -> String {
     duration(now.saturating_sub(then))
+}
+
+/// `812 B`, `3.4 KiB` … `1.24 TiB`.
+pub fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{bytes} B"),
+        _ if v < 10.0 => format!("{v:.2} {}", UNITS[unit]),
+        _ => format!("{v:.1} {}", UNITS[unit]),
+    }
 }
 
 fn mib(bytes: u64) -> String {
@@ -196,13 +216,13 @@ pub fn status(s: &Status, color: Color) -> String {
     let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
     let _ = writeln!(
         o,
-        "  {:<w$} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5}  upstream",
-        "site", "requests", "2xx", "3xx", "4xx", "5xx", "failed", "reuse"
+        "  {:<w$} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>10} {:>10}  upstream",
+        "site", "requests", "2xx", "3xx", "4xx", "5xx", "failed", "reuse", "sent", "fetched"
     );
     for (name, r, upstream) in rows {
         let _ = writeln!(
             o,
-            "  {name:<w$} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5}  {upstream}",
+            "  {name:<w$} {:>8} {:>6} {:>6} {:>6} {:>6} {:>6} {:>5} {:>10} {:>10}  {upstream}",
             r.requests,
             r.status("2xx"),
             r.status("3xx"),
@@ -210,6 +230,8 @@ pub fn status(s: &Status, color: Color) -> String {
             r.status("5xx"),
             failed(r),
             reuse(r),
+            size(r.bytes_sent),
+            size(r.bytes_fetched),
         );
     }
     if !s.findings.is_empty() {
@@ -280,6 +302,111 @@ pub fn cache(c: &CacheStats) -> String {
     o
 }
 
+/// `piano traffic`: today, the last 7 and 30 days per site, the last 30 days by kind,
+/// and the last `days` days one by one. `now` is Unix seconds.
+pub fn traffic(record: &Record, path: &str, today: NaiveDate, now: u64, days: usize) -> String {
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "{path} · updated {} ago · local days",
+        ago(now, record.updated)
+    );
+    o.push_str(
+        "response bodies only; the network interface also carries headers, TLS and TCP \
+         overhead and other traffic of the machine\n",
+    );
+    let back = |n: u64| today.checked_sub_days(Days::new(n)).unwrap_or(today);
+    let spans = [
+        ("today", sum_since(record, today)),
+        ("last 7 days", sum_since(record, back(6))),
+        ("last 30 days", sum_since(record, back(29))),
+    ];
+    let mut names: Vec<&String> = spans[2].1.keys().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(spans[2].1[*n].sent.total()));
+    let w = names.iter().map(|n| n.len()).max().unwrap_or(0).max(5);
+    let _ = writeln!(
+        o,
+        "\n  {:<w$} {:>21}  {:>21}  {:>21}",
+        "", spans[0].0, spans[1].0, spans[2].0
+    );
+    let _ = writeln!(
+        o,
+        "  {:<w$} {:>10} {:>10}  {:>10} {:>10}  {:>10} {:>10}",
+        "site", "sent", "fetched", "sent", "fetched", "sent", "fetched"
+    );
+    let total = |m: &BTreeMap<String, SiteBytes>| {
+        let mut t = SiteBytes::default();
+        for b in m.values() {
+            t.add(b);
+        }
+        t
+    };
+    let mut row = |name: &str, cells: [SiteBytes; 3]| {
+        let _ = writeln!(
+            o,
+            "  {name:<w$} {:>10} {:>10}  {:>10} {:>10}  {:>10} {:>10}",
+            size(cells[0].sent.total()),
+            size(cells[0].fetched.total()),
+            size(cells[1].sent.total()),
+            size(cells[1].fetched.total()),
+            size(cells[2].sent.total()),
+            size(cells[2].fetched.total()),
+        );
+    };
+    for name in &names {
+        row(
+            name,
+            spans
+                .each_ref()
+                .map(|(_, m)| m.get(*name).copied().unwrap_or_default()),
+        );
+    }
+    if names.len() > 1 {
+        row("total", spans.each_ref().map(|(_, m)| total(m)));
+    }
+
+    let _ = writeln!(o, "\n  last 30 days by kind, sent / fetched");
+    let _ = write!(o, "  {:<w$}", "site");
+    for k in Kind::ALL {
+        let _ = write!(o, " {:>21}", k.as_str());
+    }
+    o.push('\n');
+    for name in &names {
+        let b = spans[2].1[*name];
+        let _ = write!(o, "  {name:<w$}");
+        for k in Kind::ALL {
+            let _ = write!(
+                o,
+                " {:>21}",
+                format!("{} / {}", size(b.sent.get(k)), size(b.fetched.get(k)))
+            );
+        }
+        o.push('\n');
+    }
+
+    if days > 0 {
+        let _ = writeln!(
+            o,
+            "\n  {:<10}  {:<w$} {:>10} {:>10}",
+            "date", "site", "sent", "fetched"
+        );
+        for (date, sites) in record.days.iter().rev().take(days) {
+            let mut first = true;
+            for (name, b) in sites {
+                let d = if first { date.as_str() } else { "" };
+                first = false;
+                let _ = writeln!(
+                    o,
+                    "  {d:<10}  {name:<w$} {:>10} {:>10}",
+                    size(b.sent.total()),
+                    size(b.fetched.total())
+                );
+            }
+        }
+    }
+    o
+}
+
 pub fn reload(r: &ReloadReply) -> String {
     let mut o = String::new();
     if r.ok {
@@ -311,5 +438,72 @@ mod tests {
         assert_eq!(duration(7500), "2h 5m");
         assert_eq!(duration(3 * 86_400 + 4 * 3600 + 59), "3d 4h");
         assert_eq!(date(0), "1970-01-01");
+    }
+
+    #[test]
+    fn traffic_spans_and_kinds() {
+        use piano::traffic::{ByteKinds, Record};
+        let bytes = |media, other| SiteBytes {
+            sent: ByteKinds {
+                media,
+                other,
+                ..ByteKinds::default()
+            },
+            fetched: ByteKinds {
+                media,
+                other,
+                ..ByteKinds::default()
+            },
+        };
+        let mut r = Record {
+            updated: 1000,
+            ..Record::default()
+        };
+        for (d, n) in [
+            ("2026-11-20", 1),
+            ("2026-11-15", 10),
+            ("2026-10-25", 100),
+            ("2026-10-01", 1000),
+        ] {
+            r.days.insert(
+                d.into(),
+                [
+                    ("alpha".to_owned(), bytes(n, 1)),
+                    ("beta".to_owned(), bytes(0, n)),
+                ]
+                .into(),
+            );
+        }
+        let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let out = traffic(&r, "/x/traffic.json", today, 1060, 2);
+        let line = |name: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("{out}"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(out.starts_with("/x/traffic.json · updated 1m ago"), "{out}");
+        // today / 7 days / 30 days; 2026-10-01 is outside all of them.
+        assert_eq!(
+            line("alpha"),
+            "alpha 2 B 2 B 13 B 13 B 114 B 114 B",
+            "{out}"
+        );
+        assert_eq!(line("total"), "total 3 B 3 B 24 B 24 B 225 B 225 B");
+        assert!(out.contains("2026-11-20  alpha"), "{out}");
+        assert!(!out.contains("2026-10-25  "), "{out}");
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(size(812), "812 B");
+        assert_eq!(size(3500), "3.42 KiB");
+        assert_eq!(
+            size(41 * 1024 * 1024 * 1024 + 300 * 1024 * 1024),
+            "41.3 GiB"
+        );
+        assert_eq!(size(1 << 50), "1024.0 TiB");
     }
 }

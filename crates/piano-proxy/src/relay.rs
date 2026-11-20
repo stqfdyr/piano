@@ -106,6 +106,8 @@ pub struct Ctx {
     /// How the image engine answered: hit, miss, coalesced, stale, revalidated, missing
     /// or shed.
     pub(crate) cache: Option<&'static str>,
+    /// The bytes sent to the client were counted as they went, by the media engine.
+    pub(crate) sent_counted: bool,
 }
 
 impl Ctx {
@@ -628,6 +630,19 @@ impl ProxyHttp for Relay {
         weaken_etag(upstream_response)
     }
 
+    async fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> Result<Option<Duration>> {
+        if let (Some(b), Ok(site)) = (body.as_ref(), ctx.site()) {
+            site.counters.add_fetched(ctx.class.kind(), b.len() as u64);
+        }
+        Ok(None)
+    }
+
     async fn response_body_filter(
         &self,
         session: &mut Session,
@@ -735,11 +750,16 @@ impl ProxyHttp for Relay {
             .iter()
             .filter(|a| a.reused == Some(true))
             .count();
-        match ctx.site() {
+        let counters = match ctx.site() {
             Ok(site) => &site.counters,
             Err(_) => &self.unrouted,
+        };
+        // Bytes first: a reader that sees the request counted sees its bytes too.
+        if !ctx.sent_counted {
+            let sent = session.as_downstream().body_bytes_sent() as u64;
+            counters.add_sent(ctx.class.kind(), sent);
         }
-        .record(status, end, ctx.attempts.len(), reused);
+        counters.record(status, end, ctx.attempts.len(), reused);
         if let Some(e) = e {
             let site = ctx.site_name().unwrap_or("-");
             let path = logged_path(session.req_header());

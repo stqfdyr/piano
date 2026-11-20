@@ -12,8 +12,8 @@ mod validate;
 
 pub use duration::{Duration, ParseDurationError};
 pub use model::{
-    Access, Cache, Config, Control, DEFAULT_SOCKET, Limits, Log, LogLevel, Server, ServerDomains,
-    Site, Tls, UaRule, Upstream, UpstreamLimit,
+    Access, Cache, Config, Control, DEFAULT_SOCKET, DEFAULT_TRAFFIC_FILE, Limits, Log, LogLevel,
+    Server, ServerDomains, Site, Tls, Traffic, UaRule, Upstream, UpstreamLimit,
 };
 pub use net::{IpNet, ParseIpNetError};
 pub use validate::{UpstreamUrl, ValidationError, Warning, host_matches, is_dns_name};

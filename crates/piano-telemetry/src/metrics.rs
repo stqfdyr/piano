@@ -1,4 +1,4 @@
-//! Request counters per site, and how they grew over the last hour.
+//! Request and byte counters per site, and how they grew over the last hour.
 //!
 //! Requests add to plain atomic counters when they end; nothing is allocated or locked
 //! on that path. Once a minute a snapshot is kept, so a reader can tell what happened
@@ -73,6 +73,36 @@ impl End {
     }
 }
 
+/// What the bytes of a request carried, as traffic is broken down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Media,
+    Image,
+    Socket,
+    /// API calls, subtitles and everything else.
+    Other,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 4] = [Kind::Media, Kind::Image, Kind::Socket, Kind::Other];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Media => "media",
+            Kind::Image => "image",
+            Kind::Socket => "socket",
+            Kind::Other => "other",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Byte counts by [`Kind::ALL`] index.
+pub type ByKind = [u64; Kind::ALL.len()];
+
 /// Labels of the status classes counted, by index: no response sent, then 1xx to 5xx.
 pub const STATUS_CLASSES: [&str; 6] = ["none", "1xx", "2xx", "3xx", "4xx", "5xx"];
 
@@ -91,6 +121,8 @@ pub struct SiteCounters {
     ends: [AtomicU64; End::ALL.len()],
     attempts: AtomicU64,
     reused: AtomicU64,
+    sent: [AtomicU64; Kind::ALL.len()],
+    fetched: [AtomicU64; Kind::ALL.len()],
 }
 
 impl SiteCounters {
@@ -104,6 +136,16 @@ impl SiteCounters {
         self.reused.fetch_add(reused as u64, Ordering::Relaxed);
     }
 
+    /// Counts response body bytes written to a client.
+    pub fn add_sent(&self, kind: Kind, n: u64) {
+        self.sent[kind.index()].fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Counts response body bytes read from an upstream.
+    pub fn add_fetched(&self, kind: Kind, n: u64) {
+        self.fetched[kind.index()].fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn counts(&self) -> Counts {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         Counts {
@@ -112,6 +154,8 @@ impl SiteCounters {
             ends: self.ends.each_ref().map(load),
             attempts: load(&self.attempts),
             reused: load(&self.reused),
+            sent: self.sent.each_ref().map(load),
+            fetched: self.fetched.each_ref().map(load),
         }
     }
 }
@@ -128,6 +172,10 @@ pub struct Counts {
     pub attempts: u64,
     /// Attempts that used a pooled connection.
     pub reused: u64,
+    /// Response body bytes written to clients and read from upstreams. Request bodies
+    /// are left out: clients send a few KiB at most.
+    pub sent: ByKind,
+    pub fetched: ByKind,
 }
 
 impl Counts {
@@ -140,6 +188,8 @@ impl Counts {
             ends: std::array::from_fn(|i| sub(self.ends[i], earlier.ends[i])),
             attempts: sub(self.attempts, earlier.attempts),
             reused: sub(self.reused, earlier.reused),
+            sent: std::array::from_fn(|i| sub(self.sent[i], earlier.sent[i])),
+            fetched: std::array::from_fn(|i| sub(self.fetched[i], earlier.fetched[i])),
         }
     }
 
@@ -214,6 +264,11 @@ impl Metrics {
         Arc::clone(&self.unrouted)
     }
 
+    /// The counts of every site since start, by name.
+    pub fn totals(&self) -> BTreeMap<String, Counts> {
+        self.read().0
+    }
+
     fn read(&self) -> (BTreeMap<String, Counts>, Counts) {
         let sites = self.sites.lock().unwrap_or_else(PoisonError::into_inner);
         let counts = sites.iter().map(|(n, c)| (n.clone(), c.counts())).collect();
@@ -285,6 +340,31 @@ mod tests {
         for (i, e) in End::ALL.iter().enumerate() {
             assert_eq!(e.index(), i, "{}", e.as_str());
         }
+    }
+
+    #[test]
+    fn kind_order_matches_indexes() {
+        for (i, k) in Kind::ALL.iter().enumerate() {
+            assert_eq!(k.index(), i, "{}", k.as_str());
+        }
+    }
+
+    #[test]
+    fn bytes_add_up_by_kind_and_recent_ones_subtract() {
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        let a = m.site("a");
+        a.add_sent(Kind::Media, 100);
+        a.add_fetched(Kind::Media, 150);
+        a.add_sent(Kind::Image, 7);
+        m.tick_at(t0 + Duration::from_secs(1));
+        a.add_sent(Kind::Media, 10);
+        m.tick_at(t0 + RECENT + Duration::from_secs(2));
+        let r = m.report_at(t0 + RECENT + Duration::from_secs(3));
+        assert_eq!(r.sites[0].total.sent, [110, 7, 0, 0]);
+        assert_eq!(r.sites[0].total.fetched, [150, 0, 0, 0]);
+        assert_eq!(r.sites[0].recent.sent, [10, 0, 0, 0]);
+        assert_eq!(m.totals()["a"].sent, [110, 7, 0, 0]);
     }
 
     #[test]

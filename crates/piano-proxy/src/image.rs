@@ -25,6 +25,7 @@ use http::header::{
 };
 use http::{HeaderName, HeaderValue, Method};
 use piano_cache::{Budget, BudgetState, Lru, Wait, Weigh, image_key, shared_ttl};
+use piano_telemetry::Kind;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
@@ -770,6 +771,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
         loop {
             match http.read_body_bytes().await {
                 Ok(Some(data)) => {
+                    site.counters.add_fetched(Kind::Image, data.len() as u64);
                     if body.len() + data.len() > MAX_IMAGE {
                         return Ok(Got::TooLarge);
                     }

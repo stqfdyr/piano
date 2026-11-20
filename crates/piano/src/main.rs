@@ -78,6 +78,16 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// Bytes relayed per site and kind: today, the last 7 and 30 days. Reads the traffic
+    /// record, which the daemon writes once a minute; --json prints the record itself.
+    Traffic {
+        /// Also list the last N days one by one.
+        #[arg(long, default_value_t = 0)]
+        days: usize,
+        /// Read this file instead of traffic.file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
     /// Print the version.
     Version,
 }
@@ -154,6 +164,7 @@ fn main() -> ExitCode {
             command: ConfigCommand::Show,
         } => config_show(&cli),
         Command::Log { ref command } => log(&cli, command),
+        Command::Traffic { days, ref file } => traffic(&cli, days, file.as_deref()),
         Command::Cache {
             command: CacheCommand::Stats,
         } => cache_stats(&cli),
@@ -358,6 +369,55 @@ fn log(cli: &Cli, command: &LogCommand) -> ExitCode {
     }
 }
 
+fn traffic(cli: &Cli, days: usize, file: Option<&Path>) -> ExitCode {
+    let path = match file {
+        Some(f) => f.to_owned(),
+        None => match piano_config::load(&cli.config) {
+            Ok(c) => match c.traffic.file_path() {
+                Some(p) => p.to_owned(),
+                None => {
+                    eprintln!(
+                        "no traffic is recorded (traffic.file = \"\" in {})",
+                        cli.config.display()
+                    );
+                    return ExitCode::from(exit::CONFIG);
+                }
+            },
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(exit::CONFIG);
+            }
+        },
+    };
+    let record = match piano::traffic::read(&path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            eprintln!(
+                "{}: no traffic recorded yet; the daemon writes it once a minute",
+                path.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(exit::RUNTIME);
+        }
+    };
+    if cli.json {
+        print_json(&record);
+        return ExitCode::SUCCESS;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let today = chrono::Local::now().date_naive();
+    print!(
+        "{}",
+        render::traffic(&record, &path.display().to_string(), today, now, days)
+    );
+    ExitCode::SUCCESS
+}
+
 fn config_check(path: &Path) -> ExitCode {
     let config = match piano_config::load(path) {
         Ok(c) => c,
@@ -416,7 +476,11 @@ fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
             return ExitCode::from(exit::RUNTIME);
         }
     };
-    let admin = piano::Admin::new(live, path.to_owned(), level_override);
+    let admin = piano::Admin::new(
+        std::sync::Arc::clone(&live),
+        path.to_owned(),
+        level_override,
+    );
     server.add_service(piano::Reloader::new(std::sync::Arc::clone(&admin)));
     if let Some(bound) = control {
         server.add_service(piano::ControlService::new(admin, bound));
@@ -428,5 +492,7 @@ fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
         config.server.listen.join(", ")
     );
     server.run(piano::RunArgs::default());
+    // Streams that drained after the last minute's write.
+    live.record_traffic();
     ExitCode::SUCCESS
 }

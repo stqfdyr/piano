@@ -3,6 +3,7 @@
 //! Matching ignores ASCII case and an optional leading `/emby` segment, and does not
 //! allocate.
 
+use piano_telemetry::Kind;
 use std::time::Duration;
 
 /// What a request is; decides timeouts, retries, caching and rewriting.
@@ -34,6 +35,16 @@ impl RouteClass {
             Self::Socket => "socket",
             Self::Api => "api",
             Self::Local => "local",
+        }
+    }
+
+    /// What the request's bytes count as.
+    pub fn kind(self) -> Kind {
+        match self {
+            Self::Media => Kind::Media,
+            Self::Image => Kind::Image,
+            Self::Socket => Kind::Socket,
+            _ => Kind::Other,
         }
     }
 

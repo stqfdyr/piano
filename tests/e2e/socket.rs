@@ -90,6 +90,10 @@ async fn upgrade_relays_bytes_both_ways() {
         "{l}"
     );
     assert_eq!(l["up"][0]["status"], 101, "{l}");
+    let record = w.relay.traffic();
+    let site = record.days.values().next().unwrap()["media"];
+    assert_eq!(site.sent.socket, 5 + 2 + 100_000, "{site:?}");
+    assert_eq!(site.fetched.socket, 5 + 2 + 100_000, "{site:?}");
 }
 
 #[tokio::test]

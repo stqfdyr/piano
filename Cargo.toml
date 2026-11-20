@@ -54,6 +54,10 @@ aho-corasick = "1"
 # UA rewrite rules in the configuration.
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case"] }
 
+# Local calendar days of the traffic record; already in the tree through pingora-core,
+# which uses it without the clock. The clock brings iana-time-zone.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
 # Control protocol frames; also the tests' JSON reader.
 serde_json = "1"
 

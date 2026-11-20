@@ -57,6 +57,8 @@ pub enum ValidationError {
     RelativeAccessLog(std::path::PathBuf),
     #[error("control.socket {0:?} must be an absolute path")]
     RelativeSocket(std::path::PathBuf),
+    #[error("traffic.file {0:?} must be an absolute path")]
+    RelativeTrafficFile(std::path::PathBuf),
     #[error("site {site:?}: upstream_limit {reason}")]
     BadUpstreamLimit { site: String, reason: &'static str },
     #[error("site {site:?}: upstream {url:?}: {reason}")]
@@ -179,6 +181,11 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     {
         errors.push(ValidationError::RelativeSocket(
             config.control.socket.clone(),
+        ));
+    }
+    if config.traffic.file_path().is_some_and(|p| !p.is_absolute()) {
+        errors.push(ValidationError::RelativeTrafficFile(
+            config.traffic.file.clone(),
         ));
     }
     if config.sites.is_empty() {
@@ -409,6 +416,21 @@ mod tests {
         assert_eq!(
             errors(&format!("{MINIMAL}\n[control]\nsocket = \"ctl.sock\"")),
             [ValidationError::RelativeSocket("ctl.sock".into())]
+        );
+    }
+
+    #[test]
+    fn traffic_file_default_off_and_absolute() {
+        let c = parse(MINIMAL).unwrap();
+        assert_eq!(
+            c.traffic.file_path(),
+            Some(std::path::Path::new(crate::DEFAULT_TRAFFIC_FILE))
+        );
+        let off = parse(&format!("{MINIMAL}\n[traffic]\nfile = \"\"")).unwrap();
+        assert_eq!(off.traffic.file_path(), None);
+        assert_eq!(
+            errors(&format!("{MINIMAL}\n[traffic]\nfile = \"traffic.json\"")),
+            [ValidationError::RelativeTrafficFile("traffic.json".into())]
         );
     }
 

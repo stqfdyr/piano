@@ -23,7 +23,7 @@ use log::{debug, warn};
 use piano_cache::Budget;
 use piano_edge::acl::canonical;
 use piano_media::{ByteRange, Head, Resume, Stream, StreamGuard};
-use piano_telemetry::{Id, redact};
+use piano_telemetry::{Id, Kind, SiteCounters, redact};
 use pingora_core::protocols::http::v1::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
@@ -124,8 +124,10 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         start: ctx.hop.clone(),
         site: ctx.site,
         sites,
+        counters: Arc::clone(&site.counters),
         log: Mutex::new(Vec::new()),
     });
+    ctx.sent_counted = true;
     let (tx, rx) = mpsc::channel(QUEUE);
     let now = Instant::now();
     let mut engine = Engine {
@@ -198,6 +200,8 @@ struct Spec {
     /// Longest wait for the upstream: for each read of a request, and for the stream's
     /// next body bytes overall.
     stall: Duration,
+    /// The site's counters; a long stream counts its bytes as they pass, not at its end.
+    counters: Arc<SiteCounters>,
     log: Mutex<Vec<AttemptLog>>,
 }
 
@@ -529,6 +533,7 @@ impl Engine {
             .map_err(|e| e.into_down())?;
         self.pos += n;
         self.stream.add_sent(n);
+        self.spec.counters.add_sent(Kind::Media, n);
         self.progress = Instant::now();
         self.unproductive = 0;
         Ok(())
@@ -656,10 +661,12 @@ async fn request(
             .map_err(|_| abandoned())?;
         loop {
             match http.read_body_bytes().await {
-                Ok(Some(data)) => tx
-                    .send((id, Msg::Data(data)))
-                    .await
-                    .map_err(|_| abandoned())?,
+                Ok(Some(data)) => {
+                    spec.counters.add_fetched(Kind::Media, data.len() as u64);
+                    tx.send((id, Msg::Data(data)))
+                        .await
+                        .map_err(|_| abandoned())?;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     spec.note(entry, |a| a.error = Some(e.etype().as_str()));

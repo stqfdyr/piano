@@ -6,6 +6,7 @@ mod admin;
 mod control;
 mod procfs;
 mod reload;
+pub mod traffic;
 
 use arc_swap::ArcSwap;
 use piano_config::Config;
@@ -128,6 +129,7 @@ pub struct Live {
     accept: Arc<AcceptStats>,
     streams: Arc<Streams>,
     images: Arc<Images>,
+    ledger: traffic::Ledger,
 }
 
 /// Settings read once at startup; a reload that changes them only warns.
@@ -141,6 +143,7 @@ struct Fixed {
     keepalive_timeout: piano_config::Duration,
     max_connections: usize,
     socket: PathBuf,
+    traffic: PathBuf,
 }
 
 impl Fixed {
@@ -154,6 +157,7 @@ impl Fixed {
             keepalive_timeout: config.limits.keepalive_timeout,
             max_connections: config.limits.max_connections,
             socket: config.control.socket.clone(),
+            traffic: config.traffic.file.clone(),
         }
     }
 
@@ -183,6 +187,9 @@ impl Fixed {
         }
         if self.socket != other.socket {
             out.push("control.socket");
+        }
+        if self.traffic != other.traffic {
+            out.push("traffic.file");
         }
         out
     }
@@ -297,6 +304,10 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     }
     server.add_service(service);
 
+    let (ledger, warning) = traffic::Ledger::open(config.traffic.file_path());
+    if let Some(w) = warning {
+        log::warn!("traffic record {w}");
+    }
     let live = Arc::new(Live {
         access,
         access_log,
@@ -309,6 +320,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         accept,
         streams,
         images,
+        ledger,
     });
     Ok(Daemon { server, live })
 }
@@ -392,6 +404,31 @@ impl Live {
     /// Connections refused by the allow list since start.
     pub fn denied_connections(&self) -> u64 {
         self.access.denied()
+    }
+
+    /// Adds the bytes relayed since the last call to today's entry of the traffic record
+    /// and writes the record; call once a minute and once more when stopping. Logs when
+    /// writing starts or stops failing.
+    pub fn record_traffic(&self) {
+        let today = chrono::Local::now().date_naive();
+        self.ledger.add(&self.metrics.totals(), today);
+        let before = self.ledger.error();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        match self.ledger.save(now) {
+            Ok(_) if before.is_some() => log::info!("traffic record written again"),
+            Ok(_) => {}
+            Err(e) if before.is_none() => {
+                log::warn!("cannot write the traffic record, retrying every minute: {e}");
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// The traffic record's file and why writing it fails, if it does.
+    pub fn traffic_state(&self) -> (Option<&Path>, Option<String>) {
+        (self.ledger.path(), self.ledger.error())
     }
 
     /// Request counters; snapshot them once a minute with [`Metrics::tick`].

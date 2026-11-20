@@ -66,6 +66,8 @@ pub const ACCESS_LOG: &str = "access.log";
 /// File names of the control socket and configuration in the relay's directory.
 pub const CONTROL_SOCKET: &str = "ctl.sock";
 pub const CONFIG_FILE: &str = "piano.toml";
+/// File name of the traffic record in the relay's directory.
+pub const TRAFFIC_FILE: &str = "traffic.json";
 
 pub struct Relay {
     pub addr: SocketAddr,
@@ -144,9 +146,13 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         [control]
         socket = {socket:?}
 
+        [traffic]
+        file = {traffic:?}
+
         {sites}
         "#,
         socket = dir.path().join(CONTROL_SOCKET),
+        traffic = dir.path().join(TRAFFIC_FILE),
         allow = allow.join(", "),
         roots = roots.join(", "),
         limits = setup.limits,
@@ -234,6 +240,15 @@ impl Relay {
 
     pub fn denied_connections(&self) -> u64 {
         self.live.denied_connections()
+    }
+
+    /// Writes the traffic record now, as the daemon does once a minute, and reads it
+    /// back.
+    pub fn traffic(&self) -> piano::traffic::Record {
+        self.live.record_traffic();
+        piano::traffic::read(&self.dir.path().join(TRAFFIC_FILE))
+            .unwrap()
+            .unwrap_or_default()
     }
 
     /// Path of access log file `name` in the relay's directory.

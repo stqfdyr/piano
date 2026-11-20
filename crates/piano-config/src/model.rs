@@ -24,6 +24,8 @@ pub struct Config {
     pub control: Control,
     #[serde(default)]
     pub cache: Cache,
+    #[serde(default)]
+    pub traffic: Traffic,
     #[serde(default, rename = "site")]
     pub sites: Vec<Site>,
 }
@@ -194,6 +196,32 @@ impl Default for Cache {
             // The smallest relay has 350 MB available.
             image_memory_mib: 128,
         }
+    }
+}
+
+/// Where the bytes relayed per day, site and kind are kept across restarts.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Traffic {
+    /// JSON file rewritten once a minute; empty keeps no record.
+    pub file: PathBuf,
+}
+
+impl Default for Traffic {
+    fn default() -> Self {
+        Self {
+            file: PathBuf::from(DEFAULT_TRAFFIC_FILE),
+        }
+    }
+}
+
+/// Default traffic record path.
+pub const DEFAULT_TRAFFIC_FILE: &str = "/var/lib/piano/traffic.json";
+
+impl Traffic {
+    /// The record's path, unless none is kept.
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        (!self.file.as_os_str().is_empty()).then_some(self.file.as_path())
     }
 }
 
