@@ -4,7 +4,7 @@ use piano_e2e::SITE_HOST;
 use piano_e2e::client::{Proto, connect};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
-use piano_e2e::relay::{Relay, RelaySetup};
+use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -80,6 +80,16 @@ async fn upgrade_relays_bytes_both_ways() {
     let mut io = w.open().await;
     echo(&mut io, b"\x81\x05hello").await;
     echo(&mut io, &[7u8; 100_000]).await;
+    drop(io);
+    // Logged when the socket closes.
+    let l = &w.relay.access_lines(ACCESS_LOG, 1)[0];
+    assert_eq!(l["class"], "socket", "{l}");
+    assert_eq!(l["status"], 101, "{l}");
+    assert_eq!(
+        l["path"], "/embywebsocket?api_key=REDACTED&deviceId=d",
+        "{l}"
+    );
+    assert_eq!(l["up"][0]["status"], 101, "{l}");
 }
 
 #[tokio::test]

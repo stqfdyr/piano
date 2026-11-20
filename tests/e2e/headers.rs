@@ -30,6 +30,7 @@ async fn world() -> World {
         site_toml: SITE_TOML,
         names: &[],
         origin_ips: &[],
+        access_log: piano_e2e::relay::ACCESS_LOG,
     });
     World {
         ca,

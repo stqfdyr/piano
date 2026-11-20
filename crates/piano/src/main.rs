@@ -24,9 +24,10 @@ struct Cli {
     /// Configuration file.
     #[arg(short, long, global = true, default_value = piano_config::DEFAULT_PATH)]
     config: PathBuf,
-    /// Diagnostic log level: error, warn, info, debug or trace.
-    #[arg(long, global = true, default_value = "info")]
-    log_level: String,
+    /// Diagnostic log level: error, warn, info, debug or trace. Overrides log.level in
+    /// the configuration file, also across reloads.
+    #[arg(long, global = true)]
+    log_level: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,9 +56,20 @@ enum ConfigCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let Some(level) = piano_telemetry::logger::parse_level(&cli.log_level) else {
-        eprintln!("invalid --log-level {:?}", cli.log_level);
-        return ExitCode::from(exit::CONFIG);
+    let level_override = match cli
+        .log_level
+        .as_deref()
+        .map(piano_telemetry::logger::parse_level)
+    {
+        None => None,
+        Some(Some(level)) => Some(level),
+        Some(None) => {
+            eprintln!(
+                "invalid --log-level {:?}",
+                cli.log_level.unwrap_or_default()
+            );
+            return ExitCode::from(exit::CONFIG);
+        }
     };
     match cli.command {
         Command::Version { json } => {
@@ -68,11 +80,12 @@ fn main() -> ExitCode {
             command: ConfigCommand::Check,
         } => config_check(&cli.config),
         Command::Run => {
+            let level = level_override.unwrap_or(log::LevelFilter::Info);
             if let Err(e) = piano_telemetry::logger::init(level) {
                 eprintln!("cannot install logger: {e}");
                 return ExitCode::from(exit::RUNTIME);
             }
-            run(&cli.config)
+            run(&cli.config, level_override)
         }
     }
 }
@@ -114,7 +127,7 @@ fn config_check(path: &std::path::Path) -> ExitCode {
     }
 }
 
-fn run(path: &std::path::Path) -> ExitCode {
+fn run(path: &std::path::Path, level_override: Option<log::LevelFilter>) -> ExitCode {
     let config = match piano_config::load(path) {
         Ok(c) => c,
         Err(e) => {
@@ -122,6 +135,9 @@ fn run(path: &std::path::Path) -> ExitCode {
             return ExitCode::from(exit::CONFIG);
         }
     };
+    if level_override.is_none() {
+        piano_telemetry::logger::set_level(piano::level_filter(config.log.level));
+    }
     for w in config.warnings() {
         log::warn!("{w}");
     }
@@ -132,7 +148,7 @@ fn run(path: &std::path::Path) -> ExitCode {
             return ExitCode::from(exit::CONFIG);
         }
     };
-    server.add_service(piano::Reloader::new(live, path.to_owned()));
+    server.add_service(piano::Reloader::new(live, path.to_owned(), level_override));
     log::info!(
         "piano {} serving {} sites on {}",
         env!("CARGO_PKG_VERSION"),

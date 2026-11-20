@@ -29,6 +29,7 @@ async fn world(block: &[&str]) -> World {
         site_toml: "",
         names: &[],
         origin_ips: &[],
+        access_log: piano_e2e::relay::ACCESS_LOG,
     });
     World { ca, origin, relay }
 }

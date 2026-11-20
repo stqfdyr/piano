@@ -12,6 +12,7 @@ arc-swap.workspace = true
 async-trait.workspace = true
 log.workspace = true
 piano-config.workspace = true
+piano-telemetry.workspace = true
 pingora-core.workspace = true
 rustls.workspace = true
 thiserror.workspace = true

@@ -65,6 +65,29 @@ Changes to `server` settings and `upstream.extra_roots` need a restart.
 Exit codes: 0 success, 1 runtime error, 2 usage or configuration error, 3 `config
 check` passed with warnings.
 
+## Logs
+
+```toml
+[log]
+access = "/var/log/piano/access.log"   # "" turns the access log off
+level  = "info"                        # error | warn | info | debug | trace
+```
+
+- **Access log**: one JSON line per request (a websocket when it closes) with the site,
+  client, path, status, bytes, timings, how the request ended (`end`: `ok`,
+  `client_closed`, `connect_failed`, `redirect_refused`, ...) and every upstream
+  attempt (`up`: host, address, pooled or new connection, connect time, status or
+  error). Rotate it with logrotate and send `SIGUSR1` in `postrotate` to reopen it.
+- **Diagnostic log** on stderr: `<UTC time> <LEVEL> <target>: <message> key=value ...`.
+  ERROR needs an operator, WARN is a handled failure (for example a failed request),
+  INFO is lifecycle. `--log-level` overrides the configured level.
+- Each request carries a `rid` and each connection a `cid`; diagnostic records about a
+  request carry the same `rid=`, so the two logs can be joined.
+- Credentials are always removed: values of parameters named `api_key`, `apikey` or
+  ending in `token` or `authorization` become `REDACTED` in both logs.
+- Failed TLS handshakes and connections refused by `access.allow` are reported at
+  most once a minute, followed by a count.
+
 ## License
 
 Apache-2.0. `third_party/pingora` is a trimmed fork of

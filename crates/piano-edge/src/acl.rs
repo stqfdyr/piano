@@ -2,8 +2,9 @@
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use log::debug;
+use log::info;
 use piano_config::IpNet;
+use piano_telemetry::logger::REFUSED;
 use pingora_core::listeners::ConnectionFilter;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -95,7 +96,10 @@ impl ConnectionFilter for AccessFilter {
         let allowed = ip.is_some_and(|ip| self.acl.load().allows(ip));
         if !allowed {
             self.denied.fetch_add(1, Ordering::Relaxed);
-            debug!("refused connection from {:?}", ip.map(canonical));
+            match ip {
+                Some(ip) => info!(target: REFUSED, "refused connection from {}", canonical(ip)),
+                None => info!(target: REFUSED, "refused connection without a peer address"),
+            }
         }
         allowed
     }

@@ -15,6 +15,8 @@ pub struct Config {
     pub access: Access,
     #[serde(default)]
     pub upstream: Upstream,
+    #[serde(default)]
+    pub log: Log,
     #[serde(default, rename = "site")]
     pub sites: Vec<Site>,
 }
@@ -81,6 +83,57 @@ impl Default for Upstream {
             read_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(300),
             extra_roots: Vec::new(),
+        }
+    }
+}
+
+/// Logging.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Log {
+    /// Access log file, one JSON line per request; empty turns it off. Rotate it with
+    /// logrotate and SIGUSR1.
+    pub access: PathBuf,
+    /// Least severe diagnostic records written to stderr.
+    pub level: LogLevel,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            access: PathBuf::from("/var/log/piano/access.log"),
+            level: LogLevel::Info,
+        }
+    }
+}
+
+impl Log {
+    /// The access log path, unless the access log is off.
+    pub fn access_path(&self) -> Option<&std::path::Path> {
+        (!self.access.as_os_str().is_empty()).then_some(self.access.as_path())
+    }
+}
+
+/// Severity threshold of the diagnostic log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
         }
     }
 }

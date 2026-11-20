@@ -1488,6 +1488,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "serde_json",
  "tokio",
  "tokio-rustls",
 ]
@@ -1500,6 +1501,7 @@ dependencies = [
  "async-trait",
  "log",
  "piano-config",
+ "piano-telemetry",
  "pingora-core",
  "rustls",
  "thiserror 2.0.21",
@@ -1522,6 +1524,7 @@ dependencies = [
  "log",
  "piano-config",
  "piano-edge",
+ "piano-telemetry",
  "piano-upstream",
  "pingora-core",
  "pingora-error",

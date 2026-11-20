@@ -32,6 +32,8 @@ pub struct RelaySetup<'a> {
     /// Addresses the relay resolves the origin's name to, in order; empty means
     /// loopback only.
     pub origin_ips: &'a [IpAddr],
+    /// File name of the access log in the relay's directory; empty turns it off.
+    pub access_log: &'a str,
 }
 
 impl<'a> RelaySetup<'a> {
@@ -47,9 +49,13 @@ impl<'a> RelaySetup<'a> {
             site_toml: "",
             names: &[],
             origin_ips: &[],
+            access_log: ACCESS_LOG,
         }
     }
 }
+
+/// Default access log file name.
+pub const ACCESS_LOG: &str = "access.log";
 
 pub struct Relay {
     pub addr: SocketAddr,
@@ -85,6 +91,11 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
     let allow: Vec<String> = setup.allow.iter().map(|a| format!("{a:?}")).collect();
     let block: Vec<String> = setup.block.iter().map(|b| format!("{b:?}")).collect();
     let block = block.join(", ");
+    let access_log = if setup.access_log.is_empty() {
+        std::path::PathBuf::new()
+    } else {
+        dir.path().join(setup.access_log)
+    };
     let sites: String = setup
         .hosts
         .iter()
@@ -113,6 +124,9 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         connect_timeout = "2s"
         read_timeout = "5s"
         extra_roots = [{roots}]
+
+        [log]
+        access = {access_log:?}
 
         {sites}
         "#,
@@ -167,6 +181,44 @@ impl Relay {
 
     pub fn denied_connections(&self) -> u64 {
         self.live.denied_connections()
+    }
+
+    /// Path of access log file `name` in the relay's directory.
+    pub fn log_path(&self, name: &str) -> std::path::PathBuf {
+        self.dir.path().join(name)
+    }
+
+    pub fn reopen_access_log(&self) {
+        self.live.reopen_access_log().unwrap();
+    }
+
+    /// The lines of access log file `name` once it has at least `n`: requests are logged
+    /// just after their response ends, so a client may get there first.
+    pub fn access_lines(&self, name: &str, n: usize) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.live.flush_access_log();
+            let text = std::fs::read_to_string(self.log_path(name)).unwrap_or_default();
+            let lines: Vec<serde_json::Value> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+                .collect();
+            if lines.len() >= n {
+                return lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name} has {} lines, expected {n}:\n{text}",
+                lines.len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The raw text of access log file `name` after a flush.
+    pub fn access_text(&self, name: &str) -> String {
+        self.live.flush_access_log();
+        std::fs::read_to_string(self.log_path(name)).unwrap_or_default()
     }
 }
 

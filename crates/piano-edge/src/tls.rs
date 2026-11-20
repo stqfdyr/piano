@@ -7,6 +7,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use piano_config::Config;
+use piano_telemetry::Id;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use rustls::crypto::ring::default_provider;
@@ -51,13 +52,18 @@ pub enum Error {
     Rustls(#[from] rustls::Error),
 }
 
-/// The server name a client sent in its ClientHello, lowercased. Attached to every
-/// accepted connection's TLS digest by [`SniRecorder`].
+/// Facts about a downstream connection, attached to its TLS digest by [`SniRecorder`]
+/// when the handshake completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Sni(pub String);
+pub struct Conn {
+    /// Ties together the log records of the requests on this connection.
+    pub id: Id,
+    /// The server name from the ClientHello, lowercased.
+    pub sni: Option<String>,
+}
 
-/// Handshake callback that records the SNI name on the connection, so the HTTP layer can
-/// check that a request's host belongs to the same site.
+/// Handshake callback that records the connection id and SNI name, so the HTTP layer
+/// can log them and check that a request's host belongs to the same site.
 #[derive(Debug)]
 pub struct SniRecorder;
 
@@ -67,8 +73,10 @@ impl TlsAccept for SniRecorder {
         &self,
         tls: &TlsRef,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
-        let name = tls.server_name()?.to_ascii_lowercase();
-        Some(Arc::new(Sni(name)))
+        Some(Arc::new(Conn {
+            id: piano_telemetry::id::connection(),
+            sni: tls.server_name().map(str::to_ascii_lowercase),
+        }))
     }
 }
 

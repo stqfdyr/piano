@@ -40,6 +40,8 @@ pub enum ValidationError {
         index: usize,
         reason: String,
     },
+    #[error("log.access {0:?} must be an absolute path")]
+    RelativeAccessLog(std::path::PathBuf),
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
         site: String,
@@ -147,6 +149,11 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     let mut errors = Vec::new();
     if config.server.listen.is_empty() {
         errors.push(ValidationError::NoListen);
+    }
+    if config.log.access_path().is_some_and(|p| !p.is_absolute()) {
+        errors.push(ValidationError::RelativeAccessLog(
+            config.log.access.clone(),
+        ));
     }
     if config.sites.is_empty() {
         errors.push(ValidationError::NoSites);
@@ -272,6 +279,26 @@ mod tests {
             Err(Error::Invalid { errors, .. }) => errors,
             other => panic!("expected validation errors, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn log_defaults_and_paths() {
+        let c = parse(MINIMAL).unwrap();
+        assert_eq!(
+            c.log.access_path(),
+            Some(std::path::Path::new("/var/log/piano/access.log"))
+        );
+        assert_eq!(c.log.level, crate::LogLevel::Info);
+        let off = parse(&format!(
+            "{MINIMAL}\n[log]\naccess = \"\"\nlevel = \"debug\""
+        ))
+        .unwrap();
+        assert_eq!(off.log.access_path(), None);
+        assert_eq!(off.log.level, crate::LogLevel::Debug);
+        assert_eq!(
+            errors(&format!("{MINIMAL}\n[log]\naccess = \"piano.log\"")),
+            [ValidationError::RelativeAccessLog("piano.log".into())]
+        );
     }
 
     #[test]

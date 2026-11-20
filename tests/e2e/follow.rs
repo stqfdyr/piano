@@ -3,7 +3,7 @@
 use piano_e2e::client::{Proto, client};
 use piano_e2e::origin::{Origin, pattern_byte};
 use piano_e2e::pki::Ca;
-use piano_e2e::relay::{Relay, RelaySetup};
+use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
 
 const VOD: &str = "vod.example.net";
@@ -208,4 +208,40 @@ async fn only_get_and_head_are_followed() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn access_log_shows_each_hop_and_why_a_redirect_was_refused() {
+    let w = world().await;
+    let port = w.port();
+    let to = format!("https://{VOD}:{port}/__echo?api_key=s3cret");
+    assert_eq!(text(w.get(Proto::H1, &redirect(&to, 302))).await.0, 200);
+    for to in [
+        format!("https://{EVIL}:{port}/__echo?api_key=s3cret"),
+        "ftp://vod.example.net/x?api_key=s3cret".to_owned(),
+    ] {
+        assert_eq!(text(w.get(Proto::H1, &redirect(&to, 302))).await.0, 502);
+    }
+    let lines = w.relay.access_lines(ACCESS_LOG, 3);
+
+    let l = &lines[0];
+    assert_eq!(l["end"], "ok", "{l}");
+    let hops: Vec<(&str, u64)> = l["up"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["host"].as_str().unwrap(), a["status"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(hops, [(ORIGIN_HOST, 302), (VOD, 200)], "{l}");
+
+    for (l, reason) in lines[1..].iter().zip([EVIL, "scheme"]) {
+        assert_eq!(l["end"], "redirect_refused", "{l}");
+        assert_eq!(l["status"], 502, "{l}");
+        assert!(l["err"].as_str().unwrap().contains(reason), "{l}");
+        assert_eq!(l["up"].as_array().unwrap().len(), 1, "{l}");
+    }
+    // The client's own path carries the Location percent-encoded; the decoded
+    // credential must appear nowhere.
+    let text = w.relay.access_text(ACCESS_LOG);
+    assert!(!text.contains("api_key=s3cret"), "{text}");
 }

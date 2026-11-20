@@ -16,6 +16,7 @@ http.workspace = true
 log.workspace = true
 piano-config.workspace = true
 piano-edge.workspace = true
+piano-telemetry.workspace = true
 piano-upstream.workspace = true
 pingora-core.workspace = true
 pingora-error.workspace = true

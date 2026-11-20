@@ -9,6 +9,7 @@ use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
+use piano_telemetry::AccessLog;
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::listeners::TcpSocketOptions;
@@ -42,6 +43,8 @@ pub enum Error {
     Site { site: String, source: SiteError },
     #[error("site {0}: upstream was not validated")]
     Unvalidated(String),
+    #[error("access log: {0}")]
+    AccessLog(std::io::Error),
 }
 
 /// A server ready to run and the handle that reconfigures it.
@@ -53,6 +56,7 @@ pub struct Daemon {
 /// The parts of a running daemon that a reload replaces.
 pub struct Live {
     access: Arc<AccessFilter>,
+    access_log: Arc<AccessLog>,
     certs: Arc<CertStore>,
     sites: Arc<ArcSwap<Sites>>,
     resolver: Resolver,
@@ -97,6 +101,11 @@ impl Fixed {
     }
 }
 
+/// The diagnostic log threshold for a configured level.
+pub fn level_filter(level: piano_config::LogLevel) -> log::LevelFilter {
+    piano_telemetry::logger::parse_level(level.as_str()).unwrap_or(log::LevelFilter::Info)
+}
+
 /// Builds a ready-to-run server: listeners, access control, TLS and the relay service.
 pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     let certs = Arc::new(CertStore::new(SniTable::load(config)?));
@@ -104,6 +113,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     let client_tls = piano_upstream::tls::client_config(&config.upstream.extra_roots)?;
     let sites = Arc::new(ArcSwap::from_pointee(build_sites(config, &resolver, None)?));
     let access = Arc::new(AccessFilter::new(Acl::new(&config.access.allow)));
+    let access_log = Arc::new(AccessLog::open(config.log.access_path()).map_err(Error::AccessLog)?);
 
     let threads = match config.server.threads {
         0 => std::thread::available_parallelism().map_or(1, usize::from),
@@ -126,11 +136,17 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     let mut client = ConnectorOptions::from_server_conf(&conf);
     client.rustls_client_config = Some((client_tls.config, client_tls.roots));
 
-    let mut service =
-        ProxyServiceBuilder::new(&conf, Relay::new(Arc::clone(&sites), resolver.clone()))
-            .name("piano")
-            .client_options(client)
-            .build();
+    let mut service = ProxyServiceBuilder::new(
+        &conf,
+        Relay::new(
+            Arc::clone(&sites),
+            resolver.clone(),
+            Arc::clone(&access_log),
+        ),
+    )
+    .name("piano")
+    .client_options(client)
+    .build();
     service.set_runtime_group(RUNTIME_GROUP);
     service.set_connection_filter(Arc::clone(&access) as _);
     for addr in &config.server.listen {
@@ -144,6 +160,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
 
     let live = Arc::new(Live {
         access,
+        access_log,
         certs,
         sites,
         resolver,
@@ -163,10 +180,30 @@ impl Live {
         let current = self.sites.load();
         let sites = build_sites(config, &self.resolver, Some(&current))?;
         let acl = Acl::new(&config.access.allow);
+        // Opens the new file, if any, before anything is replaced; the last step that can
+        // fail.
+        self.access_log
+            .set_path(config.log.access_path())
+            .map_err(Error::AccessLog)?;
         self.certs.replace(table);
         self.access.replace(acl);
         self.sites.store(Arc::new(sites));
         Ok(self.fixed.changed(&Fixed::of(config)))
+    }
+
+    /// Starts a new access log file at the same path, after logrotate moved the old one.
+    pub fn reopen_access_log(&self) -> std::io::Result<()> {
+        self.access_log.reopen()
+    }
+
+    /// Waits until the access log lines queued so far are written.
+    pub fn flush_access_log(&self) {
+        self.access_log.flush();
+    }
+
+    /// Access log lines lost because the disk could not keep up.
+    pub fn dropped_access_lines(&self) -> u64 {
+        self.access_log.dropped()
     }
 
     /// Connections refused by the allow list since start.
@@ -214,4 +251,15 @@ fn build_sites(
         sites.push(s);
     }
     Ok(Sites::new(sites))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn handshake_target_matches_the_fork() {
+        assert_eq!(
+            piano_telemetry::logger::HANDSHAKE,
+            pingora_core::listeners::HANDSHAKE_LOG_TARGET
+        );
+    }
 }
