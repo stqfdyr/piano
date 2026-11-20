@@ -22,6 +22,7 @@ use crate::apps::ServerApp;
 use crate::listeners::tls::TlsSettings;
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
+use crate::listeners::HANDSHAKE_LOG_TARGET;
 use crate::listeners::{
     ConnectionFilter, HandshakeFailure, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions,
     TransportStack,
@@ -286,15 +287,18 @@ where
                                 );
                             }
                             Err(HandshakeFailure::Error(e)) => {
-                                // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
                                 if let Some(addr) = peer_addr {
-                                    error!("Downstream handshake error from {}: {e}", addr);
+                                    info!(target: HANDSHAKE_LOG_TARGET, "Downstream handshake error from {}: {e}", addr);
                                 } else {
-                                    error!("Downstream handshake error: {e}");
+                                    info!(target: HANDSHAKE_LOG_TARGET, "Downstream handshake error: {e}");
                                 }
                             }
                             Err(HandshakeFailure::TimedOut) => {
-                                error!("Downstream handshake timeout");
+                                if let Some(addr) = peer_addr {
+                                    info!(target: HANDSHAKE_LOG_TARGET, "Downstream handshake timeout from {}", addr);
+                                } else {
+                                    info!(target: HANDSHAKE_LOG_TARGET, "Downstream handshake timeout");
+                                }
                             }
                         }
                     });

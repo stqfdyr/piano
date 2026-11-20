@@ -99,6 +99,11 @@ use crate::protocols::GetSocketDigest;
 pub use accept_limits::{AcceptLimits, AcceptStats, DEFAULT_HANDSHAKE_TIMEOUT};
 pub use l4::{ServerAddress, TcpSocketOptions};
 
+/// Log target of failed and timed-out downstream handshakes. Clients can cause these at
+/// any rate, so they are logged at info level under their own target for the application
+/// to filter or rate limit.
+pub const HANDSHAKE_LOG_TARGET: &str = "pingora_core::handshake";
+
 /// The APIs to customize things like certificate during TLS server side handshake
 #[async_trait]
 pub trait TlsAccept {

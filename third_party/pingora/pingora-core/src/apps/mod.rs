@@ -19,7 +19,7 @@ pub mod http_app;
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;
 use bytes::BytesMut;
-use log::{debug, error};
+use log::{debug, info};
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
@@ -332,7 +332,7 @@ where
             // this branch, do not carry their size.
             let h2_conn = match Box::pin(server::handshake(stream, h2_options)).await {
                 Err(e) => {
-                    error!("H2 handshake error {e}");
+                    info!(target: crate::listeners::HANDSHAKE_LOG_TARGET, "H2 handshake error {e}");
                     return None;
                 }
                 Ok(c) => c,
