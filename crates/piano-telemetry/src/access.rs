@@ -76,6 +76,14 @@ impl AccessLog {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// The file written to, unless the log is off.
+    pub fn path(&self) -> Option<PathBuf> {
+        self.path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Starts a new file at the current path, after the old one was moved away.
     pub fn reopen(&self) -> io::Result<()> {
         let path = self.path.lock().unwrap_or_else(PoisonError::into_inner);

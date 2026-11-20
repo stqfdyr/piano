@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::fmt;
 use std::str::FromStr;
 
@@ -57,6 +57,12 @@ impl fmt::Display for Duration {
             }
         }
         write!(f, "{ms}ms")
+    }
+}
+
+impl Serialize for Duration {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
     }
 }
 

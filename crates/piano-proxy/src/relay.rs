@@ -20,7 +20,7 @@ use piano_edge::acl::canonical;
 use piano_edge::tls::Conn;
 use piano_telemetry::json::JsonLine;
 use piano_telemetry::logger::utc_timestamp;
-use piano_telemetry::{AccessLog, Id, redact};
+use piano_telemetry::{AccessLog, End, Id, SiteCounters, redact};
 use piano_upstream::{AddrCache, Addrs, Origin, Resolver};
 use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::Digest;
@@ -172,17 +172,25 @@ pub struct Relay {
     resolver: Resolver,
     follow_addrs: AddrCache,
     access: Arc<AccessLog>,
+    /// Requests for a host that is no site.
+    unrouted: Arc<SiteCounters>,
     /// GET requests of the `api` class so far, for sampling probes.
     api_gets: AtomicU64,
 }
 
 impl Relay {
-    pub fn new(sites: Arc<ArcSwap<Sites>>, resolver: Resolver, access: Arc<AccessLog>) -> Self {
+    pub fn new(
+        sites: Arc<ArcSwap<Sites>>,
+        resolver: Resolver,
+        access: Arc<AccessLog>,
+        unrouted: Arc<SiteCounters>,
+    ) -> Self {
         Self {
             sites,
             resolver,
             follow_addrs: AddrCache::new(FOLLOW_ADDR_TTL),
             access,
+            unrouted,
             api_gets: AtomicU64::new(0),
         }
     }
@@ -291,27 +299,27 @@ fn refuse_redirect(reason: String) -> Box<Error> {
 }
 
 /// How a request ended, as logged in `end`.
-fn end_reason(e: Option<&Error>) -> &'static str {
+fn end_reason(e: Option<&Error>) -> End {
     use ErrorType::*;
     let Some(e) = e else {
-        return "ok";
+        return End::Ok;
     };
     if *e.etype() == REFUSED {
-        return "redirect_refused";
+        return End::RedirectRefused;
     }
     match (e.esource(), e.etype()) {
-        (ErrorSource::Downstream, ReadTimedout | WriteTimedout) => "client_timeout",
-        (ErrorSource::Downstream, _) => "client_closed",
-        (ErrorSource::Upstream, ConnectTimedout | TLSHandshakeTimedout) => "connect_timeout",
+        (ErrorSource::Downstream, ReadTimedout | WriteTimedout) => End::ClientTimeout,
+        (ErrorSource::Downstream, _) => End::ClientClosed,
+        (ErrorSource::Upstream, ConnectTimedout | TLSHandshakeTimedout) => End::ConnectTimeout,
         (
             ErrorSource::Upstream,
             ConnectRefused | ConnectNoRoute | ConnectError | TLSHandshakeFailure | InvalidCert
             | HandshakeError | TLSWantX509Lookup | SocketError,
-        ) => "connect_failed",
-        (ErrorSource::Upstream, ReadTimedout | WriteTimedout) => "upstream_timeout",
-        (ErrorSource::Upstream, ConnectionClosed | ReadError | WriteError) => "upstream_closed",
-        (ErrorSource::Upstream, _) => "upstream_error",
-        _ => "internal",
+        ) => End::ConnectFailed,
+        (ErrorSource::Upstream, ReadTimedout | WriteTimedout) => End::UpstreamTimeout,
+        (ErrorSource::Upstream, ConnectionClosed | ReadError | WriteError) => End::UpstreamClosed,
+        (ErrorSource::Upstream, _) => End::UpstreamError,
+        _ => End::Internal,
     }
 }
 
@@ -358,7 +366,7 @@ fn millis(d: Duration) -> u64 {
 
 /// The access log line for a finished request. Field meanings are documented with the
 /// log format; every key is always present, `null` when unknown.
-fn access_line(session: &Session, e: Option<&Error>, end: &str, ctx: &Ctx) -> String {
+fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> String {
     let req = session.req_header();
     let down = session.as_downstream();
     let mut j = JsonLine::with_capacity(640);
@@ -388,7 +396,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: &str, ctx: &Ctx) -> St
     opt_num(&mut j, "dur_ms", ctx.start.map(|s| millis(s.elapsed())));
     opt_num(&mut j, "ttfb_ms", ctx.ttfb.map(millis));
     opt_num(&mut j, "rewrite", ctx.rewritten.map(|n| n as u64));
-    j.str("end", end);
+    j.str("end", end.as_str());
     let err = e.map(|e| redact(clip(&e.to_string(), MAX_ERR)).into_owned());
     opt_str(&mut j, "err", err.as_deref());
     j.array("up");
@@ -845,15 +853,27 @@ impl ProxyHttp for Relay {
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Ctx) {
         let end = end_reason(e);
+        let status = session.response_written().map(|r| r.status.as_u16());
+        let reused = ctx
+            .attempts
+            .iter()
+            .filter(|a| a.reused == Some(true))
+            .count();
+        match ctx.site() {
+            Ok(site) => &site.counters,
+            Err(_) => &self.unrouted,
+        }
+        .record(status, end, ctx.attempts.len(), reused);
         if let Some(e) = e {
             let site = ctx.site_name().unwrap_or("-");
             let path = logged_path(session.req_header());
+            let reason = end.as_str();
             match end {
-                "client_closed" | "client_timeout" => {
-                    debug!(rid:% = ctx.rid, site, end; "{path}: {e}");
+                End::ClientClosed | End::ClientTimeout => {
+                    debug!(rid:% = ctx.rid, site, end = reason; "{path}: {e}");
                 }
-                "internal" => error!(rid:% = ctx.rid, site, end; "{path}: {e}"),
-                _ => warn!(rid:% = ctx.rid, site, end; "{path}: {e}"),
+                End::Internal => error!(rid:% = ctx.rid, site, end = reason; "{path}: {e}"),
+                _ => warn!(rid:% = ctx.rid, site, end = reason; "{path}: {e}"),
             }
         }
         if self.access.enabled() {

@@ -36,6 +36,8 @@ pub struct RelaySetup<'a> {
     pub access_log: &'a str,
     /// Lines of the `[limits]` table.
     pub limits: &'a str,
+    /// Serve the control socket, with the configuration written to a file for reloads.
+    pub control: bool,
 }
 
 impl<'a> RelaySetup<'a> {
@@ -53,12 +55,17 @@ impl<'a> RelaySetup<'a> {
             origin_ips: &[],
             access_log: ACCESS_LOG,
             limits: "",
+            control: false,
         }
     }
 }
 
 /// Default access log file name.
 pub const ACCESS_LOG: &str = "access.log";
+
+/// File names of the control socket and configuration in the relay's directory.
+pub const CONTROL_SOCKET: &str = "ctl.sock";
+pub const CONFIG_FILE: &str = "piano.toml";
 
 pub struct Relay {
     pub addr: SocketAddr,
@@ -134,8 +141,12 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         [limits]
         {limits}
 
+        [control]
+        socket = {socket:?}
+
         {sites}
         "#,
+        socket = dir.path().join(CONTROL_SOCKET),
         allow = allow.join(", "),
         roots = roots.join(", "),
         limits = setup.limits,
@@ -146,7 +157,9 @@ impl Relay {
     pub fn start(setup: &RelaySetup<'_>) -> Self {
         let dir = TempDir::new();
         let port = free_port();
-        let config = piano_config::parse(&config_text(setup, &dir, 0, port)).unwrap();
+        let text = config_text(setup, &dir, 0, port);
+        let config_path = dir.write(CONFIG_FILE, &text);
+        let config = piano_config::parse(&text).unwrap();
         let local = [IpAddr::from([127, 0, 0, 1])];
         let origin_ips = if setup.origin_ips.is_empty() {
             &local
@@ -158,7 +171,12 @@ impl Relay {
             .iter()
             .fold(Resolver::system(), |r, name| r.with_override(name, &local))
             .with_override(ORIGIN_HOST, origin_ips);
-        let piano::Daemon { server, live } = piano::build(&config, resolver).unwrap();
+        let piano::Daemon { mut server, live } = piano::build(&config, resolver).unwrap();
+        if setup.control {
+            let bound = piano_ctl::server::bind(&dir.path().join(CONTROL_SOCKET)).unwrap();
+            let admin = piano::Admin::new(Arc::clone(&live), config_path, None);
+            server.add_service(piano::ControlService::new(admin, bound));
+        }
 
         let (stop, rx) = watch::channel(false);
         let thread = std::thread::spawn(move || {
@@ -184,6 +202,23 @@ impl Relay {
         let tag = self.generation.fetch_add(1, Ordering::Relaxed);
         let text = config_text(setup, &self.dir, tag, self.addr.port());
         self.live.apply(&piano_config::parse(&text)?)
+    }
+
+    /// Rewrites the configuration file from `setup`, for a reload through the control
+    /// socket to pick up.
+    pub fn write_config(&self, setup: &RelaySetup<'_>) {
+        let tag = self.generation.fetch_add(1, Ordering::Relaxed);
+        let text = config_text(setup, &self.dir, tag, self.addr.port());
+        self.dir.write(CONFIG_FILE, &text);
+    }
+
+    /// Writes `text` as the configuration file.
+    pub fn write_config_text(&self, text: &str) {
+        self.dir.write(CONFIG_FILE, text);
+    }
+
+    pub fn control_socket(&self) -> std::path::PathBuf {
+        self.dir.path().join(CONTROL_SOCKET)
     }
 
     /// Overwrites the certificate files the relay was started with, as a renewal would.

@@ -6,7 +6,9 @@ use crate::rewrite::Rewriter;
 use crate::route::BlockList;
 use http::HeaderValue;
 use piano_config::ServerDomains;
+use piano_telemetry::SiteCounters;
 use piano_upstream::Origin;
+use std::sync::Arc;
 
 /// One public host and the origin behind it.
 #[derive(Debug)]
@@ -17,6 +19,8 @@ pub struct Site {
     /// Precomputed upstream `Host` header value.
     pub upstream_host: HeaderValue,
     pub policy: Policy,
+    /// Kept by name across reloads.
+    pub counters: Arc<SiteCounters>,
 }
 
 /// Per-site request handling taken from the configuration.
@@ -112,6 +116,7 @@ impl Site {
         host: String,
         origin: Origin,
         policy: Policy,
+        counters: Arc<SiteCounters>,
     ) -> Result<Self, SiteError> {
         let upstream_host = HeaderValue::from_str(&origin.authority())?;
         Ok(Self {
@@ -120,6 +125,7 @@ impl Site {
             origin,
             upstream_host,
             policy,
+            counters,
         })
     }
 }
@@ -188,7 +194,7 @@ mod tests {
             server_domains: ServerDomains::default(),
             mounts: Mounts::default(),
         };
-        Site::new(host.into(), host.into(), origin, policy).unwrap()
+        Site::new(host.into(), host.into(), origin, policy, Arc::default()).unwrap()
     }
 
     #[test]

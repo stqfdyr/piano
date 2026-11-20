@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 piano-config = { path = "crates/piano-config" }
+piano-ctl = { path = "crates/piano-ctl" }
 piano-edge = { path = "crates/piano-edge" }
 piano-proxy = { path = "crates/piano-proxy" }
 piano-telemetry = { path = "crates/piano-telemetry" }
@@ -25,7 +26,11 @@ pingora-error = { path = "third_party/pingora/pingora-error" }
 pingora-http = { path = "third_party/pingora/pingora-http" }
 
 # Raising the open file limit at startup; already in the tree through pingora-core.
-nix = { version = "0.31", default-features = false, features = ["resource"] }
+nix = { version = "0.31", default-features = false, features = ["resource", "user"] }
+
+# Expiry and names of the served certificate, for status; already in the tree through
+# pingora-core.
+x509-parser = { version = "0.16", default-features = false }
 
 # Atomically replaced configuration snapshots (sites, ACL, certificates).
 arc-swap = "1"
@@ -39,7 +44,7 @@ rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tikv-jemallocator = "0.6"
-toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde", "std"] }
 
 # JSON rewriting: one pass over a body finds every place an upstream address may start.
 aho-corasick = "1"
@@ -47,8 +52,10 @@ aho-corasick = "1"
 # UA rewrite rules in the configuration.
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case"] }
 
-# Test-only.
+# Control protocol frames; also the tests' JSON reader.
 serde_json = "1"
+
+# Test-only.
 brotli = "3"
 bytes = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

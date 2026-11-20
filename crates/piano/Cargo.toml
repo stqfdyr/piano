@@ -14,12 +14,15 @@ clap.workspace = true
 log.workspace = true
 nix.workspace = true
 piano-config.workspace = true
+piano-ctl.workspace = true
 piano-edge.workspace = true
 piano-proxy.workspace = true
 piano-telemetry.workspace = true
 piano-upstream.workspace = true
 pingora-core.workspace = true
 pingora-proxy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 

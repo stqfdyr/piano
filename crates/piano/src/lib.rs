@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
+mod control;
+mod procfs;
 mod reload;
 
 use arc_swap::ArcSwap;
@@ -9,12 +12,12 @@ use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
-use piano_telemetry::AccessLog;
+use piano_telemetry::{AccessLog, Metrics};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::listeners::tls::TlsSettings;
-use pingora_core::listeners::{AcceptLimits, ListenerConfig, TcpSocketOptions};
+use pingora_core::listeners::{AcceptLimits, AcceptStats, ListenerConfig, TcpSocketOptions};
 use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::ProxyServiceBuilder;
@@ -22,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+pub use admin::Admin;
+pub use control::ControlService;
 pub use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 pub use reload::Reloader;
 
@@ -56,6 +61,14 @@ pub enum Error {
     Unvalidated(String),
     #[error("access log: {0}")]
     AccessLog(std::io::Error),
+}
+
+impl Error {
+    /// Whether fixing the configuration or certificate files cures it, as opposed to a
+    /// problem on the system (resolving an upstream, opening the access log).
+    pub fn is_config(&self) -> bool {
+        !matches!(self, Error::Resolve(_) | Error::AccessLog(_))
+    }
 }
 
 /// The certificate files in use and what they looked like when loaded, to notice when
@@ -109,6 +122,8 @@ pub struct Live {
     sites: Arc<ArcSwap<Sites>>,
     resolver: Resolver,
     fixed: Fixed,
+    metrics: Arc<Metrics>,
+    accept: Arc<AcceptStats>,
 }
 
 /// Settings read once at startup; a reload that changes them only warns.
@@ -121,6 +136,7 @@ struct Fixed {
     handshake_timeout: piano_config::Duration,
     keepalive_timeout: piano_config::Duration,
     max_connections: usize,
+    socket: PathBuf,
 }
 
 impl Fixed {
@@ -133,6 +149,7 @@ impl Fixed {
             handshake_timeout: config.limits.handshake_timeout,
             keepalive_timeout: config.limits.keepalive_timeout,
             max_connections: config.limits.max_connections,
+            socket: config.control.socket.clone(),
         }
     }
 
@@ -159,6 +176,9 @@ impl Fixed {
         }
         if self.max_connections != other.max_connections {
             out.push("limits.max_connections");
+        }
+        if self.socket != other.socket {
+            out.push("control.socket");
         }
         out
     }
@@ -204,7 +224,11 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     let certs = Arc::new(CertStore::new(SniTable::load(config)?));
     let server_tls = piano_edge::tls::server_config(Arc::clone(&certs))?;
     let client_tls = piano_upstream::tls::client_config(&config.upstream.extra_roots)?;
-    let sites = Arc::new(ArcSwap::from_pointee(build_sites(config, &resolver, None)?));
+    let metrics = Arc::new(Metrics::new());
+    let sites = Arc::new(ArcSwap::from_pointee(build_sites(
+        config, &resolver, None, &metrics,
+    )?));
+    let accept = Arc::new(AcceptStats::default());
     let access = Arc::new(AccessFilter::new(Acl::new(&config.access.allow)));
     let access_log = Arc::new(AccessLog::open(config.log.access_path()).map_err(Error::AccessLog)?);
 
@@ -235,6 +259,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
             Arc::clone(&sites),
             resolver.clone(),
             Arc::clone(&access_log),
+            metrics.unrouted(),
         ),
     )
     .name("piano")
@@ -251,6 +276,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         let limits = AcceptLimits {
             handshake_timeout: config.limits.handshake_timeout.get(),
             max_connections: Some(config.limits.max_connections),
+            stats: Some(Arc::clone(&accept)),
             ..AcceptLimits::default()
         };
         service.add_listener(
@@ -270,6 +296,8 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         sites,
         resolver,
         fixed: Fixed::of(config),
+        metrics,
+        accept,
     });
     Ok(Daemon { server, live })
 }
@@ -294,7 +322,7 @@ impl Live {
         let source = CertSource::of(config);
         let table = source.load()?;
         let current = self.sites.load();
-        let sites = build_sites(config, &self.resolver, Some(&current))?;
+        let sites = build_sites(config, &self.resolver, Some(&current), &self.metrics)?;
         let acl = Acl::new(&config.access.allow);
         // Opens the new file, if any, before anything is replaced; the last step that can
         // fail.
@@ -348,6 +376,11 @@ impl Live {
     pub fn denied_connections(&self) -> u64 {
         self.access.denied()
     }
+
+    /// Request counters; snapshot them once a minute with [`Metrics::tick`].
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
 }
 
 /// Builds the site table. An origin already in `current` keeps its addresses and the
@@ -356,6 +389,7 @@ fn build_sites(
     config: &Config,
     resolver: &Resolver,
     current: Option<&Sites>,
+    metrics: &Metrics,
 ) -> Result<Sites, Error> {
     let options = PeerOptions::from(&config.upstream);
     let mut sites = Vec::with_capacity(config.sites.len());
@@ -381,7 +415,15 @@ fn build_sites(
             options,
         };
         let s = Policy::from_config(site)
-            .and_then(|policy| Site::new(site.name.clone(), site.host.clone(), origin, policy))
+            .and_then(|policy| {
+                Site::new(
+                    site.name.clone(),
+                    site.host.clone(),
+                    origin,
+                    policy,
+                    metrics.site(&site.name),
+                )
+            })
             .map_err(|source| Error::Site {
                 site: site.name.clone(),
                 source,

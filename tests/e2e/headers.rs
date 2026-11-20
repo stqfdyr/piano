@@ -32,6 +32,7 @@ async fn world() -> World {
         origin_ips: &[],
         access_log: piano_e2e::relay::ACCESS_LOG,
         limits: "",
+        control: false,
     });
     World {
         ca,

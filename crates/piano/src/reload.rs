@@ -1,13 +1,12 @@
 //! Signals: SIGHUP rereads the configuration, SIGUSR1 reopens the access log. Also
 //! picks up renewed certificate files.
 
-use crate::{Live, RUNTIME_GROUP};
+use crate::{Admin, RUNTIME_GROUP};
 use async_trait::async_trait;
-use log::{LevelFilter, error, info, warn};
+use log::{error, info, warn};
 use piano_telemetry::logger;
 use pingora_core::server::{ListenFds, ShutdownWatch};
 use pingora_core::services::{ServiceReadyNotifier, ServiceWithDependents};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -18,54 +17,19 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 const CERT_CHECK_EVERY: Duration = Duration::from_secs(3600);
 
 /// Applies configuration reloads and log reopening to the running daemon, picks up
-/// renewed certificates, and writes out the summaries of rate-limited log records.
+/// renewed certificates, snapshots the request counters and writes out the summaries of
+/// rate-limited log records.
 pub struct Reloader {
-    live: Arc<Live>,
-    path: PathBuf,
-    /// Diagnostic log level given on the command line, which the file does not override.
-    level_override: Option<LevelFilter>,
+    admin: Arc<Admin>,
 }
 
 impl Reloader {
-    pub fn new(live: Arc<Live>, path: PathBuf, level_override: Option<LevelFilter>) -> Self {
-        Self {
-            live,
-            path,
-            level_override,
-        }
-    }
-
-    async fn reload(&self) {
-        let live = Arc::clone(&self.live);
-        let path = self.path.clone();
-        // Reading files and resolving new origins block.
-        let result = tokio::task::spawn_blocking(move || {
-            let config = piano_config::load(&path)?;
-            let warnings = config.warnings();
-            let level = config.log.level;
-            live.apply(&config).map(|fixed| (fixed, warnings, level))
-        })
-        .await;
-        match result {
-            Ok(Ok((fixed, warnings, level))) => {
-                if self.level_override.is_none() {
-                    logger::set_level(crate::level_filter(level));
-                }
-                for w in warnings {
-                    warn!("{w}");
-                }
-                if !fixed.is_empty() {
-                    warn!("restart needed for: {}", fixed.join(", "));
-                }
-                info!("configuration reloaded from {}", self.path.display());
-            }
-            Ok(Err(e)) => warn!("reload failed, keeping the running configuration: {e}"),
-            Err(e) => error!("reload task failed: {e}"),
-        }
+    pub fn new(admin: Arc<Admin>) -> Self {
+        Self { admin }
     }
 
     async fn refresh_certs(&self) {
-        let live = Arc::clone(&self.live);
+        let live = Arc::clone(self.admin.live());
         match tokio::task::spawn_blocking(move || live.refresh_certs()).await {
             Ok(Ok(true)) => info!("certificate files changed; certificate reloaded"),
             Ok(Ok(false)) => {}
@@ -77,7 +41,7 @@ impl Reloader {
     }
 
     async fn reopen(&self) {
-        let live = Arc::clone(&self.live);
+        let live = Arc::clone(self.admin.live());
         match tokio::task::spawn_blocking(move || live.reopen_access_log()).await {
             Ok(Ok(())) => info!("access log reopened"),
             Ok(Err(e)) => error!("cannot reopen the access log, still writing the old file: {e}"),
@@ -124,9 +88,14 @@ impl ServiceWithDependents for Reloader {
         let mut certs = tokio::time::interval(CERT_CHECK_EVERY);
         loop {
             tokio::select! {
-                _ = recv(&mut hup) => self.reload().await,
+                _ = recv(&mut hup) => {
+                    self.admin.reload().await;
+                }
                 _ = recv(&mut usr1) => self.reopen().await,
-                _ = tick.tick() => logger::flush_aggregated(false),
+                _ = tick.tick() => {
+                    logger::flush_aggregated(false);
+                    self.admin.live().metrics().tick();
+                }
                 _ = certs.tick() => self.refresh_certs().await,
                 _ = shutdown.changed() => break,
             }

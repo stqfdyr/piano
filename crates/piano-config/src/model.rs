@@ -1,10 +1,10 @@
 use crate::{Duration, IpNet, UpstreamUrl};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The whole configuration file.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -20,12 +20,14 @@ pub struct Config {
     pub upstream: Upstream,
     #[serde(default)]
     pub log: Log,
+    #[serde(default)]
+    pub control: Control,
     #[serde(default, rename = "site")]
     pub sites: Vec<Site>,
 }
 
 /// Process-level settings; changing them needs a restart.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Server {
     pub listen: Vec<String>,
@@ -45,7 +47,7 @@ impl Default for Server {
 }
 
 /// The downstream certificate.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
     pub cert: PathBuf,
@@ -53,7 +55,7 @@ pub struct Tls {
 }
 
 /// Who may connect. Checked on the client address before the TLS handshake.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Access {
     /// Addresses and networks allowed to connect. Must not be empty: serving everyone
@@ -63,7 +65,7 @@ pub struct Access {
 
 /// Bounds on what clients may hold. The allow list keeps strangers out before TLS, so
 /// these guard against a misbehaving client and keep the process within its resources.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
     /// Longest time from accepting a connection to the end of its TLS handshake.
@@ -92,7 +94,7 @@ impl Default for Limits {
 }
 
 /// Defaults for every upstream connection.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Upstream {
     /// Longest time one attempt may take to connect, TLS handshake included, before
@@ -121,7 +123,7 @@ impl Default for Upstream {
 }
 
 /// Logging.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Log {
     /// Access log file, one JSON line per request; empty turns it off. Rotate it with
@@ -147,8 +149,34 @@ impl Log {
     }
 }
 
+/// The local socket the command-line tool talks to the daemon through.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Control {
+    /// Unix socket path; empty turns the control socket off.
+    pub socket: PathBuf,
+}
+
+impl Default for Control {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from(DEFAULT_SOCKET),
+        }
+    }
+}
+
+/// Default control socket path.
+pub const DEFAULT_SOCKET: &str = "/run/piano/ctl.sock";
+
+impl Control {
+    /// The socket path, unless the control socket is off.
+    pub fn socket_path(&self) -> Option<&std::path::Path> {
+        (!self.socket.as_os_str().is_empty()).then_some(self.socket.as_path())
+    }
+}
+
 /// Severity threshold of the diagnostic log.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Error,
@@ -172,7 +200,7 @@ impl LogLevel {
 }
 
 /// One public host relayed to one upstream Emby server.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Site {
     /// Short name for logs and commands; defaults to the first label of `host`.
@@ -211,7 +239,7 @@ pub struct Site {
 }
 
 /// Handling of the endpoint that lists the upstream's own domain names.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerDomains {
     /// Relayed, with the upstream's names replaced by the site's.
@@ -225,7 +253,7 @@ pub enum ServerDomains {
 
 /// Replace the User-Agent sent upstream when the client's matches `pattern`. A missing
 /// User-Agent is matched as the empty string.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UaRule {
     #[serde(rename = "match")]
@@ -234,6 +262,11 @@ pub struct UaRule {
 }
 
 impl Config {
+    /// The configuration as TOML with every default written out.
+    pub fn effective_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string(self)
+    }
+
     /// Problems that do not stop the configuration from being used.
     pub fn warnings(&self) -> Vec<crate::Warning> {
         crate::validate::warnings(self)

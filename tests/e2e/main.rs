@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod access;
+mod control;
 mod follow;
 mod headers;
 mod limits;
@@ -49,6 +50,7 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         origin_ips: &[],
         access_log: piano_e2e::relay::ACCESS_LOG,
         limits: "",
+        control: false,
     });
     World { ca, origin, relay }
 }

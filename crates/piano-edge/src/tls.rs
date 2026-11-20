@@ -19,6 +19,7 @@ use rustls::{ServerConfig, version};
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// ALPN identifiers offered to clients, most preferred first.
 pub const ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
@@ -80,9 +81,48 @@ impl TlsAccept for SniRecorder {
     }
 }
 
+/// What the served certificate says about itself, for status reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertInfo {
+    /// DNS names in the subject alternative names.
+    pub names: Vec<String>,
+    /// End of validity, Unix seconds; `None` if the certificate could not be read for it.
+    pub not_after: Option<i64>,
+    /// When the files were loaded.
+    pub loaded: SystemTime,
+}
+
+impl CertInfo {
+    fn of(leaf: &CertificateDer<'_>) -> Self {
+        let parsed = x509_parser::parse_x509_certificate(leaf.as_ref()).ok();
+        let names = parsed
+            .as_ref()
+            .and_then(|(_, c)| c.subject_alternative_name().ok().flatten())
+            .map(|san| {
+                san.value
+                    .general_names
+                    .iter()
+                    .filter_map(|n| match n {
+                        x509_parser::extensions::GeneralName::DNSName(d) => Some((*d).to_owned()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            names,
+            not_after: parsed.map(|(_, c)| c.validity().not_after.timestamp()),
+            loaded: SystemTime::now(),
+        }
+    }
+}
+
 /// Certificates by SNI name, loaded from the files named in a configuration.
 #[derive(Debug)]
-pub struct SniTable(ResolvesServerCertUsingSni);
+pub struct SniTable {
+    resolver: ResolvesServerCertUsingSni,
+    info: CertInfo,
+}
 
 impl SniTable {
     /// Loads the certificate and maps every site host to it; fails if it does not cover
@@ -97,6 +137,11 @@ impl SniTable {
     pub fn from_files(cert: &Path, key: &Path, hosts: &[&str]) -> Result<Self, Error> {
         let provider = default_provider();
         let certified = load_certified_key(cert, key, &provider)?;
+        let info = certified
+            .cert
+            .first()
+            .map(CertInfo::of)
+            .ok_or_else(|| Error::EmptyChain(cert.to_owned()))?;
         let mut resolver = ResolvesServerCertUsingSni::new();
         for host in hosts {
             resolver
@@ -107,7 +152,11 @@ impl SniTable {
                     source,
                 })?;
         }
-        Ok(Self(resolver))
+        Ok(Self { resolver, info })
+    }
+
+    pub fn info(&self) -> &CertInfo {
+        &self.info
     }
 }
 
@@ -128,11 +177,16 @@ impl CertStore {
     pub fn replace(&self, table: SniTable) {
         self.table.store(Arc::new(table));
     }
+
+    /// The certificate currently served.
+    pub fn info(&self) -> CertInfo {
+        self.table.load().info.clone()
+    }
 }
 
 impl ResolvesServerCert for CertStore {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.table.load().0.resolve(hello)
+        self.table.load().resolver.resolve(hello)
     }
 }
 

@@ -55,6 +55,8 @@ pub enum ValidationError {
     },
     #[error("log.access {0:?} must be an absolute path")]
     RelativeAccessLog(std::path::PathBuf),
+    #[error("control.socket {0:?} must be an absolute path")]
+    RelativeSocket(std::path::PathBuf),
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
         site: String,
@@ -166,6 +168,15 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     if config.log.access_path().is_some_and(|p| !p.is_absolute()) {
         errors.push(ValidationError::RelativeAccessLog(
             config.log.access.clone(),
+        ));
+    }
+    if config
+        .control
+        .socket_path()
+        .is_some_and(|p| !p.is_absolute())
+    {
+        errors.push(ValidationError::RelativeSocket(
+            config.control.socket.clone(),
         ));
     }
     if config.sites.is_empty() {
@@ -354,6 +365,33 @@ mod tests {
         assert_eq!(
             errors(&format!("{MINIMAL}\n[log]\naccess = \"piano.log\"")),
             [ValidationError::RelativeAccessLog("piano.log".into())]
+        );
+    }
+
+    #[test]
+    fn effective_configuration_round_trips() {
+        let text = format!(
+            "{MINIMAL}\n[[site.ua]]\nmatch = \"^$\"\nset = \"EmbyMini/1\"\n[site.mounts]\n\"/__v\" = \"v.example.net\""
+        );
+        let shown = parse(&text).unwrap().effective_toml().unwrap();
+        assert!(shown.contains("keepalive_timeout = \"10m\""), "{shown}");
+        assert!(shown.contains("[[site]]"), "{shown}");
+        let again = parse(&shown).unwrap().effective_toml().unwrap();
+        assert_eq!(shown, again);
+    }
+
+    #[test]
+    fn control_socket_default_and_paths() {
+        let c = parse(MINIMAL).unwrap();
+        assert_eq!(
+            c.control.socket_path(),
+            Some(std::path::Path::new(crate::DEFAULT_SOCKET))
+        );
+        let off = parse(&format!("{MINIMAL}\n[control]\nsocket = \"\"")).unwrap();
+        assert_eq!(off.control.socket_path(), None);
+        assert_eq!(
+            errors(&format!("{MINIMAL}\n[control]\nsocket = \"ctl.sock\"")),
+            [ValidationError::RelativeSocket("ctl.sock".into())]
         );
     }
 

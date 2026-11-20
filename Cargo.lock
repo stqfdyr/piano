@@ -1443,12 +1443,15 @@ dependencies = [
  "log",
  "nix",
  "piano-config",
+ "piano-ctl",
  "piano-edge",
  "piano-proxy",
  "piano-telemetry",
  "piano-upstream",
  "pingora-core",
  "pingora-proxy",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tikv-jemallocator",
  "tokio",
@@ -1471,6 +1474,15 @@ dependencies = [
 [[package]]
 name = "piano-ctl"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "nix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
 
 [[package]]
 name = "piano-e2e"
@@ -1485,10 +1497,12 @@ dependencies = [
  "hyper-util",
  "piano",
  "piano-config",
+ "piano-ctl",
  "piano-upstream",
  "rcgen",
  "reqwest",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
@@ -1507,6 +1521,7 @@ dependencies = [
  "rustls",
  "thiserror 2.0.21",
  "tokio",
+ "x509-parser 0.16.0",
 ]
 
 [[package]]
