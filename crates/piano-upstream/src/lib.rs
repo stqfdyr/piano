@@ -6,5 +6,5 @@ pub mod origin;
 pub mod resolve;
 pub mod tls;
 
-pub use origin::{Origin, PeerOptions, tcp_keepalive};
+pub use origin::{Origin, PeerOptions, offer_h2, tcp_keepalive};
 pub use resolve::{AddrCache, Addrs, Resolver};

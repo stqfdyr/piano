@@ -76,6 +76,14 @@ impl RouteClass {
     pub fn may_idle(self) -> bool {
         matches!(self, Self::Socket)
     }
+
+    /// Whether the request may share an upstream HTTP/2 connection with others. Media
+    /// keeps a connection to itself: TCP's own flow control bounds what a slow client
+    /// makes the relay hold, and a stalled stream is replaced by a new connection. The
+    /// websocket needs an HTTP/1.1 upgrade.
+    pub fn multiplexed(self) -> bool {
+        !matches!(self, Self::Media | Self::Socket)
+    }
 }
 
 /// Health check answered locally on every site.

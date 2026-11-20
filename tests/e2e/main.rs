@@ -5,6 +5,7 @@
 mod access;
 mod control;
 mod follow;
+mod h2;
 mod headers;
 mod images;
 mod limits;

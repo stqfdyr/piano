@@ -8,6 +8,7 @@ use http::Method;
 use http::header::{AUTHORIZATION, COOKIE, HOST};
 use piano_upstream::{AddrCache, Addrs, Origin, Resolver};
 use pingora_core::connectors::ConnectorOptions;
+use pingora_core::connectors::http::Connector as HttpConnector;
 use pingora_core::connectors::http::v1::Connector;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
@@ -58,6 +59,8 @@ pub(crate) struct AttemptLog {
     pub reused: Option<bool>,
     /// Time to set up a new connection, TCP and TLS.
     pub connect: Option<Duration>,
+    /// Protocol of the response, `h1` or `h2`.
+    pub proto: Option<&'static str>,
     /// Status of the response header the upstream sent.
     pub status: Option<u16>,
     /// What ended the attempt, if it failed.
@@ -73,6 +76,7 @@ impl AttemptLog {
             issued: Instant::now(),
             reused: None,
             connect: None,
+            proto: None,
             status: None,
             error: None,
         }
@@ -91,10 +95,11 @@ impl AttemptLog {
 pub(crate) struct Reach {
     pub resolver: Resolver,
     pub follow_addrs: AddrCache,
-    /// Connections for the requests the relay makes itself: media streams and image
-    /// fetches. A pool of its own: the relay's pool belongs to pingora's proxy loop,
-    /// which offers no way to borrow from it.
+    /// Connections for media streams. Pools of their own, here and below: the relay's
+    /// pool belongs to pingora's proxy loop, which offers no way to borrow from it.
     pub media: Connector,
+    /// Connections for image fetches, HTTP/2 where the upstream offers it.
+    pub images: HttpConnector,
 }
 
 impl std::fmt::Debug for Reach {
@@ -110,7 +115,8 @@ impl Reach {
         Self {
             resolver,
             follow_addrs: AddrCache::new(FOLLOW_ADDR_TTL),
-            media: Connector::new(Some(client)),
+            media: Connector::new(Some(client.clone())),
+            images: HttpConnector::new(Some(client)),
         }
     }
 
@@ -240,6 +246,15 @@ pub(crate) fn is_connect_failure(e: &ErrorType) -> bool {
             | ErrorType::ConnectError
             | ErrorType::TLSHandshakeTimedout
     )
+}
+
+/// The access log's name for an upstream response's protocol.
+pub(crate) fn proto_of(version: http::Version) -> &'static str {
+    if version == http::Version::HTTP_2 {
+        "h2"
+    } else {
+        "h1"
+    }
 }
 
 /// The longest prefix of `s` within `max` bytes that ends on a char boundary.

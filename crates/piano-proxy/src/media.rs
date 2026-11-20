@@ -53,8 +53,8 @@ const MAX_UNPRODUCTIVE: u8 = 4;
 const QUEUE: usize = 2;
 
 /// A redirect's connection is reused if its body arrives within this time and size.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-const DRAIN_MAX: usize = 64 * 1024;
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const DRAIN_MAX: usize = 64 * 1024;
 
 /// A request with a resumed or hedged response whose head cannot continue the body.
 const MISMATCH: ErrorType = ErrorType::Custom("ResumeMismatch");
@@ -666,7 +666,10 @@ async fn request(
             }
         };
         let status = resp.status.as_u16();
-        spec.note(entry, |a| a.status = Some(status));
+        spec.note(entry, |a| {
+            a.status = Some(status);
+            a.proto = Some("h1");
+        });
         if origin {
             crate::image::note_upstream(&spec.budget, &resp);
         }

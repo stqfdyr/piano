@@ -108,6 +108,10 @@ pub struct Upstream {
     pub read_timeout: Duration,
     /// Longest time an idle connection stays pooled.
     pub idle_timeout: Duration,
+    /// Offer HTTP/2 to upstreams for everything but media and the websocket, so
+    /// concurrent requests share one connection instead of each opening its own. Media
+    /// always uses HTTP/1.1.
+    pub h2: bool,
     /// Extra trust anchors, added to the system roots.
     pub extra_roots: Vec<PathBuf>,
 }
@@ -121,6 +125,7 @@ impl Default for Upstream {
             connect_timeout: Duration::from_secs(3),
             read_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(300),
+            h2: true,
             extra_roots: Vec::new(),
         }
     }
@@ -298,6 +303,9 @@ pub struct Site {
     /// while the upstream asks for a pause with 429.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_limit: Option<UpstreamLimit>,
+    /// Overrides `[upstream] h2` for this site's upstream and the hosts it redirects to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2: Option<bool>,
     /// Parsed form of `upstream`, filled in by validation.
     #[serde(skip)]
     pub upstream_url: Option<UpstreamUrl>,

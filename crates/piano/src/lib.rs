@@ -32,9 +32,13 @@ pub use control::ControlService;
 pub use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 pub use reload::Reloader;
 
-/// Idle upstream connections kept per pool; pingora's proxy and the media engine each
-/// have one.
+/// Idle upstream connections kept per pool. pingora's proxy, the media engine and the
+/// image engine each have an HTTP/1.1 pool; their HTTP/2 pools hold about one connection
+/// per upstream address, since a connection carries many requests.
 const UPSTREAM_POOL_SIZE: usize = 128;
+
+/// Upstream pools that can fill up: the HTTP/1.1 ones.
+const UPSTREAM_POOLS: u64 = 3;
 
 /// All services share one runtime: one worker per CPU, no extra threads.
 const RUNTIME_GROUP: &str = "piano";
@@ -202,7 +206,7 @@ pub fn level_filter(level: piano_config::LogLevel) -> log::LevelFilter {
 
 /// Raises the soft limit on open files to the hard limit, and warns when even that
 /// cannot hold `limits.max_connections` client connections with one upstream connection
-/// each, plus both upstream pools. Process-wide, so it belongs to the daemon's startup.
+/// each, plus the upstream pools. Process-wide, so it belongs to the daemon's startup.
 pub fn raise_open_file_limit(config: &Config) {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
@@ -220,7 +224,7 @@ pub fn raise_open_file_limit(config: &Config) {
         }
     }
     let conns = config.limits.max_connections as u64 * config.server.listen.len() as u64;
-    let need = conns * 2 + 2 * UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS;
+    let need = conns * 2 + UPSTREAM_POOLS * UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS;
     if limit < need {
         log::warn!(
             "open file limit {limit} is below the {need} that limits.max_connections = {} \
@@ -462,6 +466,10 @@ fn build_sites(
             Some(a) => a,
             None => Arc::new(resolver.resolve_blocking(&url.host, url.port)?),
         };
+        let mut options = options;
+        if let Some(h2) = site.h2 {
+            options.h2 = h2;
+        }
         let origin = Origin {
             host: url.host.clone(),
             port: url.port,

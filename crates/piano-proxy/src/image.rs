@@ -26,6 +26,8 @@ use http::header::{
 use http::{HeaderName, HeaderValue, Method};
 use piano_cache::{Budget, BudgetState, Lru, Wait, Weigh, image_key, shared_ttl};
 use piano_telemetry::Kind;
+use pingora_core::protocols::http::client::HttpSession;
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
@@ -676,7 +678,10 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
     let mut last = None;
     for _ in 0..MAX_ATTEMPTS {
         let host = reach::host_of(site, hop.as_ref()).to_owned();
-        let (peer, addrs, addr) = spec.reach.peer(site, hop.as_ref()).await?;
+        let (mut peer, addrs, addr) = spec.reach.peer(site, hop.as_ref()).await?;
+        if site.origin.options.h2 {
+            piano_upstream::offer_h2(&mut peer);
+        }
         let entry = {
             let mut log = lock(&spec.log);
             log.push(AttemptLog::new(0, host.clone(), addr));
@@ -687,7 +692,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
                 f(a);
             }
         };
-        let (mut http, reused) = match spec.reach.media.get_http_session(&peer).await {
+        let (mut http, reused) = match spec.reach.images.get_http_session(&peer).await {
             Ok(c) => c,
             Err(e) => {
                 note(&|a| a.error = Some(e.etype().as_str()));
@@ -704,11 +709,11 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             }
         };
         note(&|a| a.connected(reused));
-        http.read_timeout = peer.options.read_timeout;
-        http.write_timeout = peer.options.write_timeout;
+        http.set_read_timeout(peer.options.read_timeout);
+        http.set_write_timeout(peer.options.write_timeout);
         let mut req = spec.req.clone();
         reach::prepare_request(site, hop.as_ref(), &mut req)?;
-        let resp = match media::exchange(&mut http, req).await {
+        let resp = match request(&mut http, req).await {
             Ok(r) => r,
             Err(e) => {
                 note(&|a| a.error = Some(e.etype().as_str()));
@@ -724,7 +729,15 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             }
         };
         let status = resp.status.as_u16();
-        note(&|a| a.status = Some(status));
+        let proto = if http.as_http2().is_some() {
+            "h2"
+        } else {
+            "h1"
+        };
+        note(&|a| {
+            a.status = Some(status);
+            a.proto = Some(proto);
+        });
         if at_origin(site, hop.as_ref()) {
             note_upstream(&spec.budget, &resp);
         }
@@ -747,7 +760,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
                     .remember_moved(&spec.key, next.target.clone(), Instant::now());
             }
             hops += 1;
-            tokio::spawn(media::drain(Arc::clone(&spec.reach), http, peer));
+            tokio::spawn(drain(Arc::clone(&spec.reach), http, peer));
             hop = Some(next);
             continue;
         }
@@ -758,7 +771,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             );
             let idle = peer.options.idle_timeout;
             spec.reach
-                .media
+                .images
                 .release_http_session(http, &peer, idle)
                 .await;
             return Ok(Got::NotModified(ttl));
@@ -773,7 +786,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
         }
         let mut body = BytesMut::new();
         loop {
-            match http.read_body_bytes().await {
+            match http.read_response_body().await {
                 Ok(Some(data)) => {
                     site.counters.add_fetched(Kind::Image, data.len() as u64);
                     if body.len() + data.len() > MAX_IMAGE {
@@ -790,7 +803,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
         }
         let idle = peer.options.idle_timeout;
         spec.reach
-            .media
+            .images
             .release_http_session(http, &peer, idle)
             .await;
         return Ok(Got::Response(Arc::new(stored(
@@ -803,6 +816,42 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
     Err(last
         .unwrap_or_else(|| Error::explain(ErrorType::InternalError, "no upstream attempt"))
         .into_up())
+}
+
+/// Sends a bodiless request and reads the response header.
+async fn request(http: &mut HttpSession, req: RequestHeader) -> Result<ResponseHeader> {
+    http.write_request_header(Box::new(req)).await?;
+    http.finish_request_body().await?;
+    http.read_response_header().await?;
+    let resp = http
+        .response_header()
+        .ok_or_else(|| Error::explain(ErrorType::InvalidHTTPHeader, "no response header"))?;
+    if resp.status.is_informational() {
+        return Error::e_explain(
+            ErrorType::InvalidHTTPHeader,
+            "informational response to an image request",
+        );
+    }
+    Ok(resp.clone())
+}
+
+/// Reads the rest of a redirect's body so its connection or stream can be reused.
+async fn drain(reach: Arc<Reach>, mut http: HttpSession, peer: HttpPeer) {
+    let read = tokio::time::timeout(media::DRAIN_TIMEOUT, async {
+        let mut n = 0;
+        while let Some(b) = http.read_response_body().await? {
+            n += b.len();
+            if n > media::DRAIN_MAX {
+                return Ok(false);
+            }
+        }
+        Ok::<_, Box<Error>>(true)
+    })
+    .await;
+    if matches!(read, Ok(Ok(true))) {
+        let idle = peer.options.idle_timeout;
+        reach.images.release_http_session(http, &peer, idle).await;
+    }
 }
 
 /// The upstream's answer as kept and replayed; fresh for as long as it may be cached.

@@ -191,6 +191,7 @@ mod tests {
                 connect_timeout: d,
                 read_timeout: d,
                 idle_timeout: d,
+                h2: true,
             },
         };
         let policy = Policy {

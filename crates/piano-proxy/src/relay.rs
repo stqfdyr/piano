@@ -5,7 +5,7 @@ use crate::headers;
 use crate::image::{self, Images};
 use crate::media;
 use crate::reach::{
-    self, AttemptLog, CONNECT_RETRIES, Hop, REFUSED, Reach, clip, is_connect_failure,
+    self, AttemptLog, CONNECT_RETRIES, Hop, REFUSED, Reach, clip, is_connect_failure, proto_of,
 };
 use crate::rewrite::MAX_BODY;
 use crate::route::{self, HEALTH_PATH, RouteClass};
@@ -354,6 +354,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
             None => j.null("reused"),
         };
         opt_num(&mut j, "connect_ms", a.connect.map(millis));
+        opt_str(&mut j, "proto", a.proto);
         opt_num(&mut j, "status", a.status.map(u64::from));
         opt_str(&mut j, "error", a.error);
         j.end_object();
@@ -498,6 +499,9 @@ impl ProxyHttp for Relay {
             peer.options.read_timeout = None;
             peer.options.write_timeout = None;
         }
+        if site.origin.options.h2 && ctx.class.multiplexed() {
+            piano_upstream::offer_h2(&mut peer);
+        }
         ctx.attempt = Some(Attempt { addrs, addr });
         ctx.attempts.push(AttemptLog::new(0, host, addr));
         Ok(Box::new(peer))
@@ -566,6 +570,7 @@ impl ProxyHttp for Relay {
         let status = upstream_response.status.as_u16();
         if let Some(a) = ctx.attempts.last_mut() {
             a.status = Some(status);
+            a.proto = Some(proto_of(upstream_response.version));
         }
         ctx.ttfb = ctx.start.map(|s| s.elapsed());
         ctx.cf_ray = upstream_response.headers.get("cf-ray").cloned();

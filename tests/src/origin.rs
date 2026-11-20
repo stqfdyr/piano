@@ -119,6 +119,8 @@ struct State {
 pub struct Origin {
     pub addr: SocketAddr,
     requests: Arc<AtomicUsize>,
+    /// TLS connections accepted, by negotiated protocol: HTTP/1.1, HTTP/2.
+    conns: Arc<[AtomicUsize; 2]>,
     state: State,
     task: JoinHandle<()>,
 }
@@ -131,6 +133,15 @@ impl Origin {
 
     /// Starts the origin on `bind` with `leaf` as its certificate.
     pub async fn start_on(leaf: &Leaf, bind: SocketAddr) -> Self {
+        Self::start_with(leaf, bind, true).await
+    }
+
+    /// Starts an origin on a free loopback port that offers only HTTP/1.1.
+    pub async fn start_h1_only(leaf: &Leaf) -> Self {
+        Self::start_with(leaf, SocketAddr::from(([127, 0, 0, 1], 0)), false).await
+    }
+
+    async fn start_with(leaf: &Leaf, bind: SocketAddr, h2: bool) -> Self {
         let chain = CertificateDer::pem_slice_iter(leaf.cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -142,13 +153,19 @@ impl Origin {
                 .with_no_client_auth()
                 .with_single_cert(chain, key)
                 .unwrap();
-        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tls.alpn_protocols = if h2 {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
         let acceptor = TlsAcceptor::from(Arc::new(tls));
 
         let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&requests);
+        let conns: Arc<[AtomicUsize; 2]> = Arc::default();
+        let conn_counter = Arc::clone(&conns);
         let state = State::default();
         let shared = state.clone();
         let task = tokio::spawn(async move {
@@ -158,11 +175,14 @@ impl Origin {
                 };
                 let acceptor = acceptor.clone();
                 let counter = Arc::clone(&counter);
+                let conn_counter = Arc::clone(&conn_counter);
                 let state = shared.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
+                    let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+                    conn_counter[usize::from(is_h2)].fetch_add(1, Ordering::Relaxed);
                     let service = service_fn(move |req| {
                         counter.fetch_add(1, Ordering::Relaxed);
                         handle(req, state.clone())
@@ -176,6 +196,7 @@ impl Origin {
         Self {
             addr,
             requests,
+            conns,
             state,
             task,
         }
@@ -184,6 +205,14 @@ impl Origin {
     /// Requests served so far.
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::Relaxed)
+    }
+
+    /// TLS connections accepted so far: (HTTP/1.1, HTTP/2).
+    pub fn connections(&self) -> (usize, usize) {
+        (
+            self.conns[0].load(Ordering::Relaxed),
+            self.conns[1].load(Ordering::Relaxed),
+        )
     }
 
     /// The `Range` header of each scripted media file request for `key`, in order.
@@ -218,6 +247,13 @@ fn full(body: impl Into<Bytes>) -> ResBody {
 }
 
 async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<ResBody>, Infallible> {
+    // HTTP/2 carries the host as :authority; routes and echoes read it as Host.
+    if !req.headers().contains_key(hyper::header::HOST)
+        && let Some(authority) = req.uri().authority()
+        && let Ok(v) = hyper::header::HeaderValue::from_str(authority.as_str())
+    {
+        req.headers_mut().insert(hyper::header::HOST, v);
+    }
     if req.uri().path().eq_ignore_ascii_case("/embywebsocket") {
         return Ok(websocket(&mut req));
     }
@@ -237,7 +273,12 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
             .header(CONTENT_TYPE, "application/json; charset=utf-8")
             .body(full(INFO_PUBLIC))
     } else if path.starts_with("/__echo") {
-        let mut text = format!("{} {} {:?}\n", req.method(), req.uri(), req.version());
+        let mut text = format!(
+            "{} {} {:?}\n",
+            req.method(),
+            req.uri().path_and_query().map_or("/", |p| p.as_str()),
+            req.version()
+        );
         for (name, value) in req.headers() {
             text.push_str(&format!(
                 "{name}: {}\n",

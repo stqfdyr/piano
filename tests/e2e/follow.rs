@@ -83,7 +83,11 @@ async fn follows_listed_hosts_keeping_path_bytes() {
             let (code, body) = text(w.get(proto, &redirect(&to, status))).await;
             assert_eq!(code, 200, "{proto:?} {status}: {body}");
             let mut lines = body.lines();
-            assert_eq!(lines.next(), Some(format!("GET {path} HTTP/1.1").as_str()));
+            let line = lines
+                .next()
+                .and_then(|l| l.rsplit_once(' '))
+                .map(|(l, _)| l);
+            assert_eq!(line, Some(format!("GET {path}").as_str()), "{body}");
             let host = format!("host: {VOD}:{}", w.port());
             assert!(body.lines().any(|l| l == host), "{body}");
         }
