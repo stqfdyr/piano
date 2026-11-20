@@ -100,6 +100,18 @@ pub struct HttpServerOptions {
     ///
     /// Default: `None`
     pub h2_idle_timeout: Option<Duration>,
+
+    /// How long a downstream HTTP/1 connection waits for its next request, the first one
+    /// included, in whole seconds (at least one).
+    ///
+    /// Default: `None`, 60 seconds for the first request and no limit after it.
+    pub h1_keepalive_timeout: Option<Duration>,
+
+    /// Limit on each read of an HTTP/1 request head once its first bytes arrived, so a
+    /// client cannot hold a connection open for the whole keepalive timeout per read.
+    ///
+    /// Default: `None`, the keepalive timeout applies to those reads too.
+    pub h1_header_read_timeout: Option<Duration>,
 }
 
 /// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
@@ -373,14 +385,22 @@ where
             let h1_header_count_limit = self
                 .server_options()
                 .map_or_else(HeaderLimit::default, |opts| opts.h1_header_count_limit);
+            let h1_keepalive = self
+                .server_options()
+                .and_then(|opts| opts.h1_keepalive_timeout)
+                .map(|d| d.as_secs().max(1));
+            let h1_header_read_timeout = self
+                .server_options()
+                .and_then(|opts| opts.h1_header_read_timeout);
             let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
             if *shutdown.borrow() {
                 // stop downstream from reusing if this service is shutting down soon
                 session.set_keepalive(None);
             } else {
                 // default 60s
-                session.set_keepalive(Some(60));
+                session.set_keepalive(Some(h1_keepalive.unwrap_or(60)));
             }
+            session.set_header_read_timeout(h1_header_read_timeout);
             session.set_keepalive_reuses_remaining(
                 self.server_options()
                     .and_then(|opts| opts.keepalive_request_limit),
@@ -392,8 +412,14 @@ where
                 let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
                 // Keepalive reuse creates a fresh session, so reapply listener parser settings.
                 session.set_h1_header_count_limit(h1_header_count_limit);
+                session.set_header_read_timeout(h1_header_read_timeout);
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
+                }
+                // Reading a request turns keepalive on without a limit; restore the
+                // configured one for the wait that follows.
+                if h1_keepalive.is_some() && session.get_keepalive().is_some() {
+                    session.set_keepalive(h1_keepalive);
                 }
 
                 result = self.process_new_http(session, shutdown).await;

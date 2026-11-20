@@ -357,6 +357,14 @@ where
         }
     }
 
+    /// Set the limit on each read of an HTTP/1 request head after its first bytes. Noop for
+    /// h2, subrequest and custom sessions.
+    pub fn set_header_read_timeout(&mut self, timeout: Option<Duration>) {
+        if let Self::H1(s) = self {
+            s.set_header_read_timeout(timeout);
+        }
+    }
+
     /// Get the keepalive timeout. None if keepalive is disabled. Not applicable for h2 or
     /// subrequest
     pub fn get_keepalive(&self) -> Option<u64> {

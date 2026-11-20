@@ -107,6 +107,9 @@ pub struct HttpSession {
     update_resp_headers: bool,
     /// timeouts:
     keepalive_timeout: KeepaliveStatus,
+    /// Limit on each read of a request head once its first bytes arrived; the keepalive
+    /// timeout only covers the wait for those first bytes.
+    header_read_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     /// How long to wait to make downstream session reusable, if body needs to be drained.
@@ -191,6 +194,7 @@ impl HttpSession {
             proxy_task_state: ProxyTaskState::default(),
             body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
+            header_read_timeout: None,
             update_resp_headers: true,
             response_written: None,
             request_header: None,
@@ -225,28 +229,40 @@ impl HttpSession {
     ) -> Result<Option<usize>> {
         let read_result = {
             let read_event = self.underlying_stream.read_buf(buf);
-            match self.keepalive_timeout {
-                KeepaliveStatus::Timeout(d) => match timeout(d, read_event).await {
+            if let Some(t) = self.header_read_timeout.filter(|_| already_read > 0) {
+                match timeout(t, read_event).await {
                     Ok(res) => res,
+                    // Closed quietly like an idle keepalive connection: a stalled client
+                    // is not an error of this server.
                     Err(e) => {
-                        debug!("keepalive timeout {d:?} reached, {e}");
+                        debug!("request header read timeout {t:?} reached, {e}");
                         return Ok(None);
                     }
-                },
-                KeepaliveStatus::Infinite => {
-                    // FIXME: this should only apply to reads between requests
-                    read_event.await
                 }
-                KeepaliveStatus::Off => match self.read_timeout {
-                    Some(t) => match timeout(t, read_event).await {
+            } else {
+                match self.keepalive_timeout {
+                    KeepaliveStatus::Timeout(d) => match timeout(d, read_event).await {
                         Ok(res) => res,
                         Err(e) => {
-                            debug!("read timeout {t:?} reached, {e}");
-                            return Error::e_explain(ReadTimedout, format!("timeout: {t:?}"));
+                            debug!("keepalive timeout {d:?} reached, {e}");
+                            return Ok(None);
                         }
                     },
-                    None => read_event.await,
-                },
+                    KeepaliveStatus::Infinite => {
+                        // FIXME: this should only apply to reads between requests
+                        read_event.await
+                    }
+                    KeepaliveStatus::Off => match self.read_timeout {
+                        Some(t) => match timeout(t, read_event).await {
+                            Ok(res) => res,
+                            Err(e) => {
+                                debug!("read timeout {t:?} reached, {e}");
+                                return Error::e_explain(ReadTimedout, format!("timeout: {t:?}"));
+                            }
+                        },
+                        None => read_event.await,
+                    },
+                }
             }
         };
 
@@ -1377,6 +1393,12 @@ impl HttpSession {
     /// to read from the stream after `timeout`.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         self.read_timeout = timeout;
+    }
+
+    /// Set the limit on each read of a request head after its first bytes. `None`: those
+    /// reads use the keepalive timeout, or the read timeout when keepalive is off.
+    pub fn set_header_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.header_read_timeout = timeout;
     }
 
     /// Gets the downstream read timeout.
