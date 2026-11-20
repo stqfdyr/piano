@@ -94,41 +94,27 @@ fn trim(b: &[u8]) -> &[u8] {
     b.trim_ascii()
 }
 
-/// Removes the named cookies. Several `Cookie` headers (as HTTP/2 clients send them) are
-/// joined into one, which is the only form HTTP/1.1 upstreams must accept.
-pub fn strip_cookies(names: &[String], req: &mut RequestHeader) -> Result<()> {
-    if names.is_empty() {
+/// Joins several `Cookie` headers into one, as RFC 9113 §8.2.3 requires when an
+/// HTTP/2 request (where clients send one header per cookie) goes on over HTTP/1.1,
+/// whose servers only need to accept one.
+pub fn join_cookies(req: &mut RequestHeader) -> Result<()> {
+    if req.headers.get_all(COOKIE).iter().nth(1).is_none() {
         return Ok(());
     }
-    let mut values = req.headers.get_all(COOKIE).iter().peekable();
-    if values.peek().is_none() {
-        return Ok(());
-    }
-    let mut changed = req.headers.get_all(COOKIE).iter().count() > 1;
-    let mut kept = Vec::new();
-    for value in values {
-        for pair in value.as_bytes().split(|&b| b == b';').map(trim) {
-            let name = pair
-                .split(|&b| b == b'=')
-                .next()
-                .map(trim)
-                .unwrap_or_default();
-            if pair.is_empty() || names.iter().any(|n| n.as_bytes() == name) {
-                changed = true;
-                continue;
-            }
-            if !kept.is_empty() {
-                kept.extend_from_slice(b"; ");
-            }
-            kept.extend_from_slice(pair);
+    let mut joined = Vec::new();
+    for value in req.headers.get_all(COOKIE) {
+        let value = trim(value.as_bytes());
+        if value.is_empty() {
+            continue;
         }
-    }
-    if !changed {
-        return Ok(());
+        if !joined.is_empty() {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(value);
     }
     req.remove_header(&COOKIE);
-    if !kept.is_empty() {
-        let joined = HeaderValue::from_bytes(&kept)
+    if !joined.is_empty() {
+        let joined = HeaderValue::from_bytes(&joined)
             .or_err(ErrorType::InvalidHTTPHeader, "joining cookies")?;
         req.insert_header(COOKIE, joined)?;
     }
@@ -268,24 +254,18 @@ mod tests {
     }
 
     #[test]
-    fn named_cookies_are_stripped_and_headers_joined() {
-        let strip = vec!["upstream_session".to_owned()];
+    fn cookie_headers_are_joined() {
         for (input, want) in [
-            (vec!["a=1; upstream_session=x; b=2"], vec!["a=1; b=2"]),
-            (vec!["upstream_session=x"], vec![]),
-            (vec!["a=1", "upstream_session=x", "b=2"], vec!["a=1; b=2"]),
-            (vec!["a=1;b=2"], vec!["a=1;b=2"]),
             (vec!["a=1", "b=2"], vec!["a=1; b=2"]),
-            (vec!["upstream_session2=y"], vec!["upstream_session2=y"]),
+            (vec!["a=1; b=2", " c=3 ", ""], vec!["a=1; b=2; c=3"]),
+            (vec!["a=1;b=2"], vec!["a=1;b=2"]),
+            (vec!["", ""], vec![]),
         ] {
             let headers: Vec<(&str, &str)> = input.iter().map(|v| ("cookie", *v)).collect();
             let mut r = req(&headers);
-            strip_cookies(&strip, &mut r).unwrap();
+            join_cookies(&mut r).unwrap();
             assert_eq!(values(&r, "cookie"), want, "{input:?}");
         }
-        let mut r = req(&[("cookie", "a=1"), ("cookie", "b=2")]);
-        strip_cookies(&[], &mut r).unwrap();
-        assert_eq!(values(&r, "cookie"), ["a=1", "b=2"]);
     }
 
     #[test]

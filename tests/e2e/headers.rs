@@ -6,8 +6,7 @@ use piano_e2e::pki::Ca;
 use piano_e2e::relay::{Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
 
-const SITE_TOML: &str = r#"cookies.strip = ["upstream_session"]
-[[site.ua]]
+const SITE_TOML: &str = r#"[[site.ua]]
 match = '^$|(?i)^curl/'
 set = "EmbyMini/0.1.0"
 "#;
@@ -65,7 +64,8 @@ async fn request_policy_hides_the_client_and_applies_site_rules() {
                 ("x-real-ip", "192.0.2.1"),
                 ("cf-connecting-ip", "192.0.2.1"),
                 ("forwarded", "for=192.0.2.1"),
-                ("cookie", "a=1; upstream_session=x; b=2"),
+                ("cookie", "a=1; b=2"),
+                ("cookie", "c=3"),
                 ("user-agent", "curl/8.5.0"),
             ],
         )
@@ -75,7 +75,10 @@ async fn request_policy_hides_the_client_and_applies_site_rules() {
             "{proto:?}: {lines:?}"
         );
         assert!(
-            lines.contains(&"cookie: a=1; b=2".to_owned()),
+            lines
+                .iter()
+                .filter(|l| l.starts_with("cookie:"))
+                .eq(["cookie: a=1; b=2; c=3"].iter()),
             "{proto:?}: {lines:?}"
         );
         assert!(

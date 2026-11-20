@@ -25,7 +25,6 @@ pub struct Policy {
     pub follow: FollowRules,
     pub block: BlockList,
     pub ua: UaRules,
-    pub strip_cookies: Vec<String>,
     pub rewriter: Rewriter,
     pub server_domains: ServerDomains,
 }
@@ -59,7 +58,6 @@ impl Policy {
             follow,
             block: BlockList::new(&site.block),
             ua: UaRules::new(&site.ua)?,
-            strip_cookies: site.cookies.strip.clone(),
             rewriter: Rewriter::new(names)?,
             server_domains: site.server_domains,
         })
@@ -144,7 +142,6 @@ mod tests {
             follow: FollowRules::default(),
             block: BlockList::default(),
             ua: UaRules::default(),
-            strip_cookies: Vec::new(),
             rewriter: Rewriter::new(Vec::new()).unwrap(),
             server_domains: ServerDomains::default(),
         };

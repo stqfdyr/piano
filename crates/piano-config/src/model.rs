@@ -107,8 +107,6 @@ pub struct Site {
     /// case and an optional leading `/emby`.
     #[serde(default)]
     pub block: Vec<String>,
-    #[serde(default)]
-    pub cookies: Cookies,
     /// User-Agent rewrites, tried in order; the first match wins.
     #[serde(default)]
     pub ua: Vec<UaRule>,
@@ -132,14 +130,6 @@ pub enum ServerDomains {
     Block,
     /// Relayed unchanged.
     Pass,
-}
-
-/// Cookie handling towards the upstream.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Cookies {
-    /// Cookie names removed from requests.
-    pub strip: Vec<String>,
 }
 
 /// Replace the User-Agent sent upstream when the client's matches `pattern`. A missing

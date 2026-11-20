@@ -368,7 +368,7 @@ impl ProxyHttp for Relay {
         }
         headers::scrub_request(upstream_request);
         headers::rewrite_user_agent(&site.policy.ua, upstream_request)?;
-        headers::strip_cookies(&site.policy.strip_cookies, upstream_request)?;
+        headers::join_cookies(upstream_request)?;
         Ok(())
     }
 
