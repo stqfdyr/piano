@@ -46,6 +46,8 @@ pub struct Admin {
     /// One reload at a time, whichever way it was asked for.
     reloading: tokio::sync::Mutex<()>,
     state: Mutex<State>,
+    /// How to start a successor; upgrades are off without it.
+    relaunch: std::sync::OnceLock<crate::upgrade::Relaunch>,
 }
 
 impl Admin {
@@ -63,7 +65,33 @@ impl Admin {
                 last_reload: None,
                 restart_needed: Vec::new(),
             }),
+            relaunch: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Enables `upgrade`: a successor is started the way `relaunch` says.
+    pub fn set_relaunch(&self, relaunch: crate::upgrade::Relaunch) {
+        let _ = self.relaunch.set(relaunch);
+    }
+
+    /// Hands the listening sockets to a new process started from `binary`, by default
+    /// the binary this one started from.
+    pub async fn upgrade(&self, binary: Option<PathBuf>) -> proto::UpgradeReply {
+        match self.relaunch.get() {
+            Some(r) => self.live.upgrade(r, binary).await,
+            None => proto::UpgradeReply {
+                schema: proto::UPGRADE_SCHEMA,
+                ok: false,
+                error: Some("this daemon cannot start a successor".to_owned()),
+                config_error: false,
+                version: None,
+                old_pid: std::process::id(),
+                new_pid: None,
+                ready_ms: None,
+                draining_streams: 0,
+                drain_limit_secs: 0,
+            },
+        }
     }
 
     pub fn live(&self) -> &Arc<Live> {

@@ -7,6 +7,7 @@ mod control;
 mod procfs;
 mod reload;
 pub mod traffic;
+pub mod upgrade;
 
 use arc_swap::ArcSwap;
 use piano_config::Config;
@@ -21,12 +22,12 @@ use pingora_core::connectors::ConnectorOptions;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::listeners::{AcceptLimits, AcceptStats, ListenerConfig, TcpSocketOptions};
 use pingora_core::server::Server;
-use pingora_core::server::configuration::ServerConf;
+use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_proxy::ProxyServiceBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 pub use admin::Admin;
 pub use control::ControlService;
@@ -142,8 +143,45 @@ pub struct Live {
     images: Arc<Images>,
     ledger: traffic::Ledger,
     stop: Arc<Stop>,
-    /// Client connections open when the shutdown's grace period last looked.
-    left_open: Arc<AtomicUsize>,
+    drain: Arc<Drain>,
+    /// Turns true once the relay accepts on its listening sockets.
+    listening: tokio::sync::watch::Receiver<bool>,
+    upgrader: Arc<upgrade::Upgrader>,
+    /// The control socket, which upgrades place their own sockets next to.
+    control: Option<PathBuf>,
+    /// The process this one took over from in an upgrade, which may still be draining.
+    predecessor: Option<u32>,
+    /// Turns true once this process told its predecessor that it serves.
+    taken_over: tokio::sync::watch::Sender<bool>,
+    /// `piano stop` asks for a stop as on SIGTERM.
+    stop_requested: tokio::sync::Notify,
+}
+
+/// When the drain after a terminate signal or an upgrade has to end, and what it cut.
+#[derive(Default)]
+struct Drain {
+    until: Mutex<Option<Instant>>,
+    /// Client connections still open when the drain ended at its limit.
+    left_open: AtomicUsize,
+}
+
+impl Drain {
+    /// Ends the drain `after` from now at the latest.
+    fn limit(&self, after: Duration) {
+        let until = Instant::now() + after;
+        let mut u = self
+            .until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *u = Some(u.map_or(until, |c| c.min(until)));
+    }
+
+    fn over(&self) -> bool {
+        self.until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|u| Instant::now() >= u)
+    }
 }
 
 /// Settings read once at startup; a reload that changes them only warns.
@@ -152,6 +190,7 @@ struct Fixed {
     listen: Vec<String>,
     threads: usize,
     shutdown_timeout: piano_config::Duration,
+    drain_timeout: piano_config::Duration,
     extra_roots: Vec<PathBuf>,
     handshake_timeout: piano_config::Duration,
     keepalive_timeout: piano_config::Duration,
@@ -166,6 +205,7 @@ impl Fixed {
             listen: config.server.listen.clone(),
             threads: config.server.threads,
             shutdown_timeout: config.server.shutdown_timeout,
+            drain_timeout: config.server.drain_timeout,
             extra_roots: config.upstream.extra_roots.clone(),
             handshake_timeout: config.limits.handshake_timeout,
             keepalive_timeout: config.limits.keepalive_timeout,
@@ -186,6 +226,9 @@ impl Fixed {
         }
         if self.shutdown_timeout != other.shutdown_timeout {
             out.push("server.shutdown_timeout");
+        }
+        if self.drain_timeout != other.drain_timeout {
+            out.push("server.drain_timeout");
         }
         if self.extra_roots != other.extra_roots {
             out.push("upstream.extra_roots");
@@ -246,6 +289,16 @@ pub fn raise_open_file_limit(config: &Config) {
 
 /// Builds a ready-to-run server: listeners, access control, TLS and the relay service.
 pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
+    build_with(config, resolver, None)
+}
+
+/// Like [`build`]; with `predecessor`, the server takes its listening sockets over from
+/// that process, which is upgrading.
+pub fn build_with(
+    config: &Config,
+    resolver: Resolver,
+    predecessor: Option<u32>,
+) -> Result<Daemon, Error> {
     let certs = Arc::new(CertStore::new(SniTable::load(config)?));
     let server_tls = piano_edge::tls::server_config(Arc::clone(&certs))?;
     let client_tls = piano_upstream::tls::client_config(&config.upstream.extra_roots)?;
@@ -266,13 +319,28 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         work_stealing: false,
         upstream_keepalive_pool_size: UPSTREAM_POOL_SIZE,
         max_retries: MAX_ATTEMPTS,
-        grace_period_seconds: Some(shutdown_secs(config)),
+        grace_period_seconds: Some(
+            whole_secs(config.server.drain_timeout)
+                .saturating_add(whole_secs(config.server.shutdown_timeout)),
+        ),
         graceful_shutdown_timeout_seconds: Some(RUNTIME_EXIT_WAIT),
+        upgrade_sock: next_to(config.control.socket_path(), ".upgrade").map_or_else(
+            || "/run/piano/upgrade.sock".to_owned(),
+            |p| p.to_string_lossy().into_owned(),
+        ),
+        upgrade_sock_connect_accept_max_retries: Some(upgrade::HANDOFF_ATTEMPTS),
         pid_file: "/run/piano/piano.pid".to_owned(),
-        upgrade_sock: "/run/piano/upgrade.sock".to_owned(),
         ..ServerConf::default()
     };
-    let mut server = Server::new_with_opt_and_conf(None, conf);
+    let opt = predecessor.map(|_| Opt {
+        upgrade: true,
+        ..Opt::default()
+    });
+    let mut server = Server::new_with_opt_and_conf(opt, conf);
+    if predecessor.is_some() {
+        // Receives the listening sockets; exits the process if none come.
+        server.bootstrap();
+    }
     let conf = Arc::clone(&server.configuration);
 
     let mut client = ConnectorOptions::from_server_conf(&conf);
@@ -318,16 +386,31 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
                 .accept_limits(limits),
         );
     }
+    let listening = service.watch_listening();
     server.add_service(service);
-    let left_open = Arc::new(AtomicUsize::new(0));
+    let drain = Arc::new(Drain::default());
     server.set_drained_check({
         let accept = Arc::clone(&accept);
-        let left_open = Arc::clone(&left_open);
+        let drain = Arc::clone(&drain);
         move || {
             let open = accept.open_connections();
-            left_open.store(open, Ordering::Relaxed);
-            open == 0
+            if open == 0 {
+                return true;
+            }
+            if drain.over() {
+                drain.left_open.store(open, Ordering::Relaxed);
+                return true;
+            }
+            false
         }
+    });
+    let upgrader = Arc::new(upgrade::Upgrader::default());
+    server.set_upgrade_handoff({
+        let upgrader = Arc::clone(&upgrader);
+        Box::new(move |sent| {
+            let upgrader = Arc::clone(&upgrader);
+            Box::pin(async move { upgrader.handoff(sent).await })
+        })
     });
 
     let (ledger, warning) = traffic::Ledger::open(config.traffic.file_path());
@@ -348,19 +431,35 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         images,
         ledger,
         stop,
-        left_open,
+        drain,
+        listening,
+        upgrader,
+        control: config.control.socket_path().map(Path::to_owned),
+        predecessor,
+        taken_over: tokio::sync::watch::Sender::new(false),
+        stop_requested: tokio::sync::Notify::new(),
     });
     Ok(Daemon { server, live })
 }
 
-/// The longest wait for open requests after a terminate signal, in whole seconds.
-fn shutdown_secs(config: &Config) -> u64 {
-    let ms = config.server.shutdown_timeout.get().as_millis();
-    u64::try_from(ms.div_ceil(1000)).unwrap_or(u64::MAX)
+/// `d` in whole seconds, rounded up.
+fn whole_secs(d: piano_config::Duration) -> u64 {
+    u64::try_from(d.get().as_millis().div_ceil(1000)).unwrap_or(u64::MAX)
 }
 
-/// Passes on the shutdown signals of `inner`; on terminate, first ends the work that
-/// would otherwise hold the shutdown back for its whole timeout.
+/// `path` with `suffix` appended to its file name.
+fn next_to(path: Option<&Path>, suffix: &str) -> Option<PathBuf> {
+    path.map(|p| {
+        let mut s = p.as_os_str().to_owned();
+        s.push(suffix);
+        PathBuf::from(s)
+    })
+}
+
+/// Passes on the shutdown signals of `inner`, and an upgrade when `piano upgrade` asks
+/// for one. On terminate, first ends the work that would otherwise hold the shutdown back
+/// for its whole timeout. SIGQUIT does not upgrade: without a new process waiting for
+/// the sockets, pingora would just stop.
 struct Signals {
     inner: Box<dyn ShutdownSignalWatch + Send + Sync>,
     live: Arc<Live>,
@@ -369,16 +468,23 @@ struct Signals {
 #[async_trait::async_trait]
 impl ShutdownSignalWatch for Signals {
     async fn recv(&self) -> ShutdownSignal {
-        let signal = self.inner.recv().await;
-        if matches!(signal, ShutdownSignal::GracefulTerminate) {
-            self.live.stop.terminate();
-            log::info!(
-                "stopping: {} client connections open, waiting up to {}s for their requests",
-                self.live.accept.open_connections(),
-                self.live.fixed.shutdown_timeout.get().as_secs_f64(),
-            );
+        loop {
+            let signal = tokio::select! {
+                s = self.inner.recv() => s,
+                () = self.live.upgrader.requested() => return ShutdownSignal::GracefulUpgrade,
+                () = self.live.stop_requested.notified() => ShutdownSignal::GracefulTerminate,
+            };
+            match signal {
+                ShutdownSignal::GracefulUpgrade => {
+                    log::warn!("SIGQUIT ignored; upgrade with `piano upgrade`");
+                }
+                ShutdownSignal::GracefulTerminate => {
+                    self.live.terminate();
+                    return signal;
+                }
+                ShutdownSignal::FastShutdown => return signal,
+            }
         }
-        signal
     }
 }
 
@@ -460,14 +566,71 @@ impl Live {
         })
     }
 
-    /// Call once the server has stopped: reports connections cut at the shutdown
-    /// timeout, then writes the traffic record and the access log.
+    /// Ends media streams and gives the requests in progress `shutdown_timeout`; a
+    /// predecessor still draining gets the signal too.
+    fn terminate(&self) {
+        self.stop.terminate();
+        self.drain.limit(self.fixed.shutdown_timeout.get());
+        log::info!(
+            "stopping: {} client connections open, waiting up to {}s for their requests",
+            self.accept.open_connections(),
+            self.fixed.shutdown_timeout.get().as_secs_f64(),
+        );
+        if let Some(pid) = self.predecessor {
+            upgrade::forward_terminate(pid);
+        }
+    }
+
+    /// After handing the sockets to a new process: keep the media streams until they
+    /// end or `drain_timeout` passes; a terminate signal shortens that as usual.
+    fn drain_after_upgrade(self: &Arc<Self>) {
+        self.drain.limit(self.fixed.drain_timeout.get());
+        let live = Arc::clone(self);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    term.recv().await;
+                    live.terminate();
+                }
+                Err(e) => log::warn!("cannot watch for the terminate signal while draining: {e}"),
+            }
+        });
+    }
+
+    /// Stops the daemon as SIGTERM does. Under systemd after an upgrade, the main process
+    /// is not systemd's child, so systemd cannot wait for it on its own: `ExecStop=piano
+    /// stop` waits instead.
+    pub fn request_stop(&self) -> piano_ctl::proto::StopReply {
+        self.stop_requested.notify_one();
+        piano_ctl::proto::StopReply {
+            schema: piano_ctl::proto::STOP_SCHEMA,
+            pid: std::process::id(),
+            limit_secs: whole_secs(self.fixed.shutdown_timeout),
+        }
+    }
+
+    /// Where a new process reports that it serves during an upgrade.
+    fn ready_socket(&self) -> Option<PathBuf> {
+        next_to(self.control.as_deref(), ".ready")
+    }
+
+    /// The upgrade to the binary this process started from, or `binary`.
+    pub async fn upgrade(
+        self: &Arc<Self>,
+        relaunch: &upgrade::Relaunch,
+        binary: Option<PathBuf>,
+    ) -> piano_ctl::proto::UpgradeReply {
+        upgrade::upgrade(self, relaunch, binary).await
+    }
+
+    /// Call once the server has stopped: reports connections cut at the drain limit,
+    /// then writes the traffic record and the access log.
     pub fn stopped(&self) {
-        let cut = self.left_open.swap(0, Ordering::Relaxed);
+        let cut = self.drain.left_open.swap(0, Ordering::Relaxed);
         if cut > 0 {
             log::warn!(
-                "stopped with {cut} client connections still open after {}s; they were cut",
-                self.fixed.shutdown_timeout.get().as_secs_f64()
+                "stopped with {cut} client connections still open at the drain limit; they were cut"
             );
         }
         self.record_traffic();

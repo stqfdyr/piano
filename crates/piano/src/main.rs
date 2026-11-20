@@ -8,7 +8,7 @@ mod top;
 
 use clap::{Parser, Subcommand};
 use piano_ctl::ClientError;
-use piano_ctl::proto::{CacheStats, PurgeReply, ReloadReply, Status};
+use piano_ctl::proto::{CacheStats, PurgeReply, ReloadReply, Status, StopReply, UpgradeReply};
 use piano_upstream::Resolver;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -30,6 +30,8 @@ mod exit {
 /// resolves new upstream names, which can take several resolver timeouts.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// An upgrade checks the new binary, waits for it to load and to take the sockets.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Parser)]
 #[command(name = "piano", version, about = "Emby relay")]
@@ -58,7 +60,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the daemon in the foreground.
-    Run,
+    Run {
+        /// Write the process id to this file once serving, and again after an upgrade
+        /// (for OpenRC); removed at exit unless a successor took it over.
+        #[arg(long)]
+        pidfile: Option<PathBuf>,
+        /// Take the listening sockets over from this process, which is upgrading. Used
+        /// by `piano upgrade`.
+        #[arg(long, hide = true)]
+        takeover: Option<u32>,
+    },
+    /// Replace the running daemon by a new process without dropping streams: the new
+    /// process takes over the listening sockets, the old one keeps its media streams
+    /// until they end (server.drain_timeout at most). Also applies settings that need a
+    /// restart.
+    /// Stop the daemon as SIGTERM does and wait until it has exited. Use as systemd's
+    /// ExecStop: after an upgrade the daemon is not systemd's child, so systemd could not
+    /// wait for it.
+    Stop,
+    Upgrade {
+        /// The new binary; by default the file the daemon was started from, which may
+        /// have been replaced since.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
     /// Show what the running daemon is doing and anything that needs attention.
     Status,
     /// Reread the configuration file and certificates; the running configuration stays
@@ -180,13 +205,24 @@ fn main() -> ExitCode {
         Command::Cache {
             command: CacheCommand::Purge,
         } => cache_purge(&cli),
-        Command::Run => {
+        Command::Upgrade { ref binary } => upgrade(&cli, binary.as_deref()),
+        Command::Stop => stop(&cli),
+        Command::Run {
+            ref pidfile,
+            takeover,
+        } => {
             let level = level_override.unwrap_or(log::LevelFilter::Info);
             if let Err(e) = piano_telemetry::logger::init(level) {
                 eprintln!("cannot install logger: {e}");
                 return ExitCode::from(exit::RUNTIME);
             }
-            run(&cli.config, level_override)
+            let relaunch = piano::upgrade::Relaunch {
+                exe: exe_path(),
+                config: absolute(&cli.config),
+                log_level: cli.log_level.clone(),
+                pidfile: pidfile.as_deref().map(absolute),
+            };
+            run(&relaunch, level_override, takeover)
         }
     }
 }
@@ -301,6 +337,72 @@ fn top(cli: &Cli, interval: f64) -> ExitCode {
             eprintln!("terminal: {e}");
             ExitCode::from(exit::RUNTIME)
         }
+    }
+}
+
+/// The binary as this process was started from: a file installed over it later is what
+/// an upgrade runs.
+fn exe_path() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("piano"))
+}
+
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_owned())
+}
+
+/// Extra time `stop` allows beyond the daemon's own limit, for its exit itself.
+const STOP_MARGIN: Duration = Duration::from_secs(5);
+
+fn stop(cli: &Cli) -> ExitCode {
+    let reply: StopReply = match ask(cli, "stop", STATUS_TIMEOUT) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(reply.limit_secs) + STOP_MARGIN;
+    let proc_dir = PathBuf::from(format!("/proc/{}", reply.pid));
+    while proc_dir.exists() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "pid {} is still running {}s after it was asked to stop",
+                reply.pid,
+                (Duration::from_secs(reply.limit_secs) + STOP_MARGIN).as_secs()
+            );
+            return ExitCode::from(exit::RUNTIME);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if cli.json {
+        print_json(&reply);
+    } else {
+        println!("pid {} stopped", reply.pid);
+    }
+    ExitCode::SUCCESS
+}
+
+fn upgrade(cli: &Cli, binary: Option<&Path>) -> ExitCode {
+    let cmd = match binary {
+        None => "upgrade".to_owned(),
+        Some(b) => match std::fs::canonicalize(b) {
+            Ok(b) => format!("upgrade {}", b.display()),
+            Err(e) => {
+                eprintln!("{}: {e}", b.display());
+                return ExitCode::from(exit::RUNTIME);
+            }
+        },
+    };
+    let reply: UpgradeReply = match ask(cli, &cmd, UPGRADE_TIMEOUT) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if cli.json {
+        print_json(&reply);
+    } else {
+        print!("{}", render::upgrade(&reply));
+    }
+    match (reply.ok, reply.config_error) {
+        (true, _) => ExitCode::SUCCESS,
+        (false, true) => ExitCode::from(exit::CONFIG),
+        (false, false) => ExitCode::from(exit::RUNTIME),
     }
 }
 
@@ -501,7 +603,12 @@ fn config_check(path: &Path) -> ExitCode {
     }
 }
 
-fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
+fn run(
+    relaunch: &piano::upgrade::Relaunch,
+    level_override: Option<log::LevelFilter>,
+    takeover: Option<u32>,
+) -> ExitCode {
+    let path = &relaunch.config;
     let config = match piano_config::load(path) {
         Ok(c) => c,
         Err(e) => {
@@ -516,14 +623,21 @@ fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
         log::warn!("{w}");
     }
     piano::raise_open_file_limit(&config);
-    let piano::Daemon { mut server, live } = match piano::build(&config, Resolver::system()) {
+    let built = piano::build_with(&config, Resolver::system(), takeover);
+    let piano::Daemon { mut server, live } = match built {
         Ok(d) => d,
         Err(e) => {
             log::error!("{e}");
             return ExitCode::from(exit::CONFIG);
         }
     };
-    let control = match config.control.socket_path().map(piano_ctl::server::bind) {
+    // Taking over, the old process still listens on the control socket.
+    let bind = if takeover.is_some() {
+        piano_ctl::server::bind_unpublished
+    } else {
+        piano_ctl::server::bind
+    };
+    let control = match config.control.socket_path().map(bind) {
         None => None,
         Some(Ok(bound)) => Some(bound),
         Some(Err(e)) => {
@@ -536,7 +650,12 @@ fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
         path.to_owned(),
         level_override,
     );
+    admin.set_relaunch(relaunch.clone());
     server.add_service(piano::Reloader::new(std::sync::Arc::clone(&admin)));
+    server.add_service(piano::upgrade::ReadyService::new(
+        std::sync::Arc::clone(&live),
+        relaunch.pidfile.clone(),
+    ));
     if let Some(bound) = control {
         server.add_service(piano::ControlService::new(admin, bound));
     }
@@ -550,6 +669,9 @@ fn run(path: &Path, level_override: Option<log::LevelFilter>) -> ExitCode {
         shutdown_signal: live.signals(Box::new(piano::UnixShutdownSignalWatch)),
     });
     live.stopped();
+    if let Some(p) = &relaunch.pidfile {
+        piano::upgrade::remove_pidfile(p);
+    }
     log::info!("stopped");
     ExitCode::SUCCESS
 }

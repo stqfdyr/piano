@@ -178,7 +178,13 @@ fn write_atomically(path: &Path, record: &Record) -> Result<(), Error> {
 
 #[derive(Debug)]
 struct State {
+    /// The record as last written, with the additions since.
     record: Record,
+    /// Additions not written yet; a write adds them to the file as it is then, which
+    /// another process (one draining after an upgrade) may have written too.
+    pending: BTreeMap<String, BTreeMap<String, SiteBytes>>,
+    /// Days before this one are dropped.
+    cutoff: Option<NaiveDate>,
     /// Counter readings already added, by site.
     seen: BTreeMap<String, (ByKind, ByKind)>,
     dirty: bool,
@@ -230,6 +236,8 @@ impl Ledger {
             path: keep,
             state: Mutex::new(State {
                 record,
+                pending: BTreeMap::new(),
+                cutoff: None,
                 seen: BTreeMap::new(),
                 dirty: false,
                 error: None,
@@ -262,21 +270,17 @@ impl Ledger {
             if gained.sent.is_zero() && gained.fetched.is_zero() {
                 continue;
             }
-            st.record
-                .days
-                .entry(day.clone())
-                .or_default()
-                .entry(site.clone())
-                .or_default()
-                .add(&gained);
+            for days in [&mut st.record.days, &mut st.pending] {
+                days.entry(day.clone())
+                    .or_default()
+                    .entry(site.clone())
+                    .or_default()
+                    .add(&gained);
+            }
             st.dirty = true;
         }
-        let cutoff = date.checked_sub_days(Days::new(KEEP_DAYS));
-        let before = st.record.days.len();
-        st.record.days.retain(|d, _| {
-            NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok_and(|d| cutoff.is_none_or(|c| d > c))
-        });
-        st.dirty |= st.record.days.len() != before;
+        st.cutoff = date.checked_sub_days(Days::new(KEEP_DAYS));
+        st.dirty |= prune(&mut st.record.days, st.cutoff);
     }
 
     /// Writes the record if it changed since the last write. `now` is Unix seconds.
@@ -288,9 +292,10 @@ impl Ledger {
         if !st.dirty {
             return Ok(false);
         }
-        st.record.updated = now;
-        match write_atomically(path, &st.record) {
-            Ok(()) => {
+        match merge_into_file(path, &st.pending, st.cutoff, now) {
+            Ok(record) => {
+                st.record = record;
+                st.pending.clear();
                 st.dirty = false;
                 st.error = None;
                 Ok(true)
@@ -311,6 +316,52 @@ impl Ledger {
     pub fn record(&self) -> Record {
         self.state().record.clone()
     }
+}
+
+/// Drops the days before `cutoff`; returns whether any went.
+fn prune(
+    days: &mut BTreeMap<String, BTreeMap<String, SiteBytes>>,
+    cutoff: Option<NaiveDate>,
+) -> bool {
+    let before = days.len();
+    days.retain(|d, _| {
+        NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok_and(|d| cutoff.is_none_or(|c| d > c))
+    });
+    days.len() != before
+}
+
+/// Adds `pending` to the record in the file at `path` and writes it, holding a lock
+/// beside it so that two processes do not lose each other's additions. Returns the
+/// record written.
+fn merge_into_file(
+    path: &Path,
+    pending: &BTreeMap<String, BTreeMap<String, SiteBytes>>,
+    cutoff: Option<NaiveDate>,
+    now: u64,
+) -> Result<Record, Error> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| io(Path::new(&lock_path), e))?;
+    lock.lock().map_err(|e| io(Path::new(&lock_path), e))?;
+    let mut record = read(path)?.unwrap_or_default();
+    for (day, sites) in pending {
+        let into = record.days.entry(day.clone()).or_default();
+        for (site, bytes) in sites {
+            into.entry(site.clone()).or_default().add(bytes);
+        }
+    }
+    prune(&mut record.days, cutoff);
+    record.updated = now;
+    write_atomically(path, &record)?;
+    Ok(record)
 }
 
 fn delta(now: &ByKind, before: &ByKind) -> ByteKinds {
@@ -404,6 +455,25 @@ mod tests {
         let sums = sum_since(&r, day("2026-11-21"));
         assert_eq!(sums["a"].sent.total(), 10);
         assert_eq!(sum_since(&r, day("2026-11-01"))["a"].sent.total(), 166);
+    }
+
+    #[test]
+    fn two_processes_writing_one_record_keep_both_additions() {
+        let dir = Dir::new("two");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("traffic.json");
+        let (old, _) = Ledger::open(Some(&path));
+        old.add(&totals(&[("a", [100, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        assert!(old.save(1).unwrap());
+        // The successor starts from the file, then both keep adding.
+        let (new, _) = Ledger::open(Some(&path));
+        new.add(&totals(&[("a", [50, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        old.add(&totals(&[("a", [130, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        assert!(new.save(2).unwrap());
+        assert!(old.save(3).unwrap());
+        let r = read(&path).unwrap().unwrap();
+        assert_eq!(r.days["2026-11-20"]["a"].sent.media, 180);
+        assert_eq!(old.record().days["2026-11-20"]["a"].sent.media, 180);
     }
 
     #[test]

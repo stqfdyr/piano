@@ -2,7 +2,7 @@
 
 use chrono::{Days, NaiveDate};
 use piano::traffic::{Record, SiteBytes, sum_since};
-use piano_ctl::proto::{CacheStats, Counts, Latency, Level, ReloadReply, Status};
+use piano_ctl::proto::{CacheStats, Counts, Latency, Level, ReloadReply, Status, UpgradeReply};
 use piano_telemetry::Kind;
 use piano_telemetry::metrics::End;
 use std::collections::BTreeMap;
@@ -443,6 +443,35 @@ pub fn traffic(record: &Record, path: &str, today: NaiveDate, now: u64, days: us
                 );
             }
         }
+    }
+    o
+}
+
+pub fn upgrade(r: &UpgradeReply) -> String {
+    let mut o = String::new();
+    if r.ok {
+        let _ = writeln!(
+            o,
+            "upgraded to {}: pid {} serves (ready after {} ms)",
+            r.version.as_deref().unwrap_or("?"),
+            r.new_pid.unwrap_or_default(),
+            r.ready_ms.unwrap_or_default()
+        );
+        let _ = writeln!(
+            o,
+            "pid {} keeps {} media streams until they end, {} at most",
+            r.old_pid,
+            r.draining_streams,
+            duration(r.drain_limit_secs)
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "upgrade failed; pid {} still serves:
+{}",
+            r.old_pid,
+            r.error.as_deref().unwrap_or("unknown error")
+        );
     }
     o
 }

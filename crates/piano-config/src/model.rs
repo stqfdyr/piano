@@ -40,6 +40,9 @@ pub struct Server {
     /// After a terminate signal, the longest wait for requests in progress; media
     /// streams and websockets end at once instead.
     pub shutdown_timeout: Duration,
+    /// After `piano upgrade`, the longest the old process keeps serving the media
+    /// streams it has.
+    pub drain_timeout: Duration,
 }
 
 impl Default for Server {
@@ -48,6 +51,7 @@ impl Default for Server {
             listen: vec!["[::]:443".to_owned()],
             threads: 0,
             shutdown_timeout: Duration::from_secs(10),
+            drain_timeout: Duration::from_secs(2 * 3600),
         }
     }
 }

@@ -40,7 +40,12 @@ impl Handler for Commands {
             "cache" => Some(to_value(&self.0.cache())),
             "live" => Some(to_value(&self.0.live_view())),
             "cache purge" => Some(to_value(&self.0.purge())),
-            _ => None,
+            "upgrade" => Some(to_value(&self.0.upgrade(None).await)),
+            "stop" => Some(to_value(&self.0.live().request_stop())),
+            _ => match cmd.strip_prefix("upgrade ") {
+                Some(binary) => Some(to_value(&self.0.upgrade(Some(binary.into())).await)),
+                None => None,
+            },
         }
     }
 }
@@ -55,9 +60,24 @@ impl ServiceWithDependents for ControlService {
         ready: ServiceReadyNotifier,
     ) {
         ready.notify_ready();
-        let Some(bound) = self.bound.take() else {
+        let Some(mut bound) = self.bound.take() else {
             return;
         };
+        if !bound.is_published() {
+            // Taking over: the old process keeps the path until it has handed over.
+            let mut taken = self.admin.live().taken_over.subscribe();
+            let wait = async {
+                let _ = taken.wait_for(|t| *t).await;
+            };
+            tokio::select! {
+                () = wait => {}
+                _ = shutdown.changed() => return,
+            }
+            if let Err(e) = bound.publish() {
+                log::warn!("control socket {}: {e}", bound.path().display());
+                return;
+            }
+        }
         let handler = Arc::new(Commands(Arc::clone(&self.admin)));
         server::serve(bound, handler, async move {
             let _ = shutdown.changed().await;

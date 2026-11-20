@@ -50,6 +50,10 @@ pub const RELOAD_SCHEMA: u32 = 1;
 pub const CACHE_SCHEMA: u32 = 1;
 /// Version of [`Live`].
 pub const LIVE_SCHEMA: u32 = 1;
+/// Version of [`UpgradeReply`].
+pub const UPGRADE_SCHEMA: u32 = 1;
+/// Version of [`StopReply`].
+pub const STOP_SCHEMA: u32 = 1;
 
 /// Reply to `status`. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,6 +221,35 @@ pub struct Finding {
     pub message: String,
     /// What to do or look at next.
     pub hint: Option<String>,
+}
+
+/// Reply to `stop`: the daemon stops as on SIGTERM.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StopReply {
+    pub schema: u32,
+    pub pid: u32,
+    /// The longest the daemon waits for requests in progress, in seconds.
+    pub limit_secs: u64,
+}
+
+/// Reply to `upgrade`: whether a new process took over the listening sockets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpgradeReply {
+    pub schema: u32,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Whether the new binary rejected the configuration file.
+    pub config_error: bool,
+    /// The new binary's `--version` line.
+    pub version: Option<String>,
+    pub old_pid: u32,
+    pub new_pid: Option<u32>,
+    /// From starting the new process until it served.
+    pub ready_ms: Option<u64>,
+    /// Media streams the old process keeps serving until they end.
+    pub draining_streams: usize,
+    /// The longest the old process keeps them, in seconds.
+    pub drain_limit_secs: u64,
 }
 
 /// Reply to `reload`.

@@ -44,6 +44,8 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> BindError + '_ {
 pub struct Bound {
     listener: UnixListener,
     path: PathBuf,
+    /// Where the socket sits until [`Bound::publish`] moves it to `path`.
+    unpublished: Option<PathBuf>,
     /// Device and inode of the socket file, to remove it at exit only if it is still ours.
     id: (u64, u64),
 }
@@ -53,7 +55,25 @@ impl Bound {
         &self.path
     }
 
+    /// Whether clients can reach the socket at [`Bound::path`] yet.
+    pub fn is_published(&self) -> bool {
+        self.unpublished.is_none()
+    }
+
+    /// Moves the socket to its path, replacing whatever socket is there.
+    pub fn publish(&mut self) -> io::Result<()> {
+        if let Some(tmp) = &self.unpublished {
+            fs::rename(tmp, &self.path)?;
+            self.unpublished = None;
+        }
+        Ok(())
+    }
+
     fn remove(&self) {
+        if let Some(tmp) = &self.unpublished {
+            let _ = fs::remove_file(tmp);
+            return;
+        }
         let ours = fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id);
         if ours && let Err(e) = fs::remove_file(&self.path) {
             warn!("cannot remove control socket {}: {e}", self.path.display());
@@ -66,6 +86,19 @@ impl Bound {
 /// The socket gets its mode under a temporary name and is then renamed into place, so
 /// it is never reachable with a wider mode.
 pub fn bind(path: &Path) -> Result<Bound, BindError> {
+    bind_at(path, false)
+}
+
+/// Like [`bind`], but leaves the socket under a temporary name until
+/// [`Bound::publish`], which then replaces the socket at `path` even if it has a live
+/// listener: a daemon taking over from another in an upgrade publishes once the other
+/// has handed over. The other keeps serving the connections it has and leaves the file
+/// alone at exit, since it is no longer its own.
+pub fn bind_unpublished(path: &Path) -> Result<Bound, BindError> {
+    bind_at(path, true)
+}
+
+fn bind_at(path: &Path, replace_live: bool) -> Result<Bound, BindError> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         DirBuilder::new()
             .recursive(true)
@@ -74,6 +107,8 @@ pub fn bind(path: &Path) -> Result<Bound, BindError> {
             .map_err(io_err(dir))?;
     }
     match fs::symlink_metadata(path) {
+        // Renaming over it below replaces it without disturbing its listener.
+        Ok(m) if m.file_type().is_socket() && replace_live => {}
         Ok(m) if m.file_type().is_socket() => match UnixStream::connect(path) {
             Ok(_) => return Err(BindError::InUse(path.to_owned())),
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
@@ -92,17 +127,24 @@ pub fn bind(path: &Path) -> Result<Bound, BindError> {
     let tmp = path.with_file_name(format!(".{name}.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let listener = UnixListener::bind(&tmp).map_err(io_err(&tmp))?;
-    let placed = fs::set_permissions(&tmp, Permissions::from_mode(0o600))
-        .and_then(|()| fs::rename(&tmp, path));
+    let placed = fs::set_permissions(&tmp, Permissions::from_mode(0o600)).and_then(|()| {
+        if replace_live {
+            Ok(())
+        } else {
+            fs::rename(&tmp, path)
+        }
+    });
     if let Err(e) = placed {
         let _ = fs::remove_file(&tmp);
         return Err(io_err(path)(e));
     }
-    let m = fs::symlink_metadata(path).map_err(io_err(path))?;
+    let at = if replace_live { tmp.as_path() } else { path };
+    let m = fs::symlink_metadata(at).map_err(io_err(at))?;
     listener.set_nonblocking(true).map_err(io_err(path))?;
     Ok(Bound {
         listener,
         path: path.to_owned(),
+        unpublished: replace_live.then_some(tmp),
         id: (m.dev(), m.ino()),
     })
 }
