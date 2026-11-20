@@ -232,6 +232,10 @@ impl AddrCache {
             return Ok(addrs);
         }
         let addrs = Arc::new(resolver.resolve_public(host, port).await?);
+        log::info!(
+            "redirect target {host}:{port} resolved to {:?}",
+            addrs.current()
+        );
         let mut entries = self.lock();
         let now = Instant::now();
         entries.retain(|_, (_, at)| now.duration_since(*at) < self.ttl);

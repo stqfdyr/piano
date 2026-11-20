@@ -153,6 +153,7 @@ pub enum TargetKind {
 pub struct FollowRules {
     pub upstream: String,
     pub aliases: Vec<String>,
+    /// When not empty, the only other hosts followed.
     pub follow: Vec<String>,
 }
 
@@ -161,7 +162,7 @@ impl FollowRules {
     pub fn kind(&self, host: &str) -> Option<TargetKind> {
         if host == self.upstream || self.aliases.iter().any(|a| a == host) {
             Some(TargetKind::Upstream)
-        } else if self.follow.iter().any(|p| host_matches(p, host)) {
+        } else if self.follow.is_empty() || self.follow.iter().any(|p| host_matches(p, host)) {
             Some(TargetKind::Follow)
         } else {
             None
@@ -284,5 +285,11 @@ mod tests {
         );
         assert_eq!(rules.kind("a.b.files.example.net"), None);
         assert_eq!(rules.kind("evil.example.net"), None);
+        let open = FollowRules {
+            follow: Vec::new(),
+            ..rules
+        };
+        assert_eq!(open.kind("emby2.example.net"), Some(TargetKind::Upstream));
+        assert_eq!(open.kind("any.example.org"), Some(TargetKind::Follow));
     }
 }

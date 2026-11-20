@@ -403,6 +403,17 @@ impl ProxyHttp for Relay {
         };
         let target = follow::resolve(location.as_bytes(), &base)
             .map_err(|e| refuse_redirect(format!("{e}: {:?}", location)))?;
+        // A site of this relay would receive the request again and could loop.
+        if ctx
+            .sites
+            .as_deref()
+            .is_some_and(|s| s.find(target.host.as_bytes()).is_some())
+        {
+            return Err(refuse_redirect(format!(
+                "site {}: redirect to {}, a site of this relay",
+                site.name, target.host
+            )));
+        }
         let Some(kind) = site.policy.follow.kind(&target.host) else {
             return Err(refuse_redirect(format!(
                 "site {}: {} is not in follow",

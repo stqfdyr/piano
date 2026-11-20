@@ -18,13 +18,22 @@ struct World {
 }
 
 async fn world() -> World {
+    world_with(
+        r#"aliases = ["alias.example.net"]
+follow = ["vod.example.net", "*.files.example.net"]"#,
+    )
+    .await
+}
+
+/// A site with `site_toml` instead of the default follow rules.
+async fn world_with(site_toml: &str) -> World {
     let ca = Ca::new("piano e2e");
     let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST, VOD, FILES, ALIAS, EVIL])).await;
     let roots = [ca.cert_pem()];
     let relay = Relay::start(&RelaySetup {
-        site_toml: r#"aliases = ["alias.example.net"]
-follow = ["vod.example.net", "*.files.example.net"]"#,
-        names: &[VOD, FILES, ALIAS, EVIL],
+        site_toml,
+        // SITE_HOST too, so a redirect back to the site would really reach the relay.
+        names: &[VOD, FILES, ALIAS, EVIL, SITE_HOST],
         ..RelaySetup::new(&ca.leaf(&[SITE_HOST]), &roots, origin.addr.port())
     });
     World { ca, origin, relay }
@@ -108,7 +117,7 @@ async fn credentials_go_only_to_the_upstream_and_its_aliases() {
 }
 
 #[tokio::test]
-async fn unlisted_targets_get_502_without_the_location() {
+async fn a_follow_list_refuses_other_hosts_without_the_location() {
     let w = world().await;
     let port = w.port();
     for to in [
@@ -126,6 +135,25 @@ async fn unlisted_targets_get_502_without_the_location() {
             "{body}"
         );
     }
+}
+
+#[tokio::test]
+async fn without_a_follow_list_any_host_is_followed_but_not_back_into_the_relay() {
+    let w = world_with(r#"aliases = ["alias.example.net"]"#).await;
+    let port = w.port();
+    for host in [EVIL, VOD] {
+        let to = format!("https://{host}:{port}/__echo");
+        let req = w
+            .get(Proto::H1, &redirect(&to, 302))
+            .header("x-emby-token", "secret");
+        let (code, body) = text(req).await;
+        assert_eq!(code, 200, "{to}");
+        assert!(!body.contains("x-emby-token"), "{body}");
+    }
+    let to = format!("https://{SITE_HOST}:{}/__echo", w.relay.addr.port());
+    let res = w.get(Proto::H1, &redirect(&to, 302)).send().await.unwrap();
+    assert_eq!(res.status(), 502);
+    assert!(res.headers().get("location").is_none());
 }
 
 #[tokio::test]
