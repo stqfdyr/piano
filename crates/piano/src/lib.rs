@@ -11,14 +11,16 @@ use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
 use piano_telemetry::AccessLog;
 use piano_upstream::{Origin, PeerOptions, Resolver};
+use pingora_core::apps::HttpServerOptions;
 use pingora_core::connectors::ConnectorOptions;
-use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::listeners::{AcceptLimits, ListenerConfig, TcpSocketOptions};
 use pingora_core::server::Server;
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::ProxyServiceBuilder;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 pub use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 pub use reload::Reloader;
@@ -28,6 +30,15 @@ const UPSTREAM_POOL_SIZE: usize = 128;
 
 /// All services share one runtime: one worker per CPU, no extra threads.
 const RUNTIME_GROUP: &str = "piano";
+
+/// Limit on each read of an HTTP/1 request head once it started arriving. A client in
+/// the middle of sending a head has its data ready; like the handshake timeout, this
+/// leaves room for three retransmissions.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// File descriptors kept for everything but client and upstream connections: listeners,
+/// log files, the resolver, the signal and timer machinery.
+const RESERVED_FDS: u64 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -47,6 +58,42 @@ pub enum Error {
     AccessLog(std::io::Error),
 }
 
+/// The certificate files in use and what they looked like when loaded, to notice when
+/// they are renewed.
+#[derive(Debug)]
+struct CertSource {
+    cert: PathBuf,
+    key: PathBuf,
+    hosts: Vec<String>,
+    stamp: [Option<(SystemTime, u64)>; 2],
+}
+
+impl CertSource {
+    fn of(config: &Config) -> Self {
+        let mut s = Self {
+            cert: config.tls.cert.clone(),
+            key: config.tls.key.clone(),
+            hosts: config.sites.iter().map(|s| s.host.clone()).collect(),
+            stamp: [None, None],
+        };
+        s.stamp = s.current_stamp();
+        s
+    }
+
+    fn current_stamp(&self) -> [Option<(SystemTime, u64)>; 2] {
+        let stamp = |p: &Path| {
+            let m = std::fs::metadata(p).ok()?;
+            Some((m.modified().ok()?, m.len()))
+        };
+        [stamp(&self.cert), stamp(&self.key)]
+    }
+
+    fn load(&self) -> Result<SniTable, piano_edge::tls::Error> {
+        let hosts: Vec<&str> = self.hosts.iter().map(String::as_str).collect();
+        SniTable::from_files(&self.cert, &self.key, &hosts)
+    }
+}
+
 /// A server ready to run and the handle that reconfigures it.
 pub struct Daemon {
     pub server: Server,
@@ -58,6 +105,7 @@ pub struct Live {
     access: Arc<AccessFilter>,
     access_log: Arc<AccessLog>,
     certs: Arc<CertStore>,
+    cert_source: Mutex<CertSource>,
     sites: Arc<ArcSwap<Sites>>,
     resolver: Resolver,
     fixed: Fixed,
@@ -70,6 +118,9 @@ struct Fixed {
     threads: usize,
     shutdown_timeout: piano_config::Duration,
     extra_roots: Vec<PathBuf>,
+    handshake_timeout: piano_config::Duration,
+    keepalive_timeout: piano_config::Duration,
+    max_connections: usize,
 }
 
 impl Fixed {
@@ -79,6 +130,9 @@ impl Fixed {
             threads: config.server.threads,
             shutdown_timeout: config.server.shutdown_timeout,
             extra_roots: config.upstream.extra_roots.clone(),
+            handshake_timeout: config.limits.handshake_timeout,
+            keepalive_timeout: config.limits.keepalive_timeout,
+            max_connections: config.limits.max_connections,
         }
     }
 
@@ -97,6 +151,15 @@ impl Fixed {
         if self.extra_roots != other.extra_roots {
             out.push("upstream.extra_roots");
         }
+        if self.handshake_timeout != other.handshake_timeout {
+            out.push("limits.handshake_timeout");
+        }
+        if self.keepalive_timeout != other.keepalive_timeout {
+            out.push("limits.keepalive_timeout");
+        }
+        if self.max_connections != other.max_connections {
+            out.push("limits.max_connections");
+        }
         out
     }
 }
@@ -104,6 +167,36 @@ impl Fixed {
 /// The diagnostic log threshold for a configured level.
 pub fn level_filter(level: piano_config::LogLevel) -> log::LevelFilter {
     piano_telemetry::logger::parse_level(level.as_str()).unwrap_or(log::LevelFilter::Info)
+}
+
+/// Raises the soft limit on open files to the hard limit, and warns when even that
+/// cannot hold `limits.max_connections` client connections with one upstream connection
+/// each, plus the upstream pool. Process-wide, so it belongs to the daemon's startup.
+pub fn raise_open_file_limit(config: &Config) {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("cannot read the open file limit: {e}");
+            return;
+        }
+    };
+    let mut limit = soft;
+    if soft < hard {
+        match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+            Ok(()) => limit = hard,
+            Err(e) => log::warn!("cannot raise the open file limit from {soft} to {hard}: {e}"),
+        }
+    }
+    let conns = config.limits.max_connections as u64 * config.server.listen.len() as u64;
+    let need = conns * 2 + UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS;
+    if limit < need {
+        log::warn!(
+            "open file limit {limit} is below the {need} that limits.max_connections = {} \
+             may need; raise LimitNOFILE (systemd) or rc_ulimit (OpenRC)",
+            config.limits.max_connections
+        );
+    }
 }
 
 /// Builds a ready-to-run server: listeners, access control, TLS and the relay service.
@@ -146,6 +239,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     )
     .name("piano")
     .client_options(client)
+    .server_options(server_options(config))
     .build();
     service.set_runtime_group(RUNTIME_GROUP);
     service.set_connection_filter(Arc::clone(&access) as _);
@@ -154,7 +248,17 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         tls.set_callbacks(Box::new(SniRecorder));
         let mut sock = TcpSocketOptions::default();
         sock.tcp_keepalive = Some(piano_upstream::tcp_keepalive());
-        service.add_tls_with_settings(addr, Some(sock), tls);
+        let limits = AcceptLimits {
+            handshake_timeout: config.limits.handshake_timeout.get(),
+            max_connections: Some(config.limits.max_connections),
+            ..AcceptLimits::default()
+        };
+        service.add_listener(
+            ListenerConfig::tcp(addr.as_str())
+                .tcp_socket_options(sock)
+                .tls(tls)
+                .accept_limits(limits),
+        );
     }
     server.add_service(service);
 
@@ -162,11 +266,22 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         access,
         access_log,
         certs,
+        cert_source: Mutex::new(CertSource::of(config)),
         sites,
         resolver,
         fixed: Fixed::of(config),
     });
     Ok(Daemon { server, live })
+}
+
+/// How client connections are kept between requests.
+fn server_options(config: &Config) -> HttpServerOptions {
+    let keepalive = config.limits.keepalive_timeout.get();
+    let mut o = HttpServerOptions::default();
+    o.h1_keepalive_timeout = Some(keepalive);
+    o.h1_header_read_timeout = Some(HEADER_READ_TIMEOUT);
+    o.h2_idle_timeout = Some(keepalive);
+    o
 }
 
 impl Live {
@@ -176,7 +291,8 @@ impl Live {
     /// configuration is untouched. Returns the names of changed settings that only take
     /// effect after a restart.
     pub fn apply(&self, config: &Config) -> Result<Vec<&'static str>, Error> {
-        let table = SniTable::load(config)?;
+        let source = CertSource::of(config);
+        let table = source.load()?;
         let current = self.sites.load();
         let sites = build_sites(config, &self.resolver, Some(&current))?;
         let acl = Acl::new(&config.access.allow);
@@ -186,9 +302,31 @@ impl Live {
             .set_path(config.log.access_path())
             .map_err(Error::AccessLog)?;
         self.certs.replace(table);
+        *self
+            .cert_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
         self.access.replace(acl);
         self.sites.store(Arc::new(sites));
         Ok(self.fixed.changed(&Fixed::of(config)))
+    }
+
+    /// Reloads the certificate if its files changed since they were loaded. Returns
+    /// whether it was replaced; on error the current one stays and the next call tries
+    /// again.
+    pub fn refresh_certs(&self) -> Result<bool, Error> {
+        let mut source = self
+            .cert_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = source.current_stamp();
+        if stamp == source.stamp {
+            return Ok(false);
+        }
+        let table = source.load()?;
+        self.certs.replace(table);
+        source.stamp = stamp;
+        Ok(true)
     }
 
     /// Starts a new access log file at the same path, after logrotate moved the old one.

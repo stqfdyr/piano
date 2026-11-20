@@ -40,6 +40,19 @@ pub enum ValidationError {
         index: usize,
         reason: String,
     },
+    #[error("site {site:?}: mount {prefix:?} must start with /, not end with / and have no query")]
+    BadMountPrefix { site: String, prefix: String },
+    #[error("site {site:?}: mount {prefix:?}: host {host:?} is not a valid lowercase DNS name")]
+    BadMountHost {
+        site: String,
+        prefix: String,
+        host: String,
+    },
+    #[error("limits.{name} {reason}")]
+    BadLimit {
+        name: &'static str,
+        reason: &'static str,
+    },
     #[error("log.access {0:?} must be an absolute path")]
     RelativeAccessLog(std::path::PathBuf),
     #[error("site {site:?}: upstream {url:?}: {reason}")]
@@ -161,6 +174,24 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     if config.access.allow.is_empty() {
         errors.push(ValidationError::NoAccess);
     }
+    let limits = &config.limits;
+    for (name, d) in [
+        ("handshake_timeout", limits.handshake_timeout),
+        ("keepalive_timeout", limits.keepalive_timeout),
+    ] {
+        if d.get() < std::time::Duration::from_secs(1) {
+            errors.push(ValidationError::BadLimit {
+                name,
+                reason: "must be at least 1s",
+            });
+        }
+    }
+    if limits.max_connections == 0 {
+        errors.push(ValidationError::BadLimit {
+            name: "max_connections",
+            reason: "must be at least 1",
+        });
+    }
     let site_hosts: Vec<(String, String)> = config
         .sites
         .iter()
@@ -204,8 +235,33 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
                 });
             }
         }
+        for (prefix, host) in &site.mounts {
+            let ok = prefix.len() > 1
+                && prefix.starts_with('/')
+                && !prefix.ends_with('/')
+                && !prefix.contains(['?', '#'])
+                && !prefix.contains("//");
+            if !ok {
+                errors.push(ValidationError::BadMountPrefix {
+                    site: site.name.clone(),
+                    prefix: prefix.clone(),
+                });
+            }
+            if !is_dns_name(host) {
+                errors.push(ValidationError::BadMountHost {
+                    site: site.name.clone(),
+                    prefix: prefix.clone(),
+                    host: host.clone(),
+                });
+            }
+        }
         // Following a redirect to a public site host would loop through the relay.
-        for entry in site.aliases.iter().chain(&site.follow) {
+        for entry in site
+            .aliases
+            .iter()
+            .chain(&site.follow)
+            .chain(site.mounts.values())
+        {
             for (other_name, other_host) in &site_hosts {
                 if host_matches(entry, other_host) {
                     errors.push(ValidationError::FollowCoversSite {
@@ -400,6 +456,48 @@ mod tests {
         );
         let errs = errors(&text);
         assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    #[test]
+    fn limits() {
+        let c = parse(MINIMAL).unwrap();
+        assert_eq!(c.limits.handshake_timeout.get().as_secs(), 10);
+        assert_eq!(c.limits.keepalive_timeout.get().as_secs(), 600);
+        assert_eq!(c.limits.max_connections, 1024);
+        let text = format!(
+            "{MINIMAL}
+[limits]
+handshake_timeout = \"500ms\"
+keepalive_timeout = \"0s\"
+max_connections = 0
+"
+        );
+        let errs = errors(&text);
+        assert_eq!(errs.len(), 3, "{errs:?}");
+    }
+
+    #[test]
+    fn mounts() {
+        let ok = format!(
+            "{MINIMAL}mounts = {{ \"/__v/1\" = \"vod1.example.net\", \"/__v/2\" = \"vod2.example.net\" }}
+"
+        );
+        let c = parse(&ok).unwrap();
+        assert_eq!(c.sites[0].mounts["/__v/1"], "vod1.example.net");
+        for (prefix, host) in [
+            ("/", "vod.example.net"),
+            ("v", "vod.example.net"),
+            ("/v/", "vod.example.net"),
+            ("/v?x", "vod.example.net"),
+            ("/v", "VOD.example.net"),
+            ("/v", "media.example.com"),
+        ] {
+            let text = format!(
+                "{MINIMAL}mounts = {{ {prefix:?} = {host:?} }}
+"
+            );
+            assert_eq!(errors(&text).len(), 1, "{prefix} {host}");
+        }
     }
 
     #[test]

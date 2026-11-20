@@ -88,7 +88,26 @@ impl SniTable {
     /// Loads the certificate and maps every site host to it; fails if it does not cover
     /// one of them.
     pub fn load(config: &Config) -> Result<Self, Error> {
-        sni_table(config).map(Self)
+        let hosts: Vec<&str> = config.sites.iter().map(|s| s.host.as_str()).collect();
+        Self::from_files(&config.tls.cert, &config.tls.key, &hosts)
+    }
+
+    /// Loads the certificate chain `cert` with private key `key` and maps each of
+    /// `hosts` to it; fails if it does not cover one of them.
+    pub fn from_files(cert: &Path, key: &Path, hosts: &[&str]) -> Result<Self, Error> {
+        let provider = default_provider();
+        let certified = load_certified_key(cert, key, &provider)?;
+        let mut resolver = ResolvesServerCertUsingSni::new();
+        for host in hosts {
+            resolver
+                .add(host, certified.clone())
+                .map_err(|source| Error::NotCovered {
+                    cert: cert.to_owned(),
+                    host: (*host).to_owned(),
+                    source,
+                })?;
+        }
+        Ok(Self(resolver))
     }
 }
 
@@ -125,22 +144,6 @@ pub fn server_config(certs: Arc<CertStore>) -> Result<Arc<ServerConfig>, Error> 
         .with_cert_resolver(certs);
     server.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(server))
-}
-
-fn sni_table(config: &Config) -> Result<ResolvesServerCertUsingSni, Error> {
-    let provider = default_provider();
-    let key = load_certified_key(&config.tls.cert, &config.tls.key, &provider)?;
-    let mut resolver = ResolvesServerCertUsingSni::new();
-    for site in &config.sites {
-        resolver
-            .add(&site.host, key.clone())
-            .map_err(|source| Error::NotCovered {
-                cert: config.tls.cert.clone(),
-                host: site.host.clone(),
-                source,
-            })?;
-    }
-    Ok(resolver)
 }
 
 fn load_certified_key(

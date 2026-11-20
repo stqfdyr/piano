@@ -10,4 +10,4 @@ pub mod route;
 mod sites;
 
 pub use relay::{Ctx, MAX_ATTEMPTS, Relay};
-pub use sites::{Policy, Site, SiteError, Sites};
+pub use sites::{Mounts, Policy, Site, SiteError, Sites};

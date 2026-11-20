@@ -12,6 +12,7 @@ arc-swap.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 log.workspace = true
+nix.workspace = true
 piano-config.workspace = true
 piano-edge.workspace = true
 piano-proxy.workspace = true

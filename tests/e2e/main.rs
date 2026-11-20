@@ -5,6 +5,7 @@
 mod access;
 mod follow;
 mod headers;
+mod limits;
 mod log;
 mod retry;
 mod rewrite;
@@ -47,6 +48,7 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         names: &[],
         origin_ips: &[],
         access_log: piano_e2e::relay::ACCESS_LOG,
+        limits: "",
     });
     World { ca, origin, relay }
 }

@@ -24,6 +24,9 @@ pingora-proxy = { path = "third_party/pingora/pingora-proxy", default-features =
 pingora-error = { path = "third_party/pingora/pingora-error" }
 pingora-http = { path = "third_party/pingora/pingora-http" }
 
+# Raising the open file limit at startup; already in the tree through pingora-core.
+nix = { version = "0.31", default-features = false, features = ["resource"] }
+
 # Atomically replaced configuration snapshots (sites, ACL, certificates).
 arc-swap = "1"
 async-trait = "0.1"

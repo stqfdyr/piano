@@ -27,6 +27,35 @@ pub struct Policy {
     pub ua: UaRules,
     pub rewriter: Rewriter,
     pub server_domains: ServerDomains,
+    pub mounts: Mounts,
+}
+
+/// Path prefixes relayed to other hosts of the upstream service.
+#[derive(Debug, Default)]
+pub struct Mounts {
+    /// Prefix and lowercase host, longest prefix first.
+    list: Vec<(String, String)>,
+}
+
+impl Mounts {
+    pub fn new(mounts: &std::collections::BTreeMap<String, String>) -> Self {
+        let mut list: Vec<(String, String)> =
+            mounts.iter().map(|(p, h)| (p.clone(), h.clone())).collect();
+        list.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        Self { list }
+    }
+
+    /// The host for `path` and the length of its mount prefix, when `path` continues
+    /// after the prefix with `/`. Matching ignores ASCII case.
+    pub fn find(&self, path: &[u8]) -> Option<(&str, usize)> {
+        self.list.iter().find_map(|(prefix, host)| {
+            let p = prefix.as_bytes();
+            let hit = path.len() > p.len()
+                && path[..p.len()].eq_ignore_ascii_case(p)
+                && path[p.len()] == b'/';
+            hit.then_some((host.as_str(), p.len()))
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,17 +78,30 @@ impl Policy {
         let names = std::iter::once(upstream.clone())
             .chain(site.aliases.iter().cloned())
             .collect();
+        // Mounted hosts belong to the upstream service: redirects to them keep the
+        // client's credentials, like redirects to an alias.
         let follow = FollowRules {
             upstream,
-            aliases: site.aliases.clone(),
+            aliases: site
+                .aliases
+                .iter()
+                .chain(site.mounts.values())
+                .cloned()
+                .collect(),
             follow: site.follow.clone(),
         };
+        let mounted = site
+            .mounts
+            .iter()
+            .map(|(p, h)| (h.clone(), p.clone()))
+            .collect();
         Ok(Self {
             follow,
             block: BlockList::new(&site.block),
             ua: UaRules::new(&site.ua)?,
-            rewriter: Rewriter::new(names)?,
+            rewriter: Rewriter::new(names, mounted)?,
             server_domains: site.server_domains,
+            mounts: Mounts::new(&site.mounts),
         })
     }
 }
@@ -142,10 +184,28 @@ mod tests {
             follow: FollowRules::default(),
             block: BlockList::default(),
             ua: UaRules::default(),
-            rewriter: Rewriter::new(Vec::new()).unwrap(),
+            rewriter: Rewriter::new(Vec::new(), Vec::new()).unwrap(),
             server_domains: ServerDomains::default(),
+            mounts: Mounts::default(),
         };
         Site::new(host.into(), host.into(), origin, policy).unwrap()
+    }
+
+    #[test]
+    fn mounts_match_whole_segments_longest_first() {
+        let m = Mounts::new(
+            &[
+                ("/__v".to_owned(), "a.example.net".to_owned()),
+                ("/__v/2".to_owned(), "b.example.net".to_owned()),
+            ]
+            .into(),
+        );
+        assert_eq!(m.find(b"/__v/x"), Some(("a.example.net", 4)));
+        assert_eq!(m.find(b"/__V/2/play"), Some(("b.example.net", 6)));
+        assert_eq!(m.find(b"/__v/2"), Some(("a.example.net", 4)));
+        assert_eq!(m.find(b"/__v"), None);
+        assert_eq!(m.find(b"/__vx/1"), None);
+        assert_eq!(m.find(b"/__v?x=/"), None);
     }
 
     #[test]

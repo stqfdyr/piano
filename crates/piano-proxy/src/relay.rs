@@ -455,6 +455,19 @@ impl ProxyHttp for Relay {
         let server_domains = site.policy.server_domains;
 
         let path = session.req_header().uri.path();
+        // A mounted prefix names another host of the upstream service; the rest of the
+        // path is what that host serves, so it is also what routing looks at.
+        let (path, mount) = match site.policy.mounts.find(path.as_bytes()) {
+            Some((host, len)) => {
+                let target = Target {
+                    host: host.to_owned(),
+                    port: site.origin.port,
+                    path: session.req_header().raw_path()[len..].to_vec(),
+                };
+                (&path[len..], Some(target))
+            }
+            None => (path, None),
+        };
         if path == HEALTH_PATH {
             ctx.class = RouteClass::Local;
             respond_local(session, 200, b"ok\n").await?;
@@ -466,6 +479,10 @@ impl ProxyHttp for Relay {
             return Ok(true);
         }
         ctx.class = route::classify(path);
+        ctx.hop = mount.map(|target| Hop {
+            target,
+            kind: TargetKind::Upstream,
+        });
         if matches!(ctx.class, RouteClass::Info | RouteClass::PlaybackInfo) {
             let mode = if route::is_server_domains(path) {
                 server_domains
@@ -586,11 +603,13 @@ impl ProxyHttp for Relay {
         if !is_connect_failure(e.etype()) {
             return e;
         }
-        if let Some(a) = ctx.attempt.take() {
+        // Retrying only makes sense on an address not tried yet for this request.
+        let untried = ctx.attempt.take().is_some_and(|a| {
             a.addrs.failed(a.addr);
-        }
+            usize::from(ctx.connect_retries) + 1 < a.addrs.len()
+        });
         // Nothing reached the upstream, so any method may be retried.
-        if ctx.connect_retries < CONNECT_RETRIES {
+        if untried && ctx.connect_retries < CONNECT_RETRIES {
             ctx.connect_retries += 1;
             e.set_retry(true);
         }

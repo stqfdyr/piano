@@ -141,6 +141,7 @@ fn run(path: &std::path::Path, level_override: Option<log::LevelFilter>) -> Exit
     for w in config.warnings() {
         log::warn!("{w}");
     }
+    piano::raise_open_file_limit(&config);
     let piano::Daemon { mut server, live } = match piano::build(&config, Resolver::system()) {
         Ok(d) => d,
         Err(e) => {

@@ -135,6 +135,16 @@ impl Addrs {
         self.list[i % self.list.len()]
     }
 
+    /// Number of distinct addresses.
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    /// Never true: an empty list is not an `Addrs`.
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
     /// Moves on to the next address after connecting to `failed` did not work. When
     /// several requests fail on the same address at once, only the first moves on.
     pub fn failed(&self, failed: SocketAddr) {

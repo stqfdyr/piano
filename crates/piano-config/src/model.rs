@@ -1,5 +1,6 @@
 use crate::{Duration, IpNet, UpstreamUrl};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The whole configuration file.
@@ -13,6 +14,8 @@ pub struct Config {
     pub tls: Tls,
     #[serde(default)]
     pub access: Access,
+    #[serde(default)]
+    pub limits: Limits,
     #[serde(default)]
     pub upstream: Upstream,
     #[serde(default)]
@@ -56,6 +59,36 @@ pub struct Access {
     /// Addresses and networks allowed to connect. Must not be empty: serving everyone
     /// has to be written out as `["0.0.0.0/0", "::/0"]`.
     pub allow: Vec<IpNet>,
+}
+
+/// Bounds on what clients may hold. The allow list keeps strangers out before TLS, so
+/// these guard against a misbehaving client and keep the process within its resources.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Limits {
+    /// Longest time from accepting a connection to the end of its TLS handshake.
+    pub handshake_timeout: Duration,
+    /// How long an idle client connection is kept open for its next request.
+    pub keepalive_timeout: Duration,
+    /// Most client connections open at once; further ones are closed when accepted.
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            // A TLS 1.3 handshake takes one round trip; 10 s still covers three
+            // consecutive losses with retransmission backing off 1, 2 and 4 s.
+            handshake_timeout: Duration::from_secs(10),
+            // An idle connection costs 25 to 64 KiB; a new one costs the client two round
+            // trips. Clients close idle connections when they no longer want them, so the
+            // relay closing them first only races their next request.
+            keepalive_timeout: Duration::from_secs(600),
+            // About five times the busiest moment seen on a relay (213 requests in
+            // flight); 1024 idle HTTP/2 connections take about 64 MiB.
+            max_connections: 1024,
+        }
+    }
 }
 
 /// Defaults for every upstream connection.
@@ -163,6 +196,11 @@ pub struct Site {
     /// User-Agent rewrites, tried in order; the first match wins.
     #[serde(default)]
     pub ua: Vec<UaRule>,
+    /// Path prefixes relayed to another host of the upstream service, with the prefix
+    /// removed: the upstream hands out URLs on such hosts, and rewriting puts them under
+    /// these prefixes of the site.
+    #[serde(default)]
+    pub mounts: BTreeMap<String, String>,
     /// What happens to `/System/Ext/ServerDomains`, which lists names that reach the
     /// upstream directly.
     #[serde(default)]

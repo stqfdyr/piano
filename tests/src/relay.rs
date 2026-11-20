@@ -34,6 +34,8 @@ pub struct RelaySetup<'a> {
     pub origin_ips: &'a [IpAddr],
     /// File name of the access log in the relay's directory; empty turns it off.
     pub access_log: &'a str,
+    /// Lines of the `[limits]` table.
+    pub limits: &'a str,
 }
 
 impl<'a> RelaySetup<'a> {
@@ -50,6 +52,7 @@ impl<'a> RelaySetup<'a> {
             names: &[],
             origin_ips: &[],
             access_log: ACCESS_LOG,
+            limits: "",
         }
     }
 }
@@ -128,10 +131,14 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         [log]
         access = {access_log:?}
 
+        [limits]
+        {limits}
+
         {sites}
         "#,
         allow = allow.join(", "),
         roots = roots.join(", "),
+        limits = setup.limits,
     )
 }
 
@@ -177,6 +184,17 @@ impl Relay {
         let tag = self.generation.fetch_add(1, Ordering::Relaxed);
         let text = config_text(setup, &self.dir, tag, self.addr.port());
         self.live.apply(&piano_config::parse(&text)?)
+    }
+
+    /// Overwrites the certificate files the relay was started with, as a renewal would.
+    pub fn replace_cert(&self, leaf: &crate::pki::Leaf) {
+        self.dir.write("site0.crt", &leaf.cert_pem);
+        self.dir.write("site0.key", &leaf.key_pem);
+    }
+
+    /// Runs the periodic certificate check now.
+    pub fn refresh_certs(&self) -> Result<bool, piano::Error> {
+        self.live.refresh_certs()
     }
 
     pub fn denied_connections(&self) -> u64 {

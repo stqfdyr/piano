@@ -31,39 +31,61 @@ const ANCHORS: [(&str, Anchor); 6] = [
     (r"\/\/", Anchor::Relative { escaped: true }),
 ];
 
-/// Replaces the names of one upstream server in response bodies.
+/// One name of the upstream service and the site path its URLs move to.
+#[derive(Debug)]
+struct Name {
+    host: String,
+    /// Empty for the upstream server itself; a mount prefix for another of its hosts.
+    prefix: String,
+    /// `prefix` with each `/` written as `\/`, for JSON-escaped URLs.
+    escaped_prefix: String,
+}
+
+/// Replaces the names of one upstream service in response bodies.
 #[derive(Debug)]
 pub struct Rewriter {
     anchors: AhoCorasick,
-    hosts: Vec<String>,
+    names: Vec<Name>,
 }
 
 impl Rewriter {
-    /// `hosts`: the upstream's lowercase names.
-    pub fn new(hosts: Vec<String>) -> Result<Self, BuildError> {
+    /// `hosts`: the upstream's lowercase names, replaced by the site; `mounts`: other
+    /// lowercase hosts with the site path prefix their URLs move under.
+    pub fn new(hosts: Vec<String>, mounts: Vec<(String, String)>) -> Result<Self, BuildError> {
+        let names: Vec<Name> = hosts
+            .into_iter()
+            .map(|h| (h, String::new()))
+            .chain(mounts)
+            .map(|(host, prefix)| Name {
+                escaped_prefix: prefix.replace('/', r"\/"),
+                host,
+                prefix,
+            })
+            .collect();
         let patterns: Vec<String> = ANCHORS
             .iter()
             .map(|(p, _)| (*p).to_owned())
-            .chain(hosts.iter().map(|h| format!("\"{h}\"")))
+            .chain(names.iter().map(|n| format!("\"{}\"", n.host)))
             .collect();
         let anchors = AhoCorasick::builder()
             .ascii_case_insensitive(true)
             .match_kind(MatchKind::LeftmostLongest)
             .build(&patterns)?;
-        Ok(Self { anchors, hosts })
+        Ok(Self { anchors, names })
     }
 
-    fn is_upstream(&self, host: &[u8]) -> bool {
+    fn name(&self, host: &[u8]) -> Option<&Name> {
         let host = host.strip_suffix(b".").unwrap_or(host);
-        self.hosts
+        self.names
             .iter()
-            .any(|h| h.as_bytes().eq_ignore_ascii_case(host))
+            .find(|n| n.host.as_bytes().eq_ignore_ascii_case(host))
     }
 
     /// `body` with every URL authority naming the upstream, or an IP literal after
     /// `http(s)://`, replaced by `authority` (scheme and escaping kept, `http` becoming
-    /// `https`), and every upstream name standing alone as a JSON string replaced by
-    /// `host`; with the number of replacements. `None` if nothing was replaced.
+    /// `https`) followed by the name's mount prefix, and every upstream name standing
+    /// alone as a JSON string replaced by `host`; with the number of replacements.
+    /// `None` if nothing was replaced.
     pub fn rewrite(&self, body: &[u8], host: &str, authority: &str) -> Option<(Vec<u8>, usize)> {
         let mut out = Vec::new();
         let mut copied = 0;
@@ -75,16 +97,19 @@ impl Rewriter {
             let anchor = ANCHORS
                 .get(m.pattern().as_usize())
                 .map_or(Anchor::Quoted, |(_, a)| *a);
-            let end = match anchor {
-                Anchor::Quoted => m.end(),
-                Anchor::Scheme { .. } | Anchor::Relative { .. } => {
+            let (end, prefix) = match anchor {
+                Anchor::Quoted => (m.end(), ""),
+                Anchor::Scheme { escaped } | Anchor::Relative { escaped } => {
                     let (name, end) = url_authority(body, m.end());
-                    let ours = self.is_upstream(name)
-                        || (matches!(anchor, Anchor::Scheme { .. }) && is_ip_literal(name));
-                    if !ours {
-                        continue;
-                    }
-                    end
+                    let prefix = match self.name(name) {
+                        Some(n) if escaped => n.escaped_prefix.as_str(),
+                        Some(n) => n.prefix.as_str(),
+                        None if matches!(anchor, Anchor::Scheme { .. }) && is_ip_literal(name) => {
+                            ""
+                        }
+                        None => continue,
+                    };
+                    (end, prefix)
                 }
             };
             if out.is_empty() {
@@ -92,10 +117,10 @@ impl Rewriter {
             }
             out.extend_from_slice(&body[copied..m.start()]);
             let replacement: [&str; 3] = match anchor {
-                Anchor::Scheme { escaped: false } => ["https://", authority, ""],
-                Anchor::Scheme { escaped: true } => [r"https:\/\/", authority, ""],
-                Anchor::Relative { escaped: false } => ["//", authority, ""],
-                Anchor::Relative { escaped: true } => [r"\/\/", authority, ""],
+                Anchor::Scheme { escaped: false } => ["https://", authority, prefix],
+                Anchor::Scheme { escaped: true } => [r"https:\/\/", authority, prefix],
+                Anchor::Relative { escaped: false } => ["//", authority, prefix],
+                Anchor::Relative { escaped: true } => [r"\/\/", authority, prefix],
                 Anchor::Quoted => ["\"", host, "\""],
             };
             for part in replacement {
@@ -154,7 +179,11 @@ mod tests {
     const PUBLIC: &str = "media.example.com:8443";
 
     fn rewriter() -> Rewriter {
-        Rewriter::new(vec!["emby.example.net".into(), "emby2.example.net".into()]).unwrap()
+        Rewriter::new(
+            vec!["emby.example.net".into(), "emby2.example.net".into()],
+            vec![("vod.example.net".into(), "/__vod".into())],
+        )
+        .unwrap()
     }
 
     fn rw(body: &str) -> String {
@@ -207,6 +236,26 @@ mod tests {
     }
 
     #[test]
+    fn moves_mounted_hosts_under_their_prefix() {
+        for (from, to) in [
+            (
+                r#"{"u":"https://vod.example.net/play/video/1?api_key=k"}"#,
+                r#"{"u":"https://media.example.com:8443/__vod/play/video/1?api_key=k"}"#,
+            ),
+            (
+                r#"{"u":"http:\/\/VOD.example.net\/play"}"#,
+                r#"{"u":"https:\/\/media.example.com:8443\/__vod\/play"}"#,
+            ),
+            (
+                r#"{"u":"//vod.example.net/play","h":"vod.example.net"}"#,
+                r#"{"u":"//media.example.com:8443/__vod/play","h":"media.example.com"}"#,
+            ),
+        ] {
+            assert_eq!(rw(from), to, "{from}");
+        }
+    }
+
+    #[test]
     fn replaces_ip_literals_after_a_scheme() {
         assert_eq!(
             rw(r#"{"LocalAddress":"http://172.17.0.1:8096","Wan":"https://[2001:db8::1]:8920/w"}"#),
@@ -222,7 +271,7 @@ mod tests {
     fn leaves_other_names_alone() {
         let r = rewriter();
         for body in [
-            r#"{"a":"https://vod.example.net/x"}"#,
+            r#"{"a":"https://vod2.example.net/x"}"#,
             r#"{"a":"https://emby.example.net.evil.example/x"}"#,
             r#"{"a":"https://xemby.example.net/x"}"#,
             r#"{"a":"https://emby.example.network/x"}"#,

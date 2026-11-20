@@ -102,6 +102,26 @@ async fn connection_retries_are_bounded_and_the_working_address_is_kept() {
 }
 
 #[tokio::test]
+async fn an_address_that_failed_is_not_tried_again_for_the_same_request() {
+    let w = world(&[ip(2), ip(3)]).await;
+    let (code, _) = w.send(Proto::H1, "GET", "/__seq/twice/200").await;
+    assert_eq!(code, 502);
+    let l = &w.relay.access_lines(ACCESS_LOG, 1)[0];
+    let port = w._origin.addr.port();
+    let addrs: Vec<&str> = l["up"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["addr"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        addrs,
+        [format!("127.0.0.2:{port}"), format!("127.0.0.3:{port}")],
+        "{l}"
+    );
+}
+
+#[tokio::test]
 async fn post_is_retried_after_a_refused_connection() {
     let w = world(&[ip(2), ip(1)]).await;
     assert_eq!(

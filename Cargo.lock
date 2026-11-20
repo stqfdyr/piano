@@ -1441,6 +1441,7 @@ dependencies = [
  "async-trait",
  "clap",
  "log",
+ "nix",
  "piano-config",
  "piano-edge",
  "piano-proxy",
