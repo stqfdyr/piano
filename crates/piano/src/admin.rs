@@ -3,8 +3,9 @@
 use crate::{Live, procfs};
 use log::{LevelFilter, error, info, warn};
 use piano_ctl::proto::{
-    self, Certificate, ConfigState, Connections, Finding, Level, RELOAD_SCHEMA, ReloadRecord,
-    ReloadReply, STATUS_SCHEMA, SiteStatus, Status, Traffic,
+    self, CACHE_SCHEMA, CacheStats, Certificate, ConfigState, Connections, Finding, Level,
+    PurgeReply, RELOAD_SCHEMA, ReloadRecord, ReloadReply, STATUS_SCHEMA, SiteStatus, Status,
+    Traffic, UpstreamBudget,
 };
 use piano_telemetry::logger;
 use piano_telemetry::metrics::{Counts, End, STATUS_CLASSES};
@@ -123,6 +124,54 @@ impl Admin {
             error: reply.error.clone(),
         });
         reply
+    }
+
+    /// What `piano cache stats` shows.
+    pub fn cache(&self) -> CacheStats {
+        let s = self.live.images.stats();
+        CacheStats {
+            schema: CACHE_SCHEMA,
+            images: s.images,
+            bytes: s.bytes,
+            capacity: s.capacity,
+            missing: s.missing,
+            redirects: s.moved,
+            hits: s.hits,
+            misses: s.misses,
+            coalesced: s.coalesced,
+            stale: s.stale,
+            revalidated: s.revalidated,
+            missing_hits: s.missing_hits,
+            shed: s.shed,
+            redirect_hits: s.moved_hits,
+            upstreams: s
+                .budgets
+                .into_iter()
+                .map(|(upstream, b)| UpstreamBudget {
+                    upstream,
+                    burst: b.rate.map(|r| r.burst),
+                    per_sec: b.rate.map(|r| r.per_sec),
+                    tokens: b.tokens,
+                    paused_secs: b.paused_for.map(|d| d.as_secs_f64()),
+                    limited: b.limited,
+                })
+                .collect(),
+        }
+    }
+
+    /// Forgets stored images, remembered redirects and misses.
+    pub fn purge(&self) -> PurgeReply {
+        let p = self.live.images.purge();
+        info!(
+            "image cache purged: {} images, {} misses, {} redirects",
+            p.images, p.missing, p.moved
+        );
+        PurgeReply {
+            schema: CACHE_SCHEMA,
+            images: p.images,
+            missing: p.missing,
+            redirects: p.moved,
+        }
     }
 
     /// Everything `piano status` shows.

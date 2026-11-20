@@ -6,6 +6,7 @@ mod access;
 mod control;
 mod follow;
 mod headers;
+mod images;
 mod limits;
 mod log;
 mod media;

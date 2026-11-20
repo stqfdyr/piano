@@ -12,7 +12,7 @@ use piano_config::Config;
 use piano_edge::acl::{AccessFilter, Acl};
 use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_media::Streams;
-use piano_proxy::{MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
+use piano_proxy::{Images, MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites};
 use piano_telemetry::{AccessLog, Metrics};
 use piano_upstream::{Origin, PeerOptions, Resolver};
 use pingora_core::apps::HttpServerOptions;
@@ -127,6 +127,7 @@ pub struct Live {
     metrics: Arc<Metrics>,
     accept: Arc<AcceptStats>,
     streams: Arc<Streams>,
+    images: Arc<Images>,
 }
 
 /// Settings read once at startup; a reload that changes them only warns.
@@ -256,6 +257,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
     let mut client = ConnectorOptions::from_server_conf(&conf);
     client.rustls_client_config = Some((client_tls.config, client_tls.roots));
     let streams = Arc::new(Streams::default());
+    let images = Arc::new(Images::new(image_memory(config)));
 
     let mut service = ProxyServiceBuilder::new(
         &conf,
@@ -264,6 +266,7 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
             resolver.clone(),
             client.clone(),
             Arc::clone(&streams),
+            Arc::clone(&images),
             Arc::clone(&access_log),
             metrics.unrouted(),
         ),
@@ -305,8 +308,14 @@ pub fn build(config: &Config, resolver: Resolver) -> Result<Daemon, Error> {
         metrics,
         accept,
         streams,
+        images,
     });
     Ok(Daemon { server, live })
+}
+
+/// Bytes of image bodies the configuration allows.
+fn image_memory(config: &Config) -> usize {
+    usize::try_from(config.cache.image_memory_mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
 }
 
 /// How client connections are kept between requests.
@@ -343,6 +352,7 @@ impl Live {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
         self.access.replace(acl);
         self.sites.store(Arc::new(sites));
+        self.images.set_capacity(image_memory(config));
         Ok(self.fixed.changed(&Fixed::of(config)))
     }
 

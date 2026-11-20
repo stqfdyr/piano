@@ -91,8 +91,9 @@ impl AttemptLog {
 pub(crate) struct Reach {
     pub resolver: Resolver,
     pub follow_addrs: AddrCache,
-    /// Connections for media streams. A pool of its own: the relay's pool belongs to
-    /// pingora's proxy loop, which offers no way to borrow from it.
+    /// Connections for the requests the relay makes itself: media streams and image
+    /// fetches. A pool of its own: the relay's pool belongs to pingora's proxy loop,
+    /// which offers no way to borrow from it.
     pub media: Connector,
 }
 

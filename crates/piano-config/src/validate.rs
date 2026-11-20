@@ -57,6 +57,8 @@ pub enum ValidationError {
     RelativeAccessLog(std::path::PathBuf),
     #[error("control.socket {0:?} must be an absolute path")]
     RelativeSocket(std::path::PathBuf),
+    #[error("site {site:?}: upstream_limit {reason}")]
+    BadUpstreamLimit { site: String, reason: &'static str },
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
         site: String,
@@ -281,6 +283,21 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
                         other: other_name.clone(),
                     });
                 }
+            }
+        }
+        if let Some(l) = site.upstream_limit {
+            let reason = if !(l.burst >= 1.0 && l.burst.is_finite()) {
+                Some("burst must be at least 1")
+            } else if !(l.per_sec > 0.0 && l.per_sec.is_finite()) {
+                Some("per_sec must be above 0")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                errors.push(ValidationError::BadUpstreamLimit {
+                    site: site.name.clone(),
+                    reason,
+                });
             }
         }
         for path in &site.block {
@@ -512,6 +529,33 @@ max_connections = 0
         );
         let errs = errors(&text);
         assert_eq!(errs.len(), 3, "{errs:?}");
+    }
+
+    #[test]
+    fn cache_and_upstream_limit() {
+        let c = parse(MINIMAL).unwrap();
+        assert_eq!(c.cache.image_memory_mib, 128);
+        assert_eq!(c.sites[0].upstream_limit, None);
+        let ok = format!(
+            "{MINIMAL}upstream_limit = {{ burst = 200, per_sec = 2.5 }}\n[cache]\nimage_memory_mib = 0\n"
+        );
+        let c = parse(&ok).unwrap();
+        assert_eq!(c.cache.image_memory_mib, 0);
+        let l = c.sites[0].upstream_limit.unwrap();
+        assert_eq!((l.burst, l.per_sec), (200.0, 2.5));
+        let shown = c.effective_toml().unwrap();
+        assert!(shown.contains("per_sec = 2.5"), "{shown}");
+        for bad in [
+            "{ burst = 0, per_sec = 1 }",
+            "{ burst = 5, per_sec = 0 }",
+            "{ burst = nan, per_sec = 1 }",
+        ] {
+            let errs = errors(&format!("{MINIMAL}upstream_limit = {bad}\n"));
+            assert!(
+                matches!(errs[..], [ValidationError::BadUpstreamLimit { .. }]),
+                "{bad}: {errs:?}"
+            );
+        }
     }
 
     #[test]

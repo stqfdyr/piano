@@ -46,6 +46,8 @@ impl Response {
 pub const STATUS_SCHEMA: u32 = 1;
 /// Version of [`ReloadReply`].
 pub const RELOAD_SCHEMA: u32 = 1;
+/// Version of [`CacheStats`] and [`PurgeReply`].
+pub const CACHE_SCHEMA: u32 = 1;
 
 /// Reply to `status`. Times are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -203,6 +205,60 @@ pub struct ReloadReply {
     pub config_error: bool,
     pub restart_needed: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// Reply to `cache`: the image engine since start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub schema: u32,
+    /// Image bodies held, their bytes and the memory allowed for them.
+    pub images: u64,
+    pub bytes: u64,
+    pub capacity: u64,
+    /// Images the upstream answered 404 for, remembered for a while.
+    pub missing: u64,
+    /// Remembered permanent redirects.
+    pub redirects: u64,
+    /// How image requests were answered since start: from memory (`hits`), by an
+    /// upstream request of their own (`misses`) or one they shared (`coalesced`), from an
+    /// expired copy because the upstream failed (`stale`), after the upstream confirmed
+    /// the copy (`revalidated`), with a remembered 404 (`missing_hits`), or with 429
+    /// because the budget did not allow a request in time (`shed`).
+    pub hits: u64,
+    pub misses: u64,
+    pub coalesced: u64,
+    pub stale: u64,
+    pub revalidated: u64,
+    pub missing_hits: u64,
+    pub shed: u64,
+    /// Upstream requests that went straight to a remembered redirect target.
+    pub redirect_hits: u64,
+    pub upstreams: Vec<UpstreamBudget>,
+}
+
+/// The request budget of one upstream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpstreamBudget {
+    /// `host:port`.
+    pub upstream: String,
+    /// The configured limit; `None` when only 429 pauses apply.
+    pub burst: Option<f64>,
+    pub per_sec: Option<f64>,
+    /// Requests the budget allows now.
+    pub tokens: f64,
+    /// Seconds left of a pause the upstream asked for.
+    pub paused_secs: Option<f64>,
+    /// Upstream 429 answers since start.
+    pub limited: u64,
+}
+
+/// Reply to `cache purge`: what was removed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PurgeReply {
+    pub schema: u32,
+    pub images: u64,
+    pub missing: u64,
+    pub redirects: u64,
 }
 
 #[cfg(test)]

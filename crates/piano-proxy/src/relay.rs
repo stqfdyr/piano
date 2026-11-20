@@ -2,6 +2,7 @@
 
 use crate::follow::{self, Target, TargetKind};
 use crate::headers;
+use crate::image::{self, Images};
 use crate::media;
 use crate::reach::{
     self, AttemptLog, CONNECT_RETRIES, Hop, REFUSED, Reach, clip, is_connect_failure,
@@ -102,6 +103,9 @@ pub struct Ctx {
     rewrite: Option<Rewrite>,
     /// Addresses replaced in the response body, once a collected body was rewritten.
     rewritten: Option<usize>,
+    /// How the image engine answered: hit, miss, coalesced, stale, revalidated, missing
+    /// or shed.
+    pub(crate) cache: Option<&'static str>,
 }
 
 impl Ctx {
@@ -131,6 +135,7 @@ pub struct Relay {
     sites: Arc<ArcSwap<Sites>>,
     pub(crate) reach: Arc<Reach>,
     pub(crate) streams: Arc<Streams>,
+    pub(crate) images: Arc<Images>,
     access: Arc<AccessLog>,
     /// Requests for a host that is no site.
     unrouted: Arc<SiteCounters>,
@@ -139,13 +144,14 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// `client` configures the connections of media streams, which the relay makes
-    /// itself; `streams` lists those streams while they run.
+    /// `client` configures the connections the relay makes itself, for media streams
+    /// and images; `streams` lists those streams while they run.
     pub fn new(
         sites: Arc<ArcSwap<Sites>>,
         resolver: Resolver,
         client: ConnectorOptions,
         streams: Arc<Streams>,
+        images: Arc<Images>,
         access: Arc<AccessLog>,
         unrouted: Arc<SiteCounters>,
     ) -> Self {
@@ -153,6 +159,7 @@ impl Relay {
             sites,
             reach: Arc::new(Reach::new(resolver, client)),
             streams,
+            images,
             access,
             unrouted,
             api_gets: AtomicU64::new(0),
@@ -328,6 +335,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
     opt_num(&mut j, "dur_ms", ctx.start.map(|s| millis(s.elapsed())));
     opt_num(&mut j, "ttfb_ms", ctx.ttfb.map(millis));
     opt_num(&mut j, "rewrite", ctx.rewritten.map(|n| n as u64));
+    opt_str(&mut j, "cache", ctx.cache);
     j.str("end", end.as_str());
     let err = e.map(|e| redact(clip(&e.to_string(), MAX_ERR)).into_owned());
     opt_str(&mut j, "err", err.as_deref());
@@ -468,6 +476,9 @@ impl ProxyHttp for Relay {
             media::relay(self, session, ctx).await?;
             return Ok(true);
         }
+        if ctx.class == RouteClass::Image && image::takes(session) {
+            return image::serve(self, session, ctx).await;
+        }
         Ok(false)
     }
 
@@ -475,6 +486,9 @@ impl ProxyHttp for Relay {
         let host = ctx.target_host()?.to_owned();
         let site = ctx.site()?;
         let (mut peer, addrs, addr) = self.reach.peer(site, ctx.hop.as_ref()).await?;
+        if image::at_origin(site, ctx.hop.as_ref()) {
+            self.images.budget(site).charge(Instant::now());
+        }
         if ctx.class.may_idle() {
             peer.options.read_timeout = None;
             peer.options.write_timeout = None;
@@ -550,6 +564,10 @@ impl ProxyHttp for Relay {
         }
         ctx.ttfb = ctx.start.map(|s| s.elapsed());
         ctx.cf_ray = upstream_response.headers.get("cf-ray").cloned();
+        let site = ctx.site()?;
+        if image::at_origin(site, ctx.hop.as_ref()) {
+            image::note_upstream(&self.images.budget(site), upstream_response);
+        }
         if !follow::is_redirect(status) {
             return Ok(());
         }

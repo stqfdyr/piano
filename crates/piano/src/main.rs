@@ -7,7 +7,7 @@ mod render;
 
 use clap::{Parser, Subcommand};
 use piano_ctl::ClientError;
-use piano_ctl::proto::{ReloadReply, Status};
+use piano_ctl::proto::{CacheStats, PurgeReply, ReloadReply, Status};
 use piano_upstream::Resolver;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -73,6 +73,11 @@ enum Command {
         #[command(subcommand)]
         command: LogCommand,
     },
+    /// Image cache commands.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Print the version.
     Version,
 }
@@ -83,6 +88,14 @@ enum ConfigCommand {
     Check,
     /// Print the configuration with every default written out.
     Show,
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// How image requests were answered, memory in use and each upstream's budget.
+    Stats,
+    /// Forget stored images, remembered redirects and remembered misses.
+    Purge,
 }
 
 #[derive(Subcommand)]
@@ -141,6 +154,12 @@ fn main() -> ExitCode {
             command: ConfigCommand::Show,
         } => config_show(&cli),
         Command::Log { ref command } => log(&cli, command),
+        Command::Cache {
+            command: CacheCommand::Stats,
+        } => cache_stats(&cli),
+        Command::Cache {
+            command: CacheCommand::Purge,
+        } => cache_purge(&cli),
         Command::Run => {
             let level = level_override.unwrap_or(log::LevelFilter::Info);
             if let Err(e) = piano_telemetry::logger::init(level) {
@@ -234,6 +253,35 @@ fn reload(cli: &Cli) -> ExitCode {
         (false, true) => ExitCode::from(exit::CONFIG),
         (false, false) => ExitCode::from(exit::RUNTIME),
     }
+}
+
+fn cache_stats(cli: &Cli) -> ExitCode {
+    let stats: CacheStats = match ask(cli, "cache", STATUS_TIMEOUT) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    if cli.json {
+        print_json(&stats);
+    } else {
+        print!("{}", render::cache(&stats));
+    }
+    ExitCode::SUCCESS
+}
+
+fn cache_purge(cli: &Cli) -> ExitCode {
+    let reply: PurgeReply = match ask(cli, "cache purge", STATUS_TIMEOUT) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    if cli.json {
+        print_json(&reply);
+    } else {
+        println!(
+            "purged {} images, {} remembered misses, {} remembered redirects",
+            reply.images, reply.missing, reply.redirects
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn config_show(cli: &Cli) -> ExitCode {

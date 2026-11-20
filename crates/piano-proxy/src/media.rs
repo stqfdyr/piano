@@ -20,6 +20,7 @@ use http::header::{
 };
 use http::{HeaderName, HeaderValue, Method, Version};
 use log::{debug, warn};
+use piano_cache::Budget;
 use piano_edge::acl::canonical;
 use piano_media::{ByteRange, Head, Resume, Stream, StreamGuard};
 use piano_telemetry::{Id, redact};
@@ -116,6 +117,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
     ));
     let spec = Arc::new(Spec {
         reach: Arc::clone(&relay.reach),
+        budget: relay.images.budget(site),
         stall: site.origin.options.read_timeout,
         req: upstream_request(req)?,
         client_path: req.raw_path().to_vec(),
@@ -154,7 +156,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
 
 /// The client's request made fit to send upstream: origin-form target, HTTP/1.1,
 /// without hop-by-hop fields and without `Range`, which each request sets itself.
-fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
+pub(crate) fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
     let mut up = req.clone();
     up.set_version(Version::HTTP_11);
     let target = match req.uri.path_and_query() {
@@ -183,6 +185,9 @@ fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
 /// What every upstream request of one stream shares.
 struct Spec {
     reach: Arc<Reach>,
+    /// The site's upstream request budget, which requests to the upstream itself count
+    /// against.
+    budget: Arc<Budget>,
     sites: Arc<Sites>,
     site: usize,
     req: RequestHeader,
@@ -578,6 +583,10 @@ async fn request(
         let (mut peer, addrs, addr) = spec.reach.peer(site, hop.as_ref()).await?;
         peer.options.read_timeout = Some(spec.stall);
         let entry = spec.push(AttemptLog::new(id, host.clone(), addr));
+        let origin = crate::image::at_origin(site, hop.as_ref());
+        if origin {
+            spec.budget.charge(Instant::now());
+        }
         let (mut http, reused) = match spec.reach.media.get_http_session(&peer).await {
             Ok(c) => c,
             Err(e) => {
@@ -621,6 +630,9 @@ async fn request(
         };
         let status = resp.status.as_u16();
         spec.note(entry, |a| a.status = Some(status));
+        if origin {
+            crate::image::note_upstream(&spec.budget, &resp);
+        }
         let location = follow::is_redirect(status)
             .then(|| resp.headers.get(LOCATION))
             .flatten();
@@ -668,7 +680,7 @@ async fn request(
         .into_up())
 }
 
-async fn exchange(http: &mut HttpSession, req: RequestHeader) -> Result<ResponseHeader> {
+pub(crate) async fn exchange(http: &mut HttpSession, req: RequestHeader) -> Result<ResponseHeader> {
     http.write_request_header(Box::new(req)).await?;
     http.finish_body().await?;
     http.read_response().await?;
@@ -685,7 +697,7 @@ async fn exchange(http: &mut HttpSession, req: RequestHeader) -> Result<Response
 }
 
 /// Reads the rest of a redirect's body so its connection can be reused.
-async fn drain(reach: Arc<Reach>, mut http: HttpSession, peer: HttpPeer) {
+pub(crate) async fn drain(reach: Arc<Reach>, mut http: HttpSession, peer: HttpPeer) {
     let read = tokio::time::timeout(DRAIN_TIMEOUT, async {
         let mut n = 0;
         while let Some(b) = http.read_body_ref().await? {

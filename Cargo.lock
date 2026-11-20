@@ -1542,6 +1542,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
+ "piano-cache",
  "piano-config",
  "piano-edge",
  "piano-media",

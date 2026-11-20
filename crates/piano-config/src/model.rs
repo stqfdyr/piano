@@ -22,6 +22,8 @@ pub struct Config {
     pub log: Log,
     #[serde(default)]
     pub control: Control,
+    #[serde(default)]
+    pub cache: Cache,
     #[serde(default, rename = "site")]
     pub sites: Vec<Site>,
 }
@@ -175,6 +177,36 @@ impl Control {
     }
 }
 
+/// The image cache.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Cache {
+    /// Memory for image bodies, in MiB; 0 stores none. Remembered redirects and missing
+    /// images are kept either way.
+    pub image_memory_mib: u64,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            // Replaying two months of image requests at both relays, an LRU of 128 MB
+            // serves 22–40% of them per upstream; all distinct images would take 3 GB.
+            // The smallest relay has 350 MB available.
+            image_memory_mib: 128,
+        }
+    }
+}
+
+/// The request limit an upstream enforces per client address, as measured.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamLimit {
+    /// Requests allowed at once.
+    pub burst: f64,
+    /// Requests allowed per second after that.
+    pub per_sec: f64,
+}
+
 /// Severity threshold of the diagnostic log.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -233,6 +265,11 @@ pub struct Site {
     /// upstream directly.
     #[serde(default)]
     pub server_domains: ServerDomains,
+    /// The upstream's request limit. Image requests then queue so that a quarter of it
+    /// stays free for browsing and playback. Without it, image requests only hold back
+    /// while the upstream asks for a pause with 429.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_limit: Option<UpstreamLimit>,
     /// Parsed form of `upstream`, filled in by validation.
     #[serde(skip)]
     pub upstream_url: Option<UpstreamUrl>,

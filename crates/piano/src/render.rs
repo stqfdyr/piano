@@ -1,6 +1,6 @@
 //! Text output of the management commands.
 
-use piano_ctl::proto::{Counts, Level, ReloadReply, Status};
+use piano_ctl::proto::{CacheStats, Counts, Level, ReloadReply, Status};
 use piano_telemetry::metrics::End;
 use std::fmt::Write;
 use std::io::IsTerminal;
@@ -230,6 +230,54 @@ pub fn status(s: &Status, color: Color) -> String {
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+pub fn cache(c: &CacheStats) -> String {
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "images   {} stored · {} of {} · {} misses and {} redirects remembered",
+        c.images,
+        mib(c.bytes),
+        mib(c.capacity),
+        c.missing,
+        c.redirects
+    );
+    let answered =
+        c.hits + c.misses + c.coalesced + c.stale + c.revalidated + c.missing_hits + c.shed;
+    let share = |n: u64| match answered {
+        0 => "-".to_owned(),
+        a => format!("{}%", n * 100 / a),
+    };
+    let _ = writeln!(
+        o,
+        "since start  {answered} requests · from memory {} ({}) · upstream {} · shared {} · \
+         stale {} · revalidated {} · remembered 404 {} · shed 429 {} · via remembered redirect {}",
+        c.hits,
+        share(c.hits),
+        c.misses,
+        c.coalesced,
+        c.stale,
+        c.revalidated,
+        c.missing_hits,
+        c.shed,
+        c.redirect_hits
+    );
+    for u in &c.upstreams {
+        let limit = match (u.burst, u.per_sec) {
+            (Some(b), Some(r)) => format!("limit {b} + {r}/s, {:.0} left", u.tokens),
+            _ => "no limit set".to_owned(),
+        };
+        let paused = u
+            .paused_secs
+            .map_or_else(String::new, |s| format!(" · paused {s:.0}s"));
+        let _ = writeln!(
+            o,
+            "upstream {} · {limit} · {} × 429 since start{paused}",
+            u.upstream, u.limited
+        );
+    }
+    o
 }
 
 pub fn reload(r: &ReloadReply) -> String {

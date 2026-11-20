@@ -11,6 +11,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+piano-cache = { path = "crates/piano-cache" }
 piano-config = { path = "crates/piano-config" }
 piano-ctl = { path = "crates/piano-ctl" }
 piano-edge = { path = "crates/piano-edge" }

@@ -5,6 +5,7 @@ use crate::headers::{UaRuleError, UaRules};
 use crate::rewrite::Rewriter;
 use crate::route::BlockList;
 use http::HeaderValue;
+use piano_cache::Rate;
 use piano_config::ServerDomains;
 use piano_telemetry::SiteCounters;
 use piano_upstream::Origin;
@@ -32,6 +33,8 @@ pub struct Policy {
     pub rewriter: Rewriter,
     pub server_domains: ServerDomains,
     pub mounts: Mounts,
+    /// The upstream's request limit, which image requests keep a share of free.
+    pub upstream_limit: Option<Rate>,
 }
 
 /// Path prefixes relayed to other hosts of the upstream service.
@@ -106,6 +109,10 @@ impl Policy {
             rewriter: Rewriter::new(names, mounted)?,
             server_domains: site.server_domains,
             mounts: Mounts::new(&site.mounts),
+            upstream_limit: site.upstream_limit.map(|l| Rate {
+                burst: l.burst,
+                per_sec: l.per_sec,
+            }),
         })
     }
 }
@@ -193,6 +200,7 @@ mod tests {
             rewriter: Rewriter::new(Vec::new(), Vec::new()).unwrap(),
             server_domains: ServerDomains::default(),
             mounts: Mounts::default(),
+            upstream_limit: None,
         };
         Site::new(host.into(), host.into(), origin, policy, Arc::default()).unwrap()
     }

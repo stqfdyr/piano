@@ -1,6 +1,6 @@
 [package]
 name = "piano-cache"
-description = "Image cache"
+description = "Image cache: keys, freshness, LRU store, upstream request budget"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

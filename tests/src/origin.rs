@@ -26,6 +26,13 @@
 //!   (query `len=N`), with single-range support; see [`Plan`] for `plan=…`. With
 //!   `redirect=1`, `/videos/…` answers 302 to `/__file/{key}` with the other
 //!   parameters. [`Origin::seen`] lists the `Range` of each file request per key.
+//! - `/Items/{key}/Images/{kind}` (also under `/emby`) and `/img/{key}`: an image
+//!   `image {key}` with ETag `"{key}"`, answering a matching If-None-Match with 304.
+//!   Query: `ttl=N` sets `max-age` (default 60, 0 omits Cache-Control; `/img/` always
+//!   86400), `codes=…` answers the n-th request of the path with the n-th status (the
+//!   last repeats; 429 carries `Retry-After` from `retry=N`, default 1), `moved=1` answers
+//!   301 to `/img/{key}`, `delay_ms=N` waits first. [`Origin::hits`] counts requests per
+//!   path.
 //! - anything else: 404.
 
 use crate::pki::Leaf;
@@ -185,6 +192,12 @@ impl Origin {
         seen.get(key).cloned().unwrap_or_default()
     }
 
+    /// Requests for image path `path` (without query).
+    pub fn hits(&self, path: &str) -> usize {
+        let seqs = self.state.seqs.lock().unwrap();
+        seqs.get(&format!("img:{path}")).copied().unwrap_or(0)
+    }
+
     /// Redirects answered for scripted media `key`.
     pub fn redirects(&self, key: &str) -> usize {
         let seqs = self.state.seqs.lock().unwrap();
@@ -210,6 +223,9 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
     }
     if let Some(key) = media_key(req.uri().path()) {
         return Ok(media(&req, key.to_owned(), &state).await);
+    }
+    if let Some(response) = image(&req, &state).await {
+        return Ok(response);
     }
     let seqs = state.seqs;
     let path = req.uri().path();
@@ -332,6 +348,89 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
             .body(full(Bytes::new()))
     };
     Ok(response.unwrap())
+}
+
+/// The image routes; `None` for other paths.
+async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBody>> {
+    let path = req.uri().path();
+    let p = path.strip_prefix("/emby").unwrap_or(path);
+    let (key, target) = match p.strip_prefix("/Items/") {
+        Some(rest) => {
+            let (key, tail) = rest.split_once('/')?;
+            if !tail.starts_with("Images/") {
+                return None;
+            }
+            (key, false)
+        }
+        None => (p.strip_prefix("/img/")?, true),
+    };
+    let n = {
+        let mut seqs = state.seqs.lock().unwrap();
+        let n = seqs.entry(format!("img:{path}")).or_default();
+        *n += 1;
+        *n
+    };
+    let query = req.uri().query().unwrap_or_default();
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+    };
+    if let Some(ms) = param("delay_ms").and_then(|v| v.parse().ok()) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+    let code: u16 = match param("codes") {
+        Some(c) => {
+            let codes: Vec<u16> = c.split(',').map(|c| c.parse().unwrap()).collect();
+            codes[(n - 1).min(codes.len() - 1)]
+        }
+        None => 200,
+    };
+    if !target && code == 200 && param("moved") == Some("1") {
+        return Some(
+            Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header("location", format!("/img/{key}"))
+                .body(full("moved"))
+                .unwrap(),
+        );
+    }
+    let ttl: u64 = if target {
+        86_400
+    } else {
+        param("ttl").and_then(|v| v.parse().ok()).unwrap_or(60)
+    };
+    let etag = format!("\"{key}\"");
+    let mut builder = Response::builder().status(code);
+    if ttl > 0 {
+        builder = builder.header("cache-control", format!("public, max-age={ttl}"));
+    }
+    if code == 429 {
+        builder = builder.header("retry-after", param("retry").unwrap_or("1"));
+    }
+    if code != 200 {
+        return Some(builder.body(full(Bytes::new())).unwrap());
+    }
+    let builder = builder.header("etag", &etag);
+    if req
+        .headers()
+        .get("if-none-match")
+        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+    {
+        return Some(
+            builder
+                .status(StatusCode::NOT_MODIFIED)
+                .body(full(Bytes::new()))
+                .unwrap(),
+        );
+    }
+    Some(
+        builder
+            .header(CONTENT_TYPE, "image/jpeg")
+            .header("last-modified", "Sun, 23 Nov 2025 02:39:49 GMT")
+            .body(full(format!("image {key}")))
+            .unwrap(),
+    )
 }
 
 /// Answers an upgrade request with 101 and echoes the upgraded stream.

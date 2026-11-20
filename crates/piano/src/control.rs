@@ -37,6 +37,8 @@ impl Handler for Commands {
         match cmd {
             "status" => Some(to_value(&self.0.status())),
             "reload" => Some(to_value(&self.0.reload().await)),
+            "cache" => Some(to_value(&self.0.cache())),
+            "cache purge" => Some(to_value(&self.0.purge())),
             _ => None,
         }
     }
