@@ -230,6 +230,10 @@ pub struct StopReply {
     pub pid: u32,
     /// The longest the daemon waits for requests in progress, in seconds.
     pub limit_secs: u64,
+    /// The process this one took over from, if it still runs: it drains media streams
+    /// and stops on the same signal.
+    #[serde(default)]
+    pub draining_pid: Option<u32>,
 }
 
 /// Reply to `upgrade`: whether a new process took over the listening sockets.

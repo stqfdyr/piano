@@ -607,6 +607,7 @@ impl Live {
             schema: piano_ctl::proto::STOP_SCHEMA,
             pid: std::process::id(),
             limit_secs: whole_secs(self.fixed.shutdown_timeout),
+            draining_pid: self.predecessor.filter(|&p| upgrade::runs_same_program(p)),
         }
     }
 

@@ -70,14 +70,15 @@ enum Command {
         #[arg(long, hide = true)]
         takeover: Option<u32>,
     },
+    /// Stop the daemon as SIGTERM does and wait until it has exited, together with a
+    /// process it replaced that is still draining. Use as the service manager's stop
+    /// command: after an upgrade the daemon is not the service manager's child, so it
+    /// could not wait for it.
+    Stop,
     /// Replace the running daemon by a new process without dropping streams: the new
     /// process takes over the listening sockets, the old one keeps its media streams
     /// until they end (server.drain_timeout at most). Also applies settings that need a
     /// restart.
-    /// Stop the daemon as SIGTERM does and wait until it has exited. Use as systemd's
-    /// ExecStop: after an upgrade the daemon is not systemd's child, so systemd could not
-    /// wait for it.
-    Stop,
     Upgrade {
         /// The new binary; by default the file the daemon was started from, which may
         /// have been replaced since.
@@ -358,14 +359,29 @@ fn stop(cli: &Cli) -> ExitCode {
         Ok(r) => r,
         Err(code) => return code,
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(reply.limit_secs) + STOP_MARGIN;
-    let proc_dir = PathBuf::from(format!("/proc/{}", reply.pid));
-    while proc_dir.exists() {
+    // The process an upgrade replaced gets the signal passed on and stops within the same
+    // limit; it still holds the listening sockets until then, so a start right after
+    // this command would fail without waiting for it too.
+    let limit = Duration::from_secs(reply.limit_secs) + STOP_MARGIN;
+    let deadline = std::time::Instant::now() + limit;
+    let pids: Vec<u32> = std::iter::once(reply.pid)
+        .chain(reply.draining_pid)
+        .collect();
+    loop {
+        let left: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|p| Path::new(&format!("/proc/{p}")).exists())
+            .collect();
+        if left.is_empty() {
+            break;
+        }
         if std::time::Instant::now() >= deadline {
+            let left: Vec<String> = left.iter().map(u32::to_string).collect();
             eprintln!(
-                "pid {} is still running {}s after it was asked to stop",
-                reply.pid,
-                (Duration::from_secs(reply.limit_secs) + STOP_MARGIN).as_secs()
+                "pid {} still running {}s after it was asked to stop",
+                left.join(", "),
+                limit.as_secs()
             );
             return ExitCode::from(exit::RUNTIME);
         }

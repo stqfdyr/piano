@@ -384,17 +384,19 @@ pub fn remove_pidfile(path: &Path) {
     }
 }
 
+/// Whether `pid` is a live process running the same program as this one.
+pub(crate) fn runs_same_program(pid: u32) -> bool {
+    let comm = |p: &str| std::fs::read(format!("/proc/{p}/comm")).ok();
+    matches!((comm(&pid.to_string()), comm("self")), (Some(theirs), Some(ours)) if theirs == ours)
+}
+
 /// Passes a terminate signal on to the process this one took over from, which may still
 /// be draining; only if that pid still runs the same program.
 pub(crate) fn forward_terminate(pid: u32) {
-    let comm = |p: &str| std::fs::read(format!("/proc/{p}/comm")).ok();
-    let (Some(theirs), Some(ours)) = (comm(&pid.to_string()), comm("self")) else {
-        return;
-    };
     let Ok(raw) = i32::try_from(pid) else {
         return;
     };
-    if theirs == ours {
+    if runs_same_program(pid) {
         match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), nix::sys::signal::SIGTERM) {
             Ok(()) => info!("passed the terminate signal on to pid {pid}, which is draining"),
             Err(e) => warn!("cannot signal pid {pid}: {e}"),
