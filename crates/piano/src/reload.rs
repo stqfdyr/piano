@@ -23,6 +23,10 @@ const CERT_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// unnoticed.
 const ORIGIN_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
+/// How often an upstream that did not resolve at startup is looked up again: the
+/// resolver's own timeout per try (resolv.conf default), so lookups do not pile up.
+pub(crate) const UNRESOLVED_RETRY_EVERY: Duration = Duration::from_secs(5);
+
 /// Applies configuration reloads and log reopening to the running daemon, picks up
 /// renewed certificates, snapshots the request counters, writes the traffic record and
 /// writes out the summaries of rate-limited log records. Once the server stops, only the
@@ -119,6 +123,12 @@ impl ServiceWithDependents for Reloader {
             tokio::time::Instant::now() + ORIGIN_REFRESH_EVERY,
             ORIGIN_REFRESH_EVERY,
         );
+        let mut retry = tokio::time::interval_at(
+            tokio::time::Instant::now() + UNRESOLVED_RETRY_EVERY,
+            UNRESOLVED_RETRY_EVERY,
+        );
+        retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut unresolved = self.admin.live().unresolved_origins();
         let mut refreshing = None;
         loop {
             tokio::select! {
@@ -133,6 +143,12 @@ impl ServiceWithDependents for Reloader {
                 }
                 _ = certs.tick() => self.refresh_certs().await,
                 _ = origins.tick() => self.refresh_origins(&mut refreshing),
+                _ = retry.tick(), if unresolved => {
+                    unresolved = self.admin.live().unresolved_origins();
+                    if unresolved {
+                        self.refresh_origins(&mut refreshing);
+                    }
+                }
                 _ = shutdown.changed() => break,
             }
         }

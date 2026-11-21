@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) const CERT_WARN_DAYS: i64 = 14;
 /// Few enough days left that clients will soon refuse the certificate.
 pub(crate) const CERT_ERROR_DAYS: i64 = 3;
+/// What status shows as the address of an upstream that does not resolve yet.
+const UNRESOLVED: &str = "unresolved";
 /// Share of a limit in use from which status warns.
 const NEAR_LIMIT_PERCENT: u64 = 80;
 
@@ -312,7 +314,11 @@ impl Admin {
                     name: s.name.clone(),
                     host: s.host.clone(),
                     upstream: format!("{}:{}", s.origin.host, s.origin.port),
-                    address: s.origin.addrs.current().to_string(),
+                    address: s
+                        .origin
+                        .addrs
+                        .current()
+                        .map_or_else(|| UNRESOLVED.to_owned(), |a| a.to_string()),
                     traffic: Traffic {
                         total: counts
                             .map(|c| wire(&c.total))
@@ -366,6 +372,25 @@ impl Admin {
         };
         drop(state);
         status.findings = findings(&status, unix(now));
+        for s in live
+            .sites
+            .load()
+            .iter()
+            .filter(|s| s.origin.addrs.is_empty())
+        {
+            status.findings.push(finding(
+                Level::Error,
+                "upstream_unresolved",
+                format!(
+                    "{}: upstream {} has not resolved since startup; its requests fail",
+                    s.name, s.origin.host
+                ),
+                Some(&format!(
+                    "the lookup is retried every {} s; piano doctor shows why it fails",
+                    crate::reload::UNRESOLVED_RETRY_EVERY.as_secs()
+                )),
+            ));
+        }
         if let (Some(path), Some(error)) = live.traffic_state() {
             status.findings.push(finding(
                 Level::Warn,
@@ -377,8 +402,8 @@ impl Admin {
                     path.display()
                 )),
             ));
-            status.findings.sort_by_key(|f| std::cmp::Reverse(f.level));
         }
+        status.findings.sort_by_key(|f| std::cmp::Reverse(f.level));
         status
     }
 }

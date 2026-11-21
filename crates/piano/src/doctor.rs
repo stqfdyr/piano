@@ -584,7 +584,9 @@ async fn handshake(
             .map_err(|e| e.to_string())?
     }
     .map_err(|e| e.to_string())?;
-    let addr = addrs.current();
+    let addr = addrs
+        .current()
+        .ok_or_else(|| format!("{host} has no address"))?;
     let mut peer = HttpPeer::new(addr, true, host.to_owned()).map_err(|e| e.to_string())?;
     let o = &mut peer.options;
     o.alpn = ALPN::H1;
