@@ -7,6 +7,9 @@ formatting settings work unchanged.
 
 - Upstream: `https://github.com/cloudflare/pingora`
 - Base commit: `3f87e92c982ee27c714506e16ae362776faea4aa` (2026-11-09, workspace version 0.9.0)
+- Upstream checked up to: `3f87e92c982ee27c714506e16ae362776faea4aa` (2026-11-22). The
+  weekly `upstream` workflow fails once upstream main moves past it; after looking at the
+  new commits (and merging what piano needs), move it to the commit checked.
 - License: Apache-2.0, `LICENSE` and the per-crate `LICENSE` files kept as they are.
 
 Format fork code with its own settings (`.rustfmt.toml`, edition 2021): run

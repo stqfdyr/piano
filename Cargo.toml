@@ -57,8 +57,8 @@ aho-corasick = "1"
 # matching are what such rules use; the rest of the Unicode tables is left out.
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
 
-# Local calendar days of the traffic record; already in the tree through pingora-core,
-# which uses it without the clock. The clock brings iana-time-zone.
+# Local calendar days of the traffic record and the times top shows. The clock brings
+# iana-time-zone.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # piano top: layout and drawing of the live view, with crossterm for raw mode, the
