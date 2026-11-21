@@ -903,9 +903,9 @@ impl<'u> StreamUrl<'u> {
         })
     }
 
-    /// Whether the URL is on `target` itself: same host, port and https. Through the
-    /// relay only this matters for the path, as the playback step has refused other
-    /// hosts and the site is reached on the relay's address.
+    /// Whether the URL is on `target` itself: same host, port and https. Only a direct
+    /// probe asks; through the relay the path is always read from the relay, as the
+    /// playback step has refused other hosts.
     fn is_at(&self, target: &Target) -> bool {
         self.tls && self.port == target.addr.port() && self.host.eq_ignore_ascii_case(&target.name)
     }

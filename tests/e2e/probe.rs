@@ -105,7 +105,9 @@ async fn a_refused_login_stops_after_the_public_step() {
     // The site by its name, as well as by its host.
     let mut by_name = args(Some("wrong"), false, &["A/1", "B/1"]);
     by_name.site = relay.config().sites[0].name.clone();
+    assert_ne!(by_name.site, SITE_HOST);
     let r = probe(&relay, &by_name).await;
+    assert_eq!(r.site, by_name.site);
     assert!(!r.ok());
     assert_eq!(names(&r), ["login", "public", "public"]);
     assert_eq!(r.steps[0].status, Some(401));
