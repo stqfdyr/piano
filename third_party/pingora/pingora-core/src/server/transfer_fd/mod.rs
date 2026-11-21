@@ -184,14 +184,15 @@ where
     };
     socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
 
-    /* sock is created before we change user, need to give permission */
+    // Only the owner may connect: the process handing over runs as the same user, and the
+    // descriptors of whoever connects first are served as the listening sockets.
     stat::fchmodat(
         // SAFETY: AT_FDCWD is a well-defined POSIX sentinel constant used by *at() syscalls
         // to indicate the current working directory. It is not a real file descriptor and does
         // not require ownership or lifetime guarantees.
         unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
         path,
-        stat::Mode::from_bits_truncate(0o666),
+        stat::Mode::from_bits_truncate(0o600),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
@@ -330,7 +331,9 @@ where
                 /* If the new process hasn't created the upgrade sock we'll get an ENOENT.
                 ECONNREFUSED may happen if the sock wasn't cleaned up
                 and the old process tries sending before the new one is listening.
-                EACCES may happen if connect() happen before the correct permission is set */
+                EACCES may happen if connect() happen before the correct permission is set, and
+                happens on every attempt when the receiver runs as another user: its socket is
+                0600 (P11) */
                 Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
                     /*the server is not ready yet*/
                     retried += 1;
