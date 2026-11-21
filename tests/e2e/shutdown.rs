@@ -167,6 +167,36 @@ async fn a_media_stream_ends_at_once() {
 }
 
 #[tokio::test]
+async fn a_media_stream_to_a_client_that_stopped_reading_ends_at_once() {
+    let w = world().await;
+    let c = w.client(Proto::H1);
+    let mut res = c
+        .get(w.url("/videos/held/stream.mkv?len=100000000"))
+        .header("range", "bytes=0-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 206);
+    let mut got = 0;
+    while got < 100_000 {
+        got += res.chunk().await.unwrap().unwrap().len();
+    }
+    // Socket buffers fill and the relay's write to the client blocks.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let World {
+        ca: _ca,
+        _origin,
+        relay,
+    } = w;
+    let (relay, took) = terminate_after(relay, Duration::ZERO).await.unwrap();
+    assert!(took < PROMPT, "{took:?}");
+    drop(res);
+    let lines = log_lines(&relay);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["end"], "shutdown", "{}", lines[0]);
+}
+
+#[tokio::test]
 async fn a_websocket_ends_at_once() {
     let w = world().await;
     let mut io = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;

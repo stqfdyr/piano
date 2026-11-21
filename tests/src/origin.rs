@@ -24,7 +24,8 @@
 //! - `/__bytes/{len}`: `len` bytes of [`pattern_byte`], generated while streaming, with
 //!   single-range `Range` support; stands in for a media file.
 //! - `/videos/{key}/…` and `/__file/{key}`: a scripted media file of `len` pattern bytes
-//!   (query `len=N`), with single-range support; see [`Plan`] for `plan=…`. With
+//!   (query `len=N`), with single-range support (a Range whose `If-Range` does not match
+//!   the ETag is ignored); see [`Plan`] for `plan=…`. With
 //!   `redirect=1`, `/videos/…` answers 302 to `/__file/{key}` with the other
 //!   parameters. [`Origin::seen`] lists the `Range` of each file request per key.
 //! - `/Items/{key}/Images/{kind}` (also under `/emby`) and `/img/{key}`: an image
@@ -141,6 +142,8 @@ pub struct Origin {
     requests: Arc<AtomicUsize>,
     /// TLS connections accepted, by negotiated protocol: HTTP/1.1, HTTP/2.
     conns: Arc<[AtomicUsize; 2]>,
+    /// TLS connections open now.
+    open: Arc<AtomicUsize>,
     state: State,
     task: JoinHandle<()>,
     /// Dropped with the origin, which ends every connection still open.
@@ -188,6 +191,8 @@ impl Origin {
         let counter = Arc::clone(&requests);
         let conns: Arc<[AtomicUsize; 2]> = Arc::default();
         let conn_counter = Arc::clone(&conns);
+        let open = Arc::new(AtomicUsize::new(0));
+        let open_counter = Arc::clone(&open);
         let (close, closed) = watch::channel(());
         let state = State {
             seqs: Seqs::default(),
@@ -203,6 +208,7 @@ impl Origin {
                 let acceptor = acceptor.clone();
                 let counter = Arc::clone(&counter);
                 let conn_counter = Arc::clone(&conn_counter);
+                let open = Arc::clone(&open_counter);
                 let state = shared.clone();
                 let mut closed = state.closed.clone();
                 let serve = async move {
@@ -211,6 +217,7 @@ impl Origin {
                     };
                     let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
                     conn_counter[usize::from(is_h2)].fetch_add(1, Ordering::Relaxed);
+                    let _open = Open::count(open);
                     let service = service_fn(move |req| {
                         counter.fetch_add(1, Ordering::Relaxed);
                         let head = req.method() == hyper::Method::HEAD;
@@ -249,6 +256,7 @@ impl Origin {
             addr,
             requests,
             conns,
+            open,
             state,
             task,
             _close: close,
@@ -268,6 +276,11 @@ impl Origin {
         )
     }
 
+    /// TLS connections open now.
+    pub fn open_connections(&self) -> usize {
+        self.open.load(Ordering::Relaxed)
+    }
+
     /// The `Range` header of each scripted media file request for `key`, in order.
     pub fn seen(&self, key: &str) -> Vec<Option<String>> {
         let seen = self.state.seen.lock().unwrap();
@@ -284,6 +297,22 @@ impl Origin {
     pub fn redirects(&self, key: &str) -> usize {
         let seqs = self.state.seqs.lock().unwrap();
         seqs.get(&format!("{key}#r")).copied().unwrap_or(0)
+    }
+}
+
+/// Counts a connection as open while it lives.
+struct Open(Arc<AtomicUsize>);
+
+impl Open {
+    fn count(open: Arc<AtomicUsize>) -> Self {
+        open.fetch_add(1, Ordering::Relaxed);
+        Self(open)
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -816,16 +845,19 @@ async fn media(req: &Request<Incoming>, key: String, state: &State) -> Response<
     if plan.head_delay > 0 {
         tokio::time::sleep(Duration::from_millis(plan.head_delay)).await;
     }
+    let etag = format!("\"{}\"", plan.etag.as_deref().unwrap_or("v1"));
+    // RFC 9110 §13.1.5: a Range whose If-Range does not match is ignored.
+    let current = req
+        .headers()
+        .get("if-range")
+        .is_none_or(|v| v.as_bytes() == etag.as_bytes());
     let mut builder = Response::builder()
         .header(CONTENT_TYPE, "video/x-matroska")
-        .header(
-            "etag",
-            format!("\"{}\"", plan.etag.as_deref().unwrap_or("v1")),
-        );
+        .header("etag", etag);
     if !plan.no_ranges && !plan.unknown_length {
         builder = builder.header(ACCEPT_RANGES, "bytes");
     }
-    let wanted = range.filter(|_| !plan.no_ranges && !plan.unknown_length);
+    let wanted = range.filter(|_| current && !plan.no_ranges && !plan.unknown_length);
     let (start, end) = match wanted.map(|r| parse_range(&r, total)) {
         None => (0, total),
         Some(Some(r)) => {

@@ -15,7 +15,7 @@ use crate::relay::Ctx;
 use crate::{Relay, Site, Sites, TERMINATED, headers};
 use bytes::Bytes;
 use http::header::{
-    ACCEPT_RANGES, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
+    ACCEPT_RANGES, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE,
     LAST_MODIFIED, LOCATION, RANGE, UPGRADE,
 };
 use http::{HeaderName, HeaderValue, Method, Version};
@@ -442,7 +442,7 @@ impl Engine {
                     // The response covered less than asked; another request continues.
                     return Ok(false);
                 }
-                finish(session).await?;
+                until_stop(&mut self.stop, finish(session)).await?;
                 Ok(true)
             }
             Msg::Failed(e) => {
@@ -487,10 +487,13 @@ impl Engine {
         }
         ctx.cf_ray = resp.headers.get("cf-ray").cloned();
         self.head_sent = true;
-        session
-            .write_response_header(resp, false)
-            .await
-            .map_err(|e| e.into_down())
+        until_stop(&mut self.stop, async {
+            session
+                .write_response_header(resp, false)
+                .await
+                .map_err(|e| e.into_down())
+        })
+        .await
     }
 
     /// Takes the head of a later request if it continues the body; drops the request
@@ -561,22 +564,42 @@ impl Engine {
         if let Some(s) = self.sources.pop() {
             s.detach();
         }
-        finish(session).await?;
+        until_stop(&mut self.stop, finish(session)).await?;
         Ok(true)
     }
 
     async fn write(&mut self, session: &mut Session, data: Bytes) -> Result<()> {
         let n = data.len() as u64;
         self.stream.set_writing(true);
-        let written = session.write_response_body(Some(data), false).await;
+        let written = until_stop(&mut self.stop, async {
+            session
+                .write_response_body(Some(data), false)
+                .await
+                .map_err(|e| e.into_down())
+        })
+        .await;
         self.stream.set_writing(false);
-        written.map_err(|e| e.into_down())?;
+        written?;
         self.pos += n;
         self.stream.add_sent(n);
         self.spec.counters.add_sent(Kind::Media, n);
         self.progress = Instant::now();
         self.unproductive = 0;
         Ok(())
+    }
+}
+
+/// Awaits a write to the client unless the process terminates first: a client that
+/// stopped reading holds a write for up to the downstream write timeout. A write that
+/// completes in the same poll as the signal still counts.
+async fn until_stop<T>(
+    stop: &mut watch::Receiver<bool>,
+    io: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        r = io => r,
+        _ = stop.wait_for(|t| *t) => Error::e_explain(TERMINATED, "media stream ended at shutdown"),
     }
 }
 
@@ -653,6 +676,12 @@ async fn request(
         http.read_timeout = peer.options.read_timeout;
         http.write_timeout = peer.options.write_timeout;
         let mut req = spec.req.clone();
+        if id > 0 {
+            // Later requests are checked against the first response by `Resume::check`;
+            // a client's If-Range that did not match then would only turn them into
+            // full 200 responses that cannot continue the body.
+            req.remove_header(&IF_RANGE);
+        }
         reach::prepare_request(site, hop.as_ref(), &mut req)?;
         if let Some(r) = &range {
             req.insert_header(RANGE, r.clone())?;

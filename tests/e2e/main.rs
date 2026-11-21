@@ -57,6 +57,7 @@ async fn world(origin_ca: Option<&Ca>, trust_origin_ca: bool) -> World {
         origin_ips: &[],
         access_log: piano_e2e::relay::ACCESS_LOG,
         limits: "",
+        read_timeout: Duration::from_secs(5),
         control: false,
     });
     World { ca, origin, relay }
