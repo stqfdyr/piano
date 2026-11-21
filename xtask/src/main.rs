@@ -156,7 +156,9 @@ fn ci() -> Result {
     run("build tests", build)?;
 
     let mut test = cargo();
-    test.args(["test", "--workspace", "--locked"]);
+    // Most tests wait on timeouts and sleeps (a run keeps about a tenth of four cores
+    // busy), so many more run at once than there are cores.
+    test.args(["test", "--workspace", "--locked", "--", "--test-threads=16"]);
     run_limited("test", test, TEST_LIMIT)?;
 
     let mut deny = cargo();
