@@ -36,14 +36,27 @@ impl IpNet {
     pub fn is_everything(&self) -> bool {
         self.prefix == 0
     }
+
+    /// Whether `ip` is in this network; an address of the other family never is.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(a)) => {
+                u32::from(a) & mask_v4(self.prefix) == u32::from(net)
+            }
+            (IpAddr::V6(net), IpAddr::V6(a)) => {
+                u128::from(a) & mask_v6(self.prefix) == u128::from(net)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Mask with the top `prefix` bits set.
-pub fn mask_v4(prefix: u8) -> u32 {
+pub(crate) fn mask_v4(prefix: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
 }
 
-pub fn mask_v6(prefix: u8) -> u128 {
+pub(crate) fn mask_v6(prefix: u8) -> u128 {
     u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0)
 }
 

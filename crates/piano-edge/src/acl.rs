@@ -3,53 +3,33 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use log::info;
-use piano_config::{IpNet, mask_v4, mask_v6};
+use piano_config::IpNet;
 use piano_telemetry::logger::REFUSED;
 use pingora_core::listeners::ConnectionFilter;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A compiled allow list.
+/// An allow list.
 #[derive(Debug, Default)]
 pub struct Acl {
-    v4: Vec<(u32, u32)>,
-    v6: Vec<(u128, u128)>,
+    nets: Vec<IpNet>,
     /// Loopback addresses are allowed whatever the list says.
     loopback: bool,
 }
 
 impl Acl {
     pub fn new(allow: &[IpNet], loopback: bool) -> Self {
-        let mut acl = Self {
+        Self {
+            nets: allow.to_vec(),
             loopback,
-            ..Self::default()
-        };
-        for net in allow {
-            match net.addr() {
-                IpAddr::V4(a) => acl.v4.push((u32::from(a), mask_v4(net.prefix()))),
-                IpAddr::V6(a) => acl.v6.push((u128::from(a), mask_v6(net.prefix()))),
-            }
         }
-        acl
     }
 
     /// Whether `ip` is allowed. IPv4-mapped IPv6 addresses are matched as IPv4.
     pub fn allows(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
-        if self.loopback && ip.is_loopback() {
-            return true;
-        }
-        match ip {
-            IpAddr::V4(a) => {
-                let a = u32::from(a);
-                self.v4.iter().any(|&(net, mask)| a & mask == net)
-            }
-            IpAddr::V6(a) => {
-                let a = u128::from(a);
-                self.v6.iter().any(|&(net, mask)| a & mask == net)
-            }
-        }
+        (self.loopback && ip.is_loopback()) || self.nets.iter().any(|n| n.contains(ip))
     }
 }
 

@@ -15,7 +15,7 @@ pub use model::{
     Access, Cache, Config, Control, DEFAULT_SOCKET, DEFAULT_TRAFFIC_FILE, Limits, Log, LogLevel,
     Server, ServerDomains, Site, Tls, Traffic, UaRule, Upstream, UpstreamLimit,
 };
-pub use net::{IpNet, ParseIpNetError, mask_v4, mask_v6};
+pub use net::{IpNet, ParseIpNetError};
 pub use validate::{UpstreamUrl, ValidationError, Warning, host_matches, is_dns_name};
 
 use std::path::Path;
