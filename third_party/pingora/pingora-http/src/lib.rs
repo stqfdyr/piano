@@ -118,7 +118,7 @@ pub struct RequestHeader {
 /// Whether the target round-trips through the URI and whether it is valid UTF-8 are two
 /// separate questions with only three valid combinations, so they are one value rather
 /// than two fields that could disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum RawTarget {
     /// The URI round-trips the target, so no separate copy is kept: origin-form,
     /// asterisk-form and query-only targets come back out of it byte-identical, and the
@@ -132,6 +132,19 @@ enum RawTarget {
     /// As [`Self::Verbatim`], but the target is not valid UTF-8, so the URI holds a lossy
     /// rendering of it and [`RequestHeader::raw_path_is_utf8`] reports false.
     Lossy(Box<[u8]>),
+}
+
+// The target as escaped text, not a list of byte values, so that a log line holding a
+// request header can be read and searched like the URI next to it.
+impl std::fmt::Debug for RawTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, target) = match self {
+            Self::FromUri => return f.write_str("FromUri"),
+            Self::Verbatim(t) => ("Verbatim", t),
+            Self::Lossy(t) => ("Lossy", t),
+        };
+        write!(f, "{name}(\"{}\")", target.escape_ascii())
+    }
 }
 
 impl RawTarget {

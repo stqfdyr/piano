@@ -10,5 +10,9 @@ publish.workspace = true
 [dependencies]
 log.workspace = true
 
+[dev-dependencies]
+# Debug output of real request headers, which the redaction tests run over.
+pingora-http.workspace = true
+
 [lints]
 workspace = true

@@ -1835,6 +1835,7 @@ name = "piano-telemetry"
 version = "0.1.0"
 dependencies = [
  "log",
+ "pingora-http",
 ]
 
 [[package]]
