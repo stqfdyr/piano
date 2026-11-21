@@ -1,6 +1,6 @@
 //! piano running in-process on its own threads.
 
-use crate::{ORIGIN_HOST, TempDir, free_port, loopback};
+use crate::{ORIGIN_HOST, ReservedPort, TempDir, loopback};
 use async_trait::async_trait;
 use piano::{Live, RunArgs, ShutdownSignal, ShutdownSignalWatch};
 use piano_upstream::Resolver;
@@ -82,6 +82,8 @@ pub struct Relay {
     thread: Option<JoinHandle<()>>,
     dir: TempDir,
     generation: AtomicU32,
+    /// Held until the relay is dropped.
+    _port: ReservedPort,
 }
 
 /// How the relay is told to stop.
@@ -183,7 +185,8 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
 impl Relay {
     pub fn start(setup: &RelaySetup<'_>) -> Self {
         let dir = TempDir::new();
-        let port = free_port();
+        let reserved = ReservedPort::new();
+        let port = reserved.port;
         let text = config_text(setup, &dir, 0, port);
         let config_path = dir.write(CONFIG_FILE, &text);
         let config = piano_config::parse(&text).unwrap();
@@ -224,6 +227,7 @@ impl Relay {
             thread: Some(thread),
             dir,
             generation: AtomicU32::new(1),
+            _port: reserved,
         }
     }
 

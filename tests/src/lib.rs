@@ -9,7 +9,7 @@ pub mod origin;
 pub mod pki;
 pub mod relay;
 
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -18,13 +18,32 @@ pub const SITE_HOST: &str = "media.example.com";
 /// Name of the fake origin; resolved to loopback through the test resolver.
 pub const ORIGIN_HOST: &str = "origin.example.net";
 
-/// A loopback port that was free a moment ago.
-pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A loopback port kept for its owner. While this lives the system hands the port to no
+/// other bind to port 0 and no outgoing connection, so a port released before the relay
+/// binds it cannot go to another test in the meantime. A listener that sets SO_REUSEADDR,
+/// as pingora's do, can still bind and listen on it: the reserving socket never listens.
+pub struct ReservedPort {
+    _socket: tokio::net::TcpSocket,
+    pub port: u16,
+}
+
+impl ReservedPort {
+    pub fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(loopback(0)).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            _socket: socket,
+            port,
+        }
+    }
+}
+
+impl Default for ReservedPort {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn loopback(port: u16) -> SocketAddr {
