@@ -256,7 +256,21 @@ mod tests {
     }
 
     #[test]
-    fn every_class_has_its_own_name() {
+    fn all_lists_every_class_once() {
+        // No wildcard: a new class does not compile until it has a place here and in ALL.
+        let place = |c: RouteClass| match c {
+            Media => 0,
+            Subtitle => 1,
+            Image => 2,
+            PlaybackInfo => 3,
+            Info => 4,
+            Socket => 5,
+            Api => 6,
+            Local => 7,
+        };
+        for (i, c) in RouteClass::ALL.into_iter().enumerate() {
+            assert_eq!(place(c), i, "{c:?}");
+        }
         let names: std::collections::HashSet<_> =
             RouteClass::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(names.len(), RouteClass::ALL.len());

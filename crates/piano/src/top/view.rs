@@ -647,7 +647,8 @@ fn problems(f: &mut Frame<'_>, area: Rect, list: &[Problem], log_on: bool) {
                 WARN
             };
             let mut spans = vec![
-                dim(local_time(&p.ts, "%H:%M:%S")),
+                dim(local_time(&p.ts, "%H:%M:%S")
+                    .unwrap_or_else(|| p.ts.get(11..19).unwrap_or(&p.ts).to_owned())),
                 Span::raw("  "),
                 Span::raw(format!("{:<6}", p.site)),
                 colored(status, sc),

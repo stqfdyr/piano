@@ -41,12 +41,6 @@ impl Filter {
         status: Option<&str>,
         class: Option<String>,
     ) -> Result<Self, String> {
-        if let Some(c) = &class
-            && !RouteClass::ALL.iter().any(|k| k.as_str() == c)
-        {
-            let all: Vec<&str> = RouteClass::ALL.iter().map(|k| k.as_str()).collect();
-            return Err(format!("--class {c:?}: expected one of {}", all.join(", ")));
-        }
         let status = status
             .map(|s| {
                 let bad = || {
@@ -96,25 +90,59 @@ pub struct Output {
 impl Output {
     fn line(&self, raw: &str, v: &Value) -> String {
         if self.json {
-            raw.to_owned()
+            escaped(raw)
         } else {
             human(v, self.color)
         }
     }
 }
 
-/// `s` with control characters replaced: logged fields come from clients and upstreams,
-/// and a terminal would act on them.
+/// A warning when `class` is no route class this version logs; lines of another
+/// version may still carry it.
+pub fn unknown_class(class: &str) -> Option<String> {
+    if RouteClass::ALL.iter().any(|k| k.as_str() == class) {
+        return None;
+    }
+    let all: Vec<&str> = RouteClass::ALL.iter().map(|k| k.as_str()).collect();
+    Some(format!(
+        "warning: --class {class:?} is none of {}",
+        all.join(", ")
+    ))
+}
+
+/// Characters a terminal acts on or that reorder the text around them; logged fields
+/// come from clients and upstreams.
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `s` with [`unsafe_char`]s replaced, for text output.
 fn printable(s: &str) -> Cow<'_, str> {
-    if s.contains(char::is_control) {
+    if s.contains(unsafe_char) {
         Cow::Owned(
             s.chars()
-                .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+                .map(|c| if unsafe_char(c) { '\u{fffd}' } else { c })
                 .collect(),
         )
     } else {
         Cow::Borrowed(s)
     }
+}
+
+/// A logged JSON line with [`unsafe_char`]s written as escapes: the same JSON value, as
+/// the log writer puts such characters only inside strings, and nothing a terminal
+/// acts on.
+fn escaped(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if unsafe_char(c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -129,7 +157,10 @@ fn clip(s: &str, max: usize) -> String {
 fn human(v: &Value, color: Color) -> String {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(printable);
     let ts = s("ts")
-        .map(|t| local_time(&t, "%m-%d %H:%M:%S"))
+        .map(|t| {
+            local_time(&t, "%m-%d %H:%M:%S")
+                .unwrap_or_else(|| t.get(5..19).unwrap_or(&t).replacen('T', " ", 1))
+        })
         .unwrap_or_default();
     let status = v.get("status").and_then(Value::as_u64);
     let status_text = status.map_or_else(|| "-".to_owned(), |n| n.to_string());
@@ -201,8 +232,9 @@ impl Follower {
         if let Some(n) = last {
             let len = file.metadata()?.len();
             if len > n {
-                reader.seek(SeekFrom::Start(len - n))?;
-                // The partial line before the next newline.
+                // From the byte before, so that a line starting right at `len - n`
+                // is kept: what is read up to the next newline ends the line before.
+                reader.seek(SeekFrom::Start(len - n - 1))?;
                 reader.read_until(b'\n', &mut pending)?;
                 pending.clear();
             }
@@ -315,9 +347,9 @@ mod tests {
         assert!(Filter::new(None, Some("6xx"), None).is_err());
         assert!(Filter::new(None, Some("bad"), None).is_err());
         for class in RouteClass::ALL {
-            assert!(Filter::new(None, None, Some(class.as_str().into())).is_ok());
+            assert_eq!(unknown_class(class.as_str()), None);
         }
-        let e = Filter::new(None, None, Some("vidoe".into())).unwrap_err();
+        let e = unknown_class("vidoe").unwrap();
         assert!(e.contains("media, subtitle"), "{e}");
     }
 
@@ -328,7 +360,7 @@ mod tests {
             "method": "GET", "path": "/emby/Videos/1/stream", "dur_ms": 12,
             "client": "192.0.2.7", "end": "redirect_refused", "err": "no"
         });
-        let ts = local_time("2026-11-20T08:01:02.345Z", "%m-%d %H:%M:%S");
+        let ts = local_time("2026-11-20T08:01:02.345Z", "%m-%d %H:%M:%S").unwrap();
         assert_eq!(
             human(&v, crate::render::color(true)),
             format!(
@@ -347,6 +379,16 @@ mod tests {
         assert!(!line.contains(char::is_control), "{line:?}");
         assert!(line.contains("/a\u{fffd}31m\u{fffd}[2J"), "{line:?}");
         assert_eq!(printable("ok é"), "ok é");
+        assert_eq!(printable("/x\u{202e}gnp.exe"), "/x\u{fffd}gnp.exe");
+        let raw = "{\"path\":\"/a\u{9b}2J\u{7f}\u{202e}\"}";
+        let json = escaped(raw);
+        let bs = "\\";
+        assert_eq!(
+            json,
+            format!("{{\"path\":\"/a{bs}u009b2J{bs}u007f{bs}u202e\"}}")
+        );
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, serde_json::from_str::<Value>(raw).unwrap());
     }
 
     #[test]
@@ -454,6 +496,24 @@ third
         f.poll(&mut each).unwrap();
         f.poll(&mut each).unwrap();
         assert_eq!(seen, ["one", "two", "new"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_follower_keeps_a_line_that_starts_where_it_starts() {
+        let dir = temp_dir("boundary");
+        let path = dir.join("access.log");
+        std::fs::write(&path, "aa\nbb\ncc\n").unwrap();
+        for (last, want) in [(6, &["bb", "cc"][..]), (5, &["cc"]), (2, &[])] {
+            let mut f = Follower::open(&path, Some(last)).unwrap();
+            let mut seen = Vec::new();
+            f.read(|l| {
+                seen.push(l.to_owned());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, want, "{last}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -14,20 +14,18 @@ use std::time::{Duration, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy)]
 pub struct Color(bool);
 
-/// A logged UTC timestamp in local time as `format` writes it; the text as it is when
-/// it is no RFC 3339 time. Text for people shows local time; JSON keeps UTC.
-pub fn local_time(ts: &str, format: &str) -> String {
+/// A logged UTC timestamp in local time as `format` writes it; `None` when it is no
+/// RFC 3339 time. Text for people shows local time; JSON keeps UTC.
+pub fn local_time(ts: &str, format: &str) -> Option<String> {
     time_in(ts, &chrono::Local, format)
 }
 
-fn time_in<Tz: chrono::TimeZone>(ts: &str, tz: &Tz, format: &str) -> String
+fn time_in<Tz: chrono::TimeZone>(ts: &str, tz: &Tz, format: &str) -> Option<String>
 where
     Tz::Offset: std::fmt::Display,
 {
-    chrono::DateTime::parse_from_rfc3339(ts).map_or_else(
-        |_| ts.to_owned(),
-        |t| t.with_timezone(tz).format(format).to_string(),
-    )
+    let t = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(t.with_timezone(tz).format(format).to_string())
 }
 
 pub fn color(no_color: bool) -> Color {
@@ -643,8 +641,11 @@ mod tests {
     fn logged_times_in_another_zone() {
         let east8 = FixedOffset::east_opt(8 * 3600).unwrap();
         let ts = "2026-11-20T20:01:02.345Z";
-        assert_eq!(time_in(ts, &east8, "%m-%d %H:%M:%S"), "11-21 04:01:02");
-        assert_eq!(time_in("garbled", &east8, "%H:%M:%S"), "garbled");
+        assert_eq!(
+            time_in(ts, &east8, "%m-%d %H:%M:%S").as_deref(),
+            Some("11-21 04:01:02")
+        );
+        assert_eq!(time_in("garbled", &east8, "%H:%M:%S"), None);
     }
 
     #[test]

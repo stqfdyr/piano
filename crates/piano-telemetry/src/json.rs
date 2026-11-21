@@ -106,7 +106,8 @@ pub fn escape_into(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
+            // C1 controls too: a terminal showing the log acts on them.
+            c if c.is_control() => {
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
@@ -137,6 +138,13 @@ mod tests {
         let mut s = String::new();
         escape_into(&mut s, "q\"b\\n\nc\x01\x7fé ~");
         assert_eq!(s, "\"q\\\"b\\\\n\\nc\\u0001\\u007fé ~\"");
+    }
+
+    #[test]
+    fn escapes_c1_controls() {
+        let mut s = String::new();
+        escape_into(&mut s, "\u{9b}");
+        assert_eq!(s, format!("\"{}u009b\"", '\\'));
     }
 
     #[test]
