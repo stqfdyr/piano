@@ -92,7 +92,9 @@ pub struct Head<'a> {
 pub enum Mismatch {
     #[error("status {0} instead of 206")]
     Status(u16),
-    #[error("no satisfied Content-Range, or a length that disagrees with it")]
+    #[error(
+        "no satisfied Content-Range with a complete length, or a length that disagrees with it"
+    )]
     ContentRange,
     #[error("range does not cover the resume offset")]
     Offset,
@@ -192,7 +194,9 @@ impl Resume {
         if length.is_some_and(|l| Some(l) != cr.len()) {
             return Err(Mismatch::ContentRange);
         }
-        if cr.complete != Some(self.complete) {
+        // Without a complete length the response says nothing about the representation:
+        // only this request is unusable.
+        if cr.complete.ok_or(Mismatch::ContentRange)? != self.complete {
             return Err(Mismatch::Length);
         }
         if self.etag.is_some() && self.etag.as_deref() != head.etag {
@@ -382,7 +386,7 @@ mod tests {
             ..partial(b"bytes 0-18446744073709551615/*", Some(b"\"a\""))
         };
         assert_eq!(r.check(&huge, 150), Err(Mismatch::ContentRange));
-        let cases: [(Head<'_>, Mismatch); 7] = [
+        let cases: [(Head<'_>, Mismatch); 8] = [
             (
                 Head {
                     status: 200,
@@ -391,6 +395,10 @@ mod tests {
                 Mismatch::Status(200),
             ),
             (partial(b"garbage", Some(b"\"a\"")), Mismatch::ContentRange),
+            (
+                partial(b"bytes 150-199/*", Some(b"\"a\"")),
+                Mismatch::ContentRange,
+            ),
             (
                 partial(b"bytes 151-199/1000", Some(b"\"a\"")),
                 Mismatch::Offset,
