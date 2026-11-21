@@ -1,14 +1,12 @@
 //! Bounds on client connections, mounted upstream hosts and certificate renewal.
 
-use crate::read_response;
-use piano_e2e::client::{Proto, client, connect};
+use piano_e2e::client::{Proto, client, connect, connect_tcp, read_response};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const VOD: &str = "vod1.example.net";
 
@@ -89,7 +87,7 @@ async fn a_stalled_request_head_is_cut_off_before_the_keepalive_timeout() {
 #[tokio::test]
 async fn a_silent_connection_is_closed_after_the_handshake_timeout() {
     let w = world("handshake_timeout = \"1s\"", "").await;
-    let mut tcp = TcpStream::connect(w.relay.addr).await.unwrap();
+    let mut tcp = connect_tcp(w.relay.addr).await;
     let t = time_to_close(&mut tcp, Duration::from_secs(5)).await;
     assert!(t > Duration::from_millis(800), "{t:?}");
 }
@@ -99,7 +97,7 @@ async fn connections_over_the_limit_are_closed_at_once() {
     let w = world("max_connections = 2", "").await;
     let a = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
     let _b = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
-    let mut over = TcpStream::connect(w.relay.addr).await.unwrap();
+    let mut over = connect_tcp(w.relay.addr).await;
     let t = time_to_close(&mut over, Duration::from_secs(2)).await;
     assert!(t < Duration::from_secs(1), "{t:?}");
     drop(a);

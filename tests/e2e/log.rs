@@ -1,7 +1,7 @@
 //! The access log: one JSON line per request, credentials removed.
 
 use crate::{World, url, world};
-use piano_e2e::client::{Proto, client, connect};
+use piano_e2e::client::{Proto, client, connect, read_response};
 use piano_e2e::origin::INFO_PUBLIC;
 use piano_e2e::relay::{ACCESS_LOG, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
@@ -146,7 +146,7 @@ async fn local_answers_are_logged() {
         .await
         .unwrap();
     io.flush().await.unwrap();
-    let (head, _) = crate::read_response(&mut io).await;
+    let (head, _) = read_response(&mut io).await;
     assert!(head.starts_with("HTTP/1.1 421"), "{head}");
 
     let lines = relay.access_lines(ACCESS_LOG, 3);
