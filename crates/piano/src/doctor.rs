@@ -803,7 +803,7 @@ mod tests {
         let now = 1_000 * day;
         let at = |days: i64| expiry(Some(now + days * day), now).0;
         assert_eq!(expiry(None, now).0, Level::Warn);
-        assert_eq!(expiry(Some(now), now).0, Level::Error);
+        assert_eq!(expiry(Some(now), now), (Level::Error, "expired".into()));
         assert_eq!(at(CERT_ERROR_DAYS), Level::Warn);
         assert_eq!(
             expiry(Some(now + CERT_ERROR_DAYS * day - 1), now).0,
