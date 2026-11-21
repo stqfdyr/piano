@@ -11,4 +11,4 @@ mod lru;
 pub use budget::{Budget, BudgetState, Rate, Wait};
 pub use fresh::{Freshness, shared_ttl};
 pub use key::image_key;
-pub use lru::{Lru, Weigh};
+pub use lru::{ENTRY, Lru, Weigh};

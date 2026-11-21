@@ -1,13 +1,20 @@
-//! A store bounded by the total weight of its values, evicting the least recently used.
+//! A store bounded by the total weight of its entries, evicting the least recently used.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-/// The bytes a value holds, for the store's bound.
+/// What an entry is counted beyond its key text and its value: the key in both tables,
+/// the use counter in both, and the shared key's reference counts. Hash-table slack,
+/// B-tree nodes and allocator rounding come on top, so for small entries the bound holds
+/// to within about a factor of two.
+pub const ENTRY: usize = 2 * size_of::<Arc<str>>() + 2 * size_of::<u64>() + 2 * size_of::<usize>();
+
+/// The bytes a value holds, for the store's bound. The store adds the key's.
 pub trait Weigh {
     fn weight(&self) -> usize;
 }
 
-impl<T: Weigh> Weigh for std::sync::Arc<T> {
+impl<T: Weigh> Weigh for Arc<T> {
     fn weight(&self) -> usize {
         T::weight(self)
     }
@@ -18,8 +25,8 @@ pub struct Lru<V> {
     capacity: usize,
     used: usize,
     tick: u64,
-    map: HashMap<String, (u64, V)>,
-    order: BTreeMap<u64, String>,
+    map: HashMap<Arc<str>, (u64, V)>,
+    order: BTreeMap<u64, Arc<str>>,
 }
 
 impl<V: Weigh> Lru<V> {
@@ -37,7 +44,9 @@ impl<V: Weigh> Lru<V> {
         self.capacity
     }
 
-    /// Total weight of the stored values.
+    /// Total weight of the entries: values, keys and bookkeeping. Keys come from
+    /// requests, so they count; otherwise long keys with light values would outgrow the
+    /// bound many times over.
     pub fn used(&self) -> usize {
         self.used
     }
@@ -62,25 +71,26 @@ impl<V: Weigh> Lru<V> {
         Some(v)
     }
 
-    /// Stores `value`, evicting the least recently used values beyond the capacity. A
-    /// value heavier than the whole capacity is not stored.
+    /// Stores `value`, evicting the least recently used entries beyond the capacity. An
+    /// entry heavier than the whole capacity is not stored.
     pub fn insert(&mut self, key: String, value: V) {
         self.remove(&key);
-        let w = value.weight();
+        let w = cost(&key, &value);
         if w > self.capacity {
             return;
         }
         self.tick += 1;
         self.used += w;
-        self.order.insert(self.tick, key.clone());
+        let key: Arc<str> = key.into();
+        self.order.insert(self.tick, Arc::clone(&key));
         self.map.insert(key, (self.tick, value));
         self.evict();
     }
 
     pub fn remove(&mut self, key: &str) -> Option<V> {
-        let (seq, v) = self.map.remove(key)?;
+        let (k, (seq, v)) = self.map.remove_entry(key)?;
         self.order.remove(&seq);
-        self.used -= v.weight();
+        self.used -= cost(&k, &v);
         Some(v)
     }
 
@@ -104,10 +114,14 @@ impl<V: Weigh> Lru<V> {
                 break;
             };
             if let Some((_, v)) = self.map.remove(&key) {
-                self.used -= v.weight();
+                self.used -= cost(&key, &v);
             }
         }
     }
+}
+
+fn cost<V: Weigh>(key: &str, value: &V) -> usize {
+    key.len() + ENTRY + value.weight()
 }
 
 #[cfg(test)]
@@ -120,47 +134,72 @@ mod tests {
         }
     }
 
+    /// The weight of an entry with a one-byte key and a value of weight `w`.
+    fn one(w: usize) -> usize {
+        1 + ENTRY + w
+    }
+
     #[test]
     fn evicts_least_recently_used_by_weight() {
-        let mut l = Lru::new(10);
-        assert_eq!(l.capacity(), 10);
+        let mut l = Lru::new(one(4) * 2 + 1);
         l.insert("a".into(), 4usize);
         l.insert("b".into(), 4);
         assert_eq!(l.get("a"), Some(&4));
         l.insert("c".into(), 4);
         assert!(l.get("b").is_none(), "b was least recently used");
-        assert_eq!(l.used(), 8);
+        assert_eq!(l.used(), one(4) * 2);
         assert_eq!(l.len(), 2);
         assert!(!l.is_empty());
-        l.insert("big".into(), 11);
+        l.insert("big".into(), l.capacity());
         assert!(l.get("big").is_none());
-        assert_eq!(l.used(), 8);
+        assert_eq!(l.used(), one(4) * 2);
     }
 
     #[test]
     fn replace_remove_clear_and_shrink() {
-        let mut l = Lru::new(10);
+        let mut l = Lru::new(one(3) * 2);
         l.insert("a".into(), 3usize);
         l.insert("a".into(), 5);
-        assert_eq!(l.used(), 5);
+        assert_eq!(l.used(), one(5));
         assert_eq!(l.remove("a"), Some(5));
         assert_eq!(l.used(), 0);
         l.insert("a".into(), 3);
         l.insert("b".into(), 3);
-        l.set_capacity(4);
+        assert_eq!(l.len(), 2);
+        l.set_capacity(one(3));
         assert_eq!(l.len(), 1);
         assert!(l.get("b").is_some());
         assert_eq!(l.clear(), 1);
         assert!(l.is_empty());
+        assert_eq!(l.used(), 0);
         l.set_capacity(0);
         l.insert("z".into(), 0);
-        assert_eq!(l.len(), 1, "weightless values fit a zero capacity");
+        assert!(l.is_empty(), "every entry weighs something");
+    }
+
+    #[test]
+    fn keys_count_toward_the_bound() {
+        let key = |i: usize| format!("{i:04}{}", "k".repeat(996));
+        let mut l = Lru::new(10 * (1000 + ENTRY));
+        for i in 0..100 {
+            l.insert(key(i), 0usize);
+        }
+        assert_eq!(
+            l.len(),
+            10,
+            "weightless values with long keys still fill the store"
+        );
+        assert_eq!(l.used(), 10 * (1000 + ENTRY));
+        assert!(l.get(&key(99)).is_some());
+        assert!(l.get(&key(89)).is_none());
+        l.remove(&key(99));
+        assert_eq!(l.used(), 9 * (1000 + ENTRY));
     }
 
     #[test]
     fn shared_values_weigh_what_they_hold() {
-        let mut l = Lru::new(10);
-        l.insert("a".into(), std::sync::Arc::new(6usize));
-        assert_eq!(l.used(), 6);
+        let mut l = Lru::new(100);
+        l.insert("a".into(), Arc::new(6usize));
+        assert_eq!(l.used(), one(6));
     }
 }
