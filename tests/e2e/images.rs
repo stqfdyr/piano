@@ -264,3 +264,56 @@ async fn cache_stats_and_purge() {
     let s: CacheStats = serde_json::from_value(ask("cache").await.unwrap()).unwrap();
     assert_eq!((s.images, s.missing, s.redirects, s.bytes), (0, 0, 0, 0));
 }
+
+#[tokio::test]
+async fn an_image_purged_while_revalidated_is_fetched_anew() {
+    let w = world_with("", true).await;
+    let path = "/Items/e1/Images/Primary?ttl=1&delay_ms=600";
+    w.get(path).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The stored copy goes while the upstream is asked to confirm it; a request that
+    // arrives then has no copy of its own.
+    let late = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let socket = w.relay.control_socket();
+        tokio::task::spawn_blocking(move || {
+            piano_ctl::call(&socket, "cache purge", Duration::from_secs(10)).unwrap()
+        })
+        .await
+        .unwrap();
+        w.get(path).await
+    };
+    let (first, late) = tokio::join!(w.get(path), late);
+    assert_eq!((first.status, first.body.as_str()), (200, "image e1"));
+    assert_eq!((late.status, late.body.as_str()), (200, "image e1"));
+    assert_eq!(w.origin.hits("/Items/e1/Images/Primary"), 3);
+}
+
+#[tokio::test]
+async fn partial_requests_go_to_the_plain_proxy() {
+    let w = world().await;
+    let got = w
+        .get_with("/Items/g1/Images/Primary", &[("range", "bytes=0-1")])
+        .await;
+    assert_eq!(got.status, 200);
+    w.get("/Items/g1/Images/Primary").await;
+    assert_eq!(w.cache_fields(2), ["-", "miss"]);
+}
+
+#[tokio::test]
+async fn an_expired_image_stands_in_only_for_failures() {
+    let w = world().await;
+    for path in [
+        "/Items/h1/Images/Primary?ttl=1&codes=200,404",
+        "/Items/h2/Images/Primary?ttl=1&codes=200,429",
+    ] {
+        w.get(path).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The upstream's answer stands unless it is a failure.
+    let gone = w.get("/Items/h1/Images/Primary?ttl=1&codes=200,404").await;
+    assert_eq!(gone.status, 404);
+    let limited = w.get("/Items/h2/Images/Primary?ttl=1&codes=200,429").await;
+    assert_eq!((limited.status, limited.body.as_str()), (200, "image h2"));
+    assert_eq!(w.cache_fields(4), ["miss", "miss", "miss", "stale"]);
+}

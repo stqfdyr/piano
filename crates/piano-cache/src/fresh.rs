@@ -3,14 +3,20 @@
 use std::time::Duration;
 
 /// How long a response may be served from a shared cache, capped at `max`; `None` when
-/// it must not be stored or revalidated before every use. `s-maxage` wins over
+/// it must not be stored or revalidated before every use. `cache_control` holds every
+/// `Cache-Control` field line, which together form one list. `s-maxage` wins over
 /// `max-age`; without either nothing is stored, since image endpoints that want caching
 /// say so.
-pub fn shared_ttl(cache_control: Option<&[u8]>, max: Duration) -> Option<Duration> {
-    let value = cache_control?;
+pub fn shared_ttl<'a>(
+    cache_control: impl IntoIterator<Item = &'a [u8]>,
+    max: Duration,
+) -> Option<Duration> {
     let mut max_age = None;
     let mut s_maxage = None;
-    for directive in value.split(|&b| b == b',') {
+    let directives = cache_control
+        .into_iter()
+        .flat_map(|line| line.split(|&b| b == b','));
+    for directive in directives {
         let directive = directive.trim_ascii();
         let (name, arg) = match directive.iter().position(|&b| b == b'=') {
             Some(i) => (&directive[..i], Some(directive[i + 1..].trim_ascii())),
@@ -45,7 +51,7 @@ mod tests {
     const MAX: Duration = Duration::from_secs(30 * 86_400);
 
     fn ttl(v: &str) -> Option<u64> {
-        shared_ttl(Some(v.as_bytes()), MAX).map(|d| d.as_secs())
+        shared_ttl([v.as_bytes()], MAX).map(|d| d.as_secs())
     }
 
     #[test]
@@ -63,6 +69,15 @@ mod tests {
         assert_eq!(ttl("no-store, max-age=60"), None);
         assert_eq!(ttl("no-cache"), None);
         assert_eq!(ttl("max-age=x"), None);
-        assert_eq!(shared_ttl(None, MAX), None);
+        assert_eq!(shared_ttl(std::iter::empty(), MAX), None);
+    }
+
+    #[test]
+    fn field_lines_form_one_list() {
+        let lines = |l: &[&'static str]| {
+            shared_ttl(l.iter().map(|s| s.as_bytes()), MAX).map(|d| d.as_secs())
+        };
+        assert_eq!(lines(&["public, max-age=60", "private"]), None);
+        assert_eq!(lines(&["max-age=60", "s-maxage=600"]), Some(600));
     }
 }

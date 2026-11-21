@@ -123,6 +123,7 @@ mod tests {
     #[test]
     fn evicts_least_recently_used_by_weight() {
         let mut l = Lru::new(10);
+        assert_eq!(l.capacity(), 10);
         l.insert("a".into(), 4usize);
         l.insert("b".into(), 4);
         assert_eq!(l.get("a"), Some(&4));
@@ -130,6 +131,7 @@ mod tests {
         assert!(l.get("b").is_none(), "b was least recently used");
         assert_eq!(l.used(), 8);
         assert_eq!(l.len(), 2);
+        assert!(!l.is_empty());
         l.insert("big".into(), 11);
         assert!(l.get("big").is_none());
         assert_eq!(l.used(), 8);
@@ -153,5 +155,12 @@ mod tests {
         l.set_capacity(0);
         l.insert("z".into(), 0);
         assert_eq!(l.len(), 1, "weightless values fit a zero capacity");
+    }
+
+    #[test]
+    fn shared_values_weigh_what_they_hold() {
+        let mut l = Lru::new(10);
+        l.insert("a".into(), std::sync::Arc::new(6usize));
+        assert_eq!(l.used(), 6);
     }
 }
