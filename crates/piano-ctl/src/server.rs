@@ -322,21 +322,41 @@ mod tests {
         assert!(!allowed(if me == 65534 { 65533 } else { 65534 }));
     }
 
+    /// Accepts one connection within 5 s and hands it to `then`.
+    fn accept_one(listener: &UnixListener, then: impl FnOnce(UnixStream)) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((s, _)) => return then(s),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < until, "no connection");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
     #[test]
     fn a_connection_closed_without_a_reply_is_reported_as_such() {
         let dir = Dir::new();
         let path = dir.0.join("ctl.sock");
         let bound = bind(&path).unwrap();
-        bound.listener.set_nonblocking(false).unwrap();
-        let closer = std::thread::spawn(move || {
-            // Read the request, as a daemon does, then close without answering.
-            let (mut s, _) = bound.listener.accept().unwrap();
+        // Read the request, as a daemon does, then close without answering; or close at
+        // once, as a busy daemon does.
+        let read_first = |mut s: UnixStream| {
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let _ = frame::read_blocking(&mut s, MAX_REQUEST);
-        });
-        let r = call(&path, "status", Duration::from_secs(5));
-        closer.join().unwrap();
-        assert!(matches!(r, Err(ClientError::Closed)), "{r:?}");
+        };
+        let at_once = drop::<UnixStream>;
+        for close in [&read_first as &(dyn Fn(UnixStream) + Sync), &at_once] {
+            std::thread::scope(|scope| {
+                let closer = scope.spawn(|| accept_one(&bound.listener, close));
+                let r = call(&path, "status", Duration::from_secs(5));
+                closer.join().unwrap();
+                assert!(matches!(r, Err(ClientError::Closed(_))), "{r:?}");
+            });
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

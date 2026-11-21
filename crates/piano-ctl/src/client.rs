@@ -14,11 +14,12 @@ pub enum ClientError {
     #[error("cannot reach the daemon at {path}: {source}")]
     Unreachable { path: PathBuf, source: io::Error },
     /// The daemon closed the connection without replying: it serves a few connections at a
-    /// time and closes the others at once, and it closes them all when it stops.
+    /// time and closes the others at once, closes them all when it stops, and closes one
+    /// whose peer it refuses or whose request it cannot read (logged).
     #[error(
-        "the daemon closed the connection without a reply; it is busy with other commands or stopping"
+        "the daemon closed the connection without a reply: busy with other commands, stopping, or refusing this connection (see its log)"
     )]
-    Closed,
+    Closed(#[source] io::Error),
     #[error("talking to the daemon: {0}")]
     Io(#[from] io::Error),
     #[error("unexpected reply from the daemon: {0}")]
@@ -64,7 +65,7 @@ fn closed(e: io::Error) -> ClientError {
     match e.kind() {
         io::ErrorKind::UnexpectedEof
         | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::ConnectionReset => ClientError::Closed,
+        | io::ErrorKind::ConnectionReset => ClientError::Closed(e),
         _ => ClientError::Io(e),
     }
 }
