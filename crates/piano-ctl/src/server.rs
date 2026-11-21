@@ -314,6 +314,51 @@ mod tests {
         assert!(matches!(bind(&path), Err(BindError::NotSocket(_))));
     }
 
+    #[test]
+    fn only_root_and_the_daemons_own_user_may_connect() {
+        let me = nix::unistd::geteuid().as_raw();
+        assert!(allowed(0));
+        assert!(allowed(me));
+        assert!(!allowed(if me == 65534 { 65533 } else { 65534 }));
+    }
+
+    /// Accepts one connection within 5 s and hands it to `then`.
+    fn accept_one(listener: &UnixListener, then: impl FnOnce(UnixStream)) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((s, _)) => return then(s),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < until, "no connection");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_connection_closed_without_a_reply_is_reported_as_such() {
+        let dir = Dir::new();
+        let path = dir.0.join("ctl.sock");
+        let bound = bind(&path).unwrap();
+        // Read the request, as a daemon does, then close without answering; or close at
+        // once, as a busy daemon does.
+        let read_first = |mut s: UnixStream| {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = frame::read_blocking(&mut s, MAX_REQUEST);
+        };
+        let at_once = drop::<UnixStream>;
+        for close in [&read_first as &(dyn Fn(UnixStream) + Sync), &at_once] {
+            std::thread::scope(|scope| {
+                let closer = scope.spawn(|| accept_one(&bound.listener, close));
+                let r = call(&path, "status", Duration::from_secs(5));
+                closer.join().unwrap();
+                assert!(matches!(r, Err(ClientError::Closed(_))), "{r:?}");
+            });
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serves_commands_and_removes_the_socket_at_shutdown() {
         let dir = Dir::new();
