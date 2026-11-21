@@ -128,7 +128,7 @@ impl Reach {
         hop: Option<&Hop>,
     ) -> Result<(HttpPeer, Arc<Addrs>, SocketAddr)> {
         let Some(hop) = hop else {
-            let addr = site.origin.addrs.current();
+            let addr = current(&site.origin)?;
             let peer = site.origin.peer(addr)?;
             return Ok((peer, Arc::clone(&site.origin.addrs), addr));
         };
@@ -147,9 +147,21 @@ impl Reach {
             addrs,
             options: site.origin.options,
         };
-        let addr = origin.addrs.current();
+        let addr = current(&origin)?;
         Ok((origin.peer(addr)?, origin.addrs, addr))
     }
+}
+
+/// The address to connect to `origin` at; an upstream that has not resolved since startup
+/// fails like an address that cannot be reached.
+fn current(origin: &Origin) -> Result<SocketAddr> {
+    origin.addrs.current().ok_or_else(|| {
+        Error::explain(
+            ErrorType::ConnectNoRoute,
+            format!("{} does not resolve yet", origin.host),
+        )
+        .into_up()
+    })
 }
 
 /// The host an attempt towards `hop` goes to.

@@ -327,8 +327,14 @@ pub fn build_with(
     let server_tls = piano_edge::tls::server_config(Arc::clone(&certs))?;
     let client_tls = piano_upstream::tls::client_config(&config.upstream.extra_roots)?;
     let metrics = Arc::new(Metrics::new());
+    // A fresh start serves the sites whose upstream resolves and retries the others; an
+    // upgrade fails instead and the old process goes on serving.
     let sites = Arc::new(ArcSwap::from_pointee(build_sites(
-        config, &resolver, None, &metrics,
+        config,
+        &resolver,
+        None,
+        &metrics,
+        predecessor.is_none(),
     )?));
     let accept = Arc::new(AcceptStats::default());
     let access = Arc::new(AccessFilter::new(Acl::new(
@@ -531,14 +537,30 @@ fn server_options(config: &Config) -> HttpServerOptions {
 }
 
 impl Live {
+    /// Whether an upstream has not resolved since startup.
+    pub fn unresolved_origins(&self) -> bool {
+        self.sites.load().iter().any(|s| s.origin.addrs.is_empty())
+    }
+
     /// Looks up the upstreams again and moves each to its new addresses if they
     /// changed; an upstream whose lookup fails keeps the addresses it has. Blocks on
     /// the lookups.
     pub fn refresh_origins(&self) {
+        self.look_up(false);
+    }
+
+    /// Like [`Self::refresh_origins`] for the upstreams without addresses only.
+    pub fn resolve_unresolved(&self) {
+        self.look_up(true);
+    }
+
+    fn look_up(&self, unresolved_only: bool) {
         let sites = self.sites.load_full();
         let mut done: Vec<*const Addrs> = Vec::new();
         for origin in sites.iter().map(|s| &s.origin) {
-            if done.contains(&Arc::as_ptr(&origin.addrs)) {
+            if done.contains(&Arc::as_ptr(&origin.addrs))
+                || (unresolved_only && !origin.addrs.is_empty())
+            {
                 continue;
             }
             done.push(Arc::as_ptr(&origin.addrs));
@@ -552,6 +574,8 @@ impl Live {
                         );
                     }
                 }
+                // Warned about at startup; retried every few seconds until it resolves.
+                Err(e) if origin.addrs.is_empty() => log::debug!("{e}"),
                 Err(e) => log::warn!("keeping the current addresses of the upstream: {e}"),
             }
         }
@@ -566,7 +590,7 @@ impl Live {
         let source = CertSource::of(config);
         let table = source.load()?;
         let current = self.sites.load();
-        let sites = build_sites(config, &self.resolver, Some(&current), &self.metrics)?;
+        let sites = build_sites(config, &self.resolver, Some(&current), &self.metrics, false)?;
         let acl = Acl::new(&config.access.allow, config.access.loopback);
         // Opens the new file, if any, before anything is replaced; the last step that can
         // fail.
@@ -787,12 +811,14 @@ fn unix_now() -> u64 {
 /// Builds the site table. Sites with the same upstream share its addresses, so one
 /// site's failover and every refresh reach all of them; an origin already in `current`
 /// keeps its addresses and the one in use, so a reload does not move its pooled
-/// connections to a new bucket.
+/// connections to a new bucket. With `unresolved_ok`, an upstream whose lookup fails
+/// gets no addresses until a refresh finds them, instead of failing the build.
 fn build_sites(
     config: &Config,
     resolver: &Resolver,
     current: Option<&Sites>,
     metrics: &Metrics,
+    unresolved_ok: bool,
 ) -> Result<Sites, Error> {
     let options = PeerOptions::from(&config.upstream);
     let mut sites = Vec::with_capacity(config.sites.len());
@@ -810,7 +836,17 @@ fn build_sites(
             .map(|o| Arc::clone(&o.addrs));
         let addrs = match known {
             Some(a) => a,
-            None => Arc::new(resolver.resolve_blocking(&url.host, url.port)?),
+            None => match resolver.resolve_blocking(&url.host, url.port) {
+                Ok(a) => Arc::new(a),
+                Err(e) if unresolved_ok => {
+                    log::warn!(
+                        "site {}: {e}; its requests fail until the upstream resolves",
+                        site.name
+                    );
+                    Arc::new(Addrs::unresolved())
+                }
+                Err(e) => return Err(e.into()),
+            },
         };
         let mut options = options;
         if let Some(h2) = site.h2 {
@@ -921,20 +957,44 @@ mod tests {
             .with_override("emby.example.net", &[ip("192.0.2.1"), ip("192.0.2.2")])
             .with_override("other.example.net", &[ip("192.0.2.3")]);
         let metrics = Metrics::new();
-        let sites = build_sites(&config, &resolver, None, &metrics).unwrap();
+        let sites = build_sites(&config, &resolver, None, &metrics, false).unwrap();
         let addrs: Vec<&Arc<Addrs>> = sites.iter().map(|s| &s.origin.addrs).collect();
         assert!(Arc::ptr_eq(addrs[0], addrs[1]));
         assert!(!Arc::ptr_eq(addrs[0], addrs[2]));
         // A failover seen by one site is seen by the other.
         let sa = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
         addrs[0].failed(sa("192.0.2.1:443"));
-        assert_eq!(addrs[1].current(), sa("192.0.2.2:443"));
+        assert_eq!(addrs[1].current(), Some(sa("192.0.2.2:443")));
         // A reload keeps the addresses of the upstreams it already knows.
-        let again = build_sites(&config, &resolver, Some(&sites), &metrics).unwrap();
+        let again = build_sites(&config, &resolver, Some(&sites), &metrics, false).unwrap();
         assert!(Arc::ptr_eq(
             &again.iter().nth(1).unwrap().origin.addrs,
             addrs[0]
         ));
+    }
+
+    #[test]
+    fn only_a_fresh_start_takes_an_upstream_that_does_not_resolve() {
+        let config = config("");
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let none = Resolver::system().with_override("emby.example.net", &[]);
+        let metrics = Metrics::new();
+        assert!(matches!(
+            build_sites(&config, &none, None, &metrics, false),
+            Err(Error::Resolve(_))
+        ));
+        let sites = build_sites(&config, &none, None, &metrics, true).unwrap();
+        let addrs = &sites.iter().next().unwrap().origin.addrs;
+        assert_eq!(addrs.current(), None);
+        // A reload keeps the empty table, which a refresh fills in.
+        let again = build_sites(&config, &none, Some(&sites), &metrics, false).unwrap();
+        assert!(Arc::ptr_eq(
+            &again.iter().next().unwrap().origin.addrs,
+            addrs
+        ));
+        let found = Resolver::system().with_override("emby.example.net", &[ip]);
+        addrs.update(found.resolve_blocking("emby.example.net", 443).unwrap());
+        assert_eq!(addrs.current(), Some(std::net::SocketAddr::new(ip, 443)));
     }
 
     #[test]

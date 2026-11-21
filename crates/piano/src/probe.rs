@@ -108,8 +108,11 @@ pub async fn run(config: &Config, resolver: &Resolver, args: &Args) -> Result<Re
             .upstream_url
             .as_ref()
             .ok_or_else(|| Error::UnknownSite(args.site.clone()))?;
-        let addrs = resolver.resolve_blocking(&url.host, url.port)?;
-        Target::new(addrs.current(), &url.host)
+        let addr = resolver
+            .resolve_blocking(&url.host, url.port)?
+            .current()
+            .ok_or_else(|| piano_upstream::resolve::Error::NoAddress(url.host.clone()))?;
+        Target::new(addr, &url.host)
     } else {
         Target::new(relay_address(&config.server.listen)?, &site.host)
     };

@@ -23,6 +23,10 @@ const CERT_CHECK_EVERY: Duration = Duration::from_secs(3600);
 /// unnoticed.
 const ORIGIN_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
+/// How often an upstream that did not resolve at startup is looked up again: the
+/// resolver's own timeout per try (resolv.conf default), so lookups do not pile up.
+pub(crate) const UNRESOLVED_RETRY_EVERY: Duration = Duration::from_secs(5);
+
 /// Applies configuration reloads and log reopening to the running daemon, picks up
 /// renewed certificates, snapshots the request counters, writes the traffic record and
 /// writes out the summaries of rate-limited log records. Once the server stops, only the
@@ -50,12 +54,18 @@ impl Reloader {
 
     /// Starts looking the upstreams up again unless the previous round still runs. Not
     /// awaited: a slow resolver must not hold up signals and the minute tick.
-    fn refresh_origins(&self, running: &mut Option<JoinHandle<()>>) {
+    fn refresh_origins(&self, running: &mut Option<JoinHandle<()>>, unresolved_only: bool) {
         if running.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
         let live = Arc::clone(self.admin.live());
-        *running = Some(tokio::task::spawn_blocking(move || live.refresh_origins()));
+        *running = Some(tokio::task::spawn_blocking(move || {
+            if unresolved_only {
+                live.resolve_unresolved();
+            } else {
+                live.refresh_origins();
+            }
+        }));
     }
 
     async fn record_traffic(&self) {
@@ -119,6 +129,12 @@ impl ServiceWithDependents for Reloader {
             tokio::time::Instant::now() + ORIGIN_REFRESH_EVERY,
             ORIGIN_REFRESH_EVERY,
         );
+        let mut retry = tokio::time::interval_at(
+            tokio::time::Instant::now() + UNRESOLVED_RETRY_EVERY,
+            UNRESOLVED_RETRY_EVERY,
+        );
+        retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut unresolved = self.admin.live().unresolved_origins();
         let mut refreshing = None;
         loop {
             tokio::select! {
@@ -132,7 +148,13 @@ impl ServiceWithDependents for Reloader {
                     self.record_traffic().await;
                 }
                 _ = certs.tick() => self.refresh_certs().await,
-                _ = origins.tick() => self.refresh_origins(&mut refreshing),
+                _ = origins.tick() => self.refresh_origins(&mut refreshing, false),
+                _ = retry.tick(), if unresolved => {
+                    unresolved = self.admin.live().unresolved_origins();
+                    if unresolved {
+                        self.refresh_origins(&mut refreshing, true);
+                    }
+                }
                 _ = shutdown.changed() => break,
             }
         }

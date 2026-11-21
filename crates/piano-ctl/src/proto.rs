@@ -157,8 +157,9 @@ pub struct SiteStatus {
     pub host: String,
     /// `host:port` of the upstream.
     pub upstream: String,
-    /// The upstream address connections currently go to.
-    pub address: String,
+    /// The upstream address connections currently go to; `None` while the upstream has
+    /// not resolved since startup.
+    pub address: Option<String>,
     #[serde(flatten)]
     pub traffic: Traffic,
     /// Time to first byte over the last `ttfb_secs`, by `browse`, `image` and

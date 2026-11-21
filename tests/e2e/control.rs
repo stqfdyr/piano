@@ -80,7 +80,7 @@ async fn status_counts_requests_and_describes_the_daemon() {
         site.upstream,
         format!("{ORIGIN_HOST}:{}", w.origin.addr.port())
     );
-    assert_eq!(site.address, w.origin.addr.to_string());
+    assert_eq!(site.address, Some(w.origin.addr.to_string()));
     for c in [&site.traffic.total, &site.traffic.recent] {
         assert_eq!(c.requests, 2);
         assert_eq!(c.status("2xx"), 2);

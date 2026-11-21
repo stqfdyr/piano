@@ -38,8 +38,8 @@ impl Resolver {
         Self::default()
     }
 
-    /// Answers `host` with `ips`, in that order, instead of asking the system resolver.
-    /// Overridden answers skip the public-address check.
+    /// Answers `host` with `ips`, in that order, instead of asking the system resolver;
+    /// with none, `host` has no address. Overridden answers skip the public-address check.
     #[cfg(feature = "test-support")]
     pub fn with_override(mut self, host: &str, ips: &[IpAddr]) -> Self {
         self.overrides.insert(host.to_owned(), ips.to_vec());
@@ -47,20 +47,23 @@ impl Resolver {
     }
 
     #[cfg(feature = "test-support")]
-    fn overridden(&self, host: &str, port: u16) -> Option<Addrs> {
+    fn overridden(&self, host: &str, port: u16) -> Option<Result<Addrs, Error>> {
         let ips = self.overrides.get(host)?;
-        Addrs::new(ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
+        Some(
+            Addrs::new(ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
+                .ok_or_else(|| Error::NoAddress(host.to_owned())),
+        )
     }
 
     #[cfg(not(feature = "test-support"))]
-    fn overridden(&self, _host: &str, _port: u16) -> Option<Addrs> {
+    fn overridden(&self, _host: &str, _port: u16) -> Option<Result<Addrs, Error>> {
         None
     }
 
     /// Resolves `host`; IPv4 addresses come first.
     pub fn resolve_blocking(&self, host: &str, port: u16) -> Result<Addrs, Error> {
         if let Some(a) = self.overridden(host, port) {
-            return Ok(a);
+            return a;
         }
         let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
@@ -77,7 +80,7 @@ impl Resolver {
     /// this host's private services.
     pub async fn resolve_public(&self, host: &str, port: u16) -> Result<Addrs, Error> {
         if let Some(a) = self.overridden(host, port) {
-            return Ok(a);
+            return a;
         }
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
             .await
@@ -119,7 +122,8 @@ fn ipv4_first(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// every request to the host, so a failed address is skipped by later requests too.
 #[derive(Debug)]
 pub struct Addrs {
-    /// Never empty. Replaced only by [`Addrs::update`].
+    /// Empty only until a host that did not resolve at startup first does. Replaced only
+    /// by [`Addrs::update`].
     list: RwLock<Box<[SocketAddr]>>,
     current: AtomicUsize,
 }
@@ -136,15 +140,24 @@ impl Addrs {
         })
     }
 
+    /// A host that does not resolve yet; [`Addrs::update`] fills it in once it does.
+    pub fn unresolved() -> Self {
+        Self {
+            list: RwLock::new(Box::default()),
+            current: AtomicUsize::new(0),
+        }
+    }
+
     fn list(&self) -> std::sync::RwLockReadGuard<'_, Box<[SocketAddr]>> {
         // The list is replaced whole, so a panic elsewhere cannot leave it inconsistent.
         self.list.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The address to connect to.
-    pub fn current(&self) -> SocketAddr {
+    /// The address to connect to; `None` while the host does not resolve.
+    pub fn current(&self) -> Option<SocketAddr> {
         let list = self.list();
-        list[self.current.load(Ordering::Relaxed) % list.len()]
+        let i = self.current.load(Ordering::Relaxed);
+        list.get(i.checked_rem(list.len())?).copied()
     }
 
     /// Number of distinct addresses.
@@ -152,7 +165,7 @@ impl Addrs {
         self.list().len()
     }
 
-    /// Never true: an empty list is not an `Addrs`.
+    /// Whether the host does not resolve yet.
     pub fn is_empty(&self) -> bool {
         self.list().is_empty()
     }
@@ -162,7 +175,7 @@ impl Addrs {
     pub fn failed(&self, failed: SocketAddr) {
         let list = self.list();
         let i = self.current.load(Ordering::Relaxed);
-        if list[i % list.len()] == failed {
+        if list.get(i.checked_rem(list.len()).unwrap_or(0)) == Some(&failed) {
             let next = (i + 1) % list.len();
             let _ = self
                 .current
@@ -188,8 +201,12 @@ impl Addrs {
         if sorted(&list) == sorted(&fresh) {
             return None;
         }
-        let in_use = list[self.current.load(Ordering::Relaxed) % list.len()];
-        let next = fresh.iter().position(|&a| a == in_use).unwrap_or(0);
+        let in_use = self
+            .current
+            .load(Ordering::Relaxed)
+            .checked_rem(list.len())
+            .map(|i| list[i]);
+        let next = fresh.iter().position(|&a| Some(a) == in_use).unwrap_or(0);
         let old = std::mem::replace(&mut *list, fresh);
         self.current.store(next, Ordering::Relaxed);
         Some((old.into_vec(), list.to_vec()))
@@ -283,8 +300,8 @@ impl AddrCache {
         }
         let addrs = Arc::new(resolver.resolve_public(host, port).await?);
         log::info!(
-            "redirect target {host}:{port} resolved to {:?}",
-            addrs.current()
+            "redirect target {host}:{port} resolved to {}",
+            addrs.current().map(|a| a.to_string()).unwrap_or_default()
         );
         let mut entries = self.lock();
         let now = Instant::now();
@@ -323,14 +340,14 @@ mod tests {
             sa("192.0.2.3:443"),
         );
         let addrs = Addrs::new(vec![a, b, c]).unwrap();
-        assert_eq!(addrs.current(), a);
+        assert_eq!(addrs.current(), Some(a));
         addrs.failed(a);
         // A second request that also failed on `a` does not skip `b`.
         addrs.failed(a);
-        assert_eq!(addrs.current(), b);
+        assert_eq!(addrs.current(), Some(b));
         addrs.failed(b);
         addrs.failed(c);
-        assert_eq!(addrs.current(), a);
+        assert_eq!(addrs.current(), Some(a));
     }
 
     #[test]
@@ -340,11 +357,24 @@ mod tests {
         assert!(matches!(e, Error::NotPublic { .. }), "{e}");
         let pub6 = sa("[2606:4700::1]:443");
         let kept = keep_public("a.example.net", vec![pub6, private, sa("1.1.1.1:443")]).unwrap();
-        assert_eq!((kept.len(), kept.current()), (2, sa("1.1.1.1:443")));
+        assert_eq!((kept.len(), kept.current()), (2, Some(sa("1.1.1.1:443"))));
         assert!(matches!(
             keep_public("a.example.net", vec![]),
             Err(Error::NoAddress(_))
         ));
+    }
+
+    #[test]
+    fn an_unresolved_host_takes_its_first_addresses() {
+        let (a, b) = (sa("192.0.2.1:443"), sa("192.0.2.2:443"));
+        let addrs = Addrs::unresolved();
+        assert_eq!((addrs.current(), addrs.len()), (None, 0));
+        // Nothing to move on from.
+        addrs.failed(a);
+        assert_eq!(addrs.current(), None);
+        let (old, new) = addrs.update(Addrs::new(vec![a, b]).unwrap()).unwrap();
+        assert_eq!((old, new), (vec![], vec![a, b]));
+        assert_eq!(addrs.current(), Some(a));
     }
 
     #[test]
@@ -356,19 +386,19 @@ mod tests {
         );
         let addrs = Addrs::new(vec![a, b]).unwrap();
         addrs.failed(a);
-        assert_eq!(addrs.current(), b);
+        assert_eq!(addrs.current(), Some(b));
         // The same set in another order is no change.
         assert!(addrs.update(Addrs::new(vec![b, a]).unwrap()).is_none());
-        assert_eq!(addrs.current(), b);
+        assert_eq!(addrs.current(), Some(b));
         // `b` is still listed: it stays in use at its new position.
         let (old, new) = addrs.update(Addrs::new(vec![c, b]).unwrap()).unwrap();
         assert_eq!((old, new), (vec![a, b], vec![c, b]));
-        assert_eq!((addrs.current(), addrs.len()), (b, 2));
+        assert_eq!((addrs.current(), addrs.len()), (Some(b), 2));
         addrs.failed(b);
-        assert_eq!(addrs.current(), c);
+        assert_eq!(addrs.current(), Some(c));
         // The address in use is gone: the first of the new list takes over.
         addrs.update(Addrs::new(vec![a]).unwrap()).unwrap();
-        assert_eq!((addrs.current(), addrs.len()), (a, 1));
+        assert_eq!((addrs.current(), addrs.len()), (Some(a), 1));
     }
 
     #[test]
