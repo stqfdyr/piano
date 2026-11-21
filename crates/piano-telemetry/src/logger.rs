@@ -31,7 +31,58 @@ struct Tally {
     /// Start of the current window; `None` before the first record.
     since: Option<Instant>,
     suppressed: u64,
+    /// Level of the last suppressed record; `None` while nothing was suppressed.
     level: Option<Level>,
+}
+
+/// Records suppressed in a window that has ended.
+#[derive(Debug, PartialEq, Eq)]
+struct Suppressed {
+    count: u64,
+    level: Level,
+    /// Length of the window, in whole seconds.
+    secs: u64,
+}
+
+/// What to do with a record of an aggregated target.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Suppress,
+    /// Write it, after the summary of the window it ends, if that suppressed anything.
+    Write(Option<Suppressed>),
+}
+
+impl Tally {
+    /// Counts a record seen at `now`; the first one in a window is written.
+    fn admit(&mut self, level: Level, now: Instant) -> Admit {
+        if self.since.is_some_and(|s| now.duration_since(s) < WINDOW) {
+            self.suppressed += 1;
+            self.level = Some(level);
+            return Admit::Suppress;
+        }
+        let ended = self.take(now);
+        self.since = Some(now);
+        Admit::Write(ended)
+    }
+
+    /// Ends the window if it is over at `now`, or with `all` whatever its age.
+    fn close(&mut self, now: Instant, all: bool) -> Option<Suppressed> {
+        let since = self.since?;
+        if !all && now.duration_since(since) < WINDOW {
+            return None;
+        }
+        self.take(now)
+    }
+
+    /// Resets the tally, returning what its window suppressed.
+    fn take(&mut self, now: Instant) -> Option<Suppressed> {
+        let t = std::mem::take(self);
+        Some(Suppressed {
+            count: t.suppressed,
+            level: t.level?,
+            secs: now.duration_since(t.since?).as_secs(),
+        })
+    }
 }
 
 struct StderrLogger {
@@ -54,22 +105,12 @@ impl Log for StderrLogger {
         let now = SystemTime::now();
         if let Some(i) = aggregated(record.target()) {
             let mut tallies = self.tallies.lock().unwrap_or_else(PoisonError::into_inner);
-            let t = &mut tallies[i];
-            let instant = Instant::now();
-            match t.since {
-                Some(since) if instant.duration_since(since) < WINDOW => {
-                    t.suppressed += 1;
-                    t.level = Some(record.level());
-                    return;
-                }
-                _ => {
-                    if t.suppressed > 0 {
-                        emit(&summary(record.target(), t, now));
+            match tallies[i].admit(record.level(), Instant::now()) {
+                Admit::Suppress => return,
+                Admit::Write(ended) => {
+                    if let Some(s) = ended {
+                        emit(&summary(record.target(), &s, now));
                     }
-                    *t = Tally {
-                        since: Some(instant),
-                        ..Tally::default()
-                    };
                 }
             }
         }
@@ -96,13 +137,13 @@ fn emit(line: &str) {
     let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
-fn summary(target: &str, t: &Tally, now: SystemTime) -> String {
-    let level = t.level.unwrap_or(Level::Info);
-    let secs = t.since.map_or(0, |s| s.elapsed().as_secs());
+fn summary(target: &str, s: &Suppressed, now: SystemTime) -> String {
     format!(
-        "{} {level:<5} {target}: {} more like this in the last {secs} s\n",
+        "{} {:<5} {target}: {} more like this in the last {} s\n",
         utc_timestamp(now),
-        t.suppressed
+        s.level,
+        s.count,
+        s.secs
     )
 }
 
@@ -153,13 +194,10 @@ pub fn flush_aggregated(all: bool) {
         .tallies
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    let now = Instant::now();
     for (t, target) in tallies.iter_mut().zip(AGGREGATED) {
-        let ended = t.since.is_some_and(|s| all || s.elapsed() >= WINDOW);
-        if ended {
-            if t.suppressed > 0 {
-                emit(&summary(target, t, SystemTime::now()));
-            }
-            *t = Tally::default();
+        if let Some(s) = t.close(now, all) {
+            emit(&summary(target, &s, SystemTime::now()));
         }
     }
 }
@@ -261,6 +299,88 @@ mod tests {
             "1970-01-01T00:00:00.000Z WARN  piano_proxy::relay: GET /x?api_key=REDACTED failed \
              rid=00000000000000ab note=\"two words\"\n"
         );
+    }
+
+    #[test]
+    fn one_record_a_minute_is_written_and_the_rest_counted() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut t = Tally::default();
+        assert_eq!(t.admit(Level::Info, at(0)), Admit::Write(None));
+        assert_eq!(t.admit(Level::Info, at(1)), Admit::Suppress);
+        assert_eq!(t.admit(Level::Warn, at(59)), Admit::Suppress);
+        let ended = Suppressed {
+            count: 2,
+            level: Level::Warn,
+            secs: 61,
+        };
+        assert_eq!(t.admit(Level::Info, at(61)), Admit::Write(Some(ended)));
+        // A window that suppressed nothing ends without a summary.
+        assert_eq!(t.admit(Level::Info, at(121)), Admit::Write(None));
+        assert_eq!(t.admit(Level::Info, at(122)), Admit::Suppress);
+    }
+
+    #[test]
+    fn windows_are_closed_when_over_or_at_exit() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut t = Tally::default();
+        assert_eq!(t.close(at(0), true), None);
+        t.admit(Level::Info, at(0));
+        t.admit(Level::Info, at(10));
+        assert_eq!(t.close(at(59), false), None);
+        let ended = Suppressed {
+            count: 1,
+            level: Level::Info,
+            secs: 60,
+        };
+        assert_eq!(t.close(at(60), false), Some(ended));
+        // The next record opens a new window and is written.
+        assert_eq!(t.admit(Level::Info, at(70)), Admit::Write(None));
+        t.admit(Level::Info, at(71));
+        let ended = Suppressed {
+            count: 1,
+            level: Level::Info,
+            secs: 5,
+        };
+        assert_eq!(t.close(at(75), true), Some(ended));
+        assert_eq!(t.admit(Level::Info, at(76)), Admit::Write(None));
+    }
+
+    #[test]
+    fn summary_line() {
+        let s = Suppressed {
+            count: 41,
+            level: Level::Warn,
+            secs: 60,
+        };
+        assert_eq!(
+            summary(HANDSHAKE, &s, UNIX_EPOCH),
+            "1970-01-01T00:00:00.000Z WARN  pingora_core::handshake: 41 more like this in \
+             the last 60 s\n"
+        );
+    }
+
+    #[test]
+    fn dates_match_a_day_by_day_count() {
+        let (mut y, mut m, mut d) = (1970_i64, 1_u32, 1_u32);
+        for z in 0..(2500 - 1970) * 366 {
+            assert_eq!(civil_from_days(z), (y, m, d), "day {z}");
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let len = match m {
+                2 if leap => 29,
+                2 => 28,
+                4 | 6 | 9 | 11 => 30,
+                _ => 31,
+            };
+            d += 1;
+            if d > len {
+                (d, m) = (1, m + 1);
+                if m > 12 {
+                    (m, y) = (1, y + 1);
+                }
+            }
+        }
     }
 
     #[test]
