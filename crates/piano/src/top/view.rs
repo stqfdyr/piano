@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, Wrap};
 
 const DIM: Color = Color::Indexed(244);
 const FAINT: Color = Color::Indexed(238);
@@ -636,7 +636,11 @@ fn problems(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>, log_on: bool) {
         return;
     }
     if let Some(e) = s.log_error {
-        f.render_widget(Paragraph::new(colored(format!("  {e}"), WARN)), body);
+        // Wrapped: the reason comes last.
+        f.render_widget(
+            Paragraph::new(colored(format!("  {e}"), WARN)).wrap(Wrap { trim: false }),
+            body,
+        );
         return;
     }
     if list.is_empty() {

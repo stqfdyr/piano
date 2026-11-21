@@ -33,6 +33,8 @@ struct State {
     problems: Problems,
     /// The access log the daemon writes, and the reader, or why it cannot be read.
     log: Option<(String, Result<Follower, String>)>,
+    /// Why the last read of an open log failed; cleared by the next good one.
+    log_read: Option<String>,
     clock: String,
     error: Option<String>,
     paused: bool,
@@ -46,6 +48,7 @@ impl State {
             view: None,
             problems: Problems::default(),
             log: None,
+            log_read: None,
             clock: String::new(),
             error: None,
             paused: false,
@@ -54,8 +57,10 @@ impl State {
     }
 
     fn log_error(&self) -> Option<String> {
-        match &self.log {
-            Some((path, Err(e))) => Some(format!("cannot read {path}: {e}")),
+        match (&self.log, &self.log_read) {
+            (Some((path, Err(e))), _) | (Some((path, Ok(_))), Some(e)) => {
+                Some(format!("cannot read {path}: {e}"))
+            }
             _ => None,
         }
     }
@@ -73,11 +78,11 @@ impl State {
         }
         if let Some((_, Ok(log))) = &mut self.log {
             let problems = &mut self.problems;
-            // A log that cannot be read leaves the list as it is.
-            let _ = log.poll(|l| {
+            let read = log.poll(|l| {
                 problems.add(l);
                 Ok(())
             });
+            self.log_read = read.err().map(|e| e.to_string());
         }
     }
 
@@ -86,13 +91,16 @@ impl State {
     fn follow(&mut self, path: Option<&str>) {
         let Some(path) = path else {
             self.log = None;
+            self.log_read = None;
             return;
         };
-        if let Some((p, Ok(_))) = &self.log
-            && p == path
-        {
-            return;
+        match &self.log {
+            Some((p, Ok(_))) if p == path => return,
+            Some((p, _)) if p == path => {}
+            // Problems of another file are not this one's.
+            _ => self.problems = Problems::default(),
         }
+        self.log_read = None;
         let log = Follower::open(Path::new(path), Some(BACKLOG)).map_err(|e| e.to_string());
         self.log = Some((path.to_owned(), log));
     }
@@ -255,6 +263,7 @@ mod tests {
     fn an_access_log_that_cannot_be_read_is_said_so() {
         let mut s = State::new();
         let dir = std::env::temp_dir().join(format!("piano-top-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("access.log");
         let path = path.to_str().unwrap();
         s.follow(Some(path));
@@ -265,6 +274,23 @@ mod tests {
         std::fs::write(path, "").unwrap();
         s.follow(Some(path));
         assert_eq!(s.log_error(), None);
+        s.log_read = Some("Input/output error".into());
+        assert_eq!(
+            s.log_error().as_deref(),
+            Some(format!("cannot read {path}: Input/output error").as_str())
+        );
+        s.problems.add(
+            r#"{"ts":"2026-11-20T08:01:02.345Z","site":"a","status":502,"path":"/x","end":"ok"}"#,
+        );
+        s.follow(Some(path));
+        assert_eq!(s.problems.list.len(), 1);
+        s.follow(Some("/elsewhere/access.log"));
+        assert!(s.problems.list.is_empty());
+        assert!(
+            s.log_error()
+                .unwrap()
+                .starts_with("cannot read /elsewhere/")
+        );
         s.follow(None);
         assert!(s.log.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
