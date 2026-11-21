@@ -58,8 +58,9 @@ const MISSING_TTL: Duration = Duration::from_secs(600);
 /// the upstream reorganises its paths; a day bounds that.
 const MOVED_TTL: Duration = Duration::from_secs(86_400);
 
-/// Memory for remembered redirects and missing images: about 200 bytes each, so tens of
-/// thousands of entries, more than the distinct images seen at a relay in two months.
+/// Memory for remembered redirects and missing images: about 300 bytes each with the
+/// key, so thousands to tens of thousands of entries, more than the distinct images seen
+/// at a relay in two months.
 const MOVED_MEMORY: usize = 8 * 1024 * 1024;
 const MISSING_MEMORY: usize = 2 * 1024 * 1024;
 
@@ -1127,8 +1128,8 @@ mod tests {
         let images = Images::new(10_000);
         images.store("a", image(4_000));
         images.store("b", image(4_000));
-        // Body, header name and value, and fixed overheads per field and per image.
-        let one = 4_000 + (4 + 3 + 32) + 128;
+        // Body, header name and value, fixed overheads per field and per image, the key.
+        let one = (4_000 + (4 + 3 + 32) + 128 + 1 + piano_cache::ENTRY) as u64;
         assert_eq!(images.stats().bytes, 2 * one);
         images.store("c", image(4_000));
         assert_eq!(images.stats().images, 2, "the oldest made room");
@@ -1137,18 +1138,21 @@ mod tests {
 
         let now = Instant::now();
         for i in 0..40_000 {
-            images.remember_missing(&i.to_string(), now);
+            images.remember_missing(&format!("{i:05}"), now);
         }
-        assert_eq!(images.stats().missing as usize, MISSING_MEMORY / 64);
+        assert_eq!(
+            images.stats().missing as usize,
+            MISSING_MEMORY / (64 + 5 + piano_cache::ENTRY)
+        );
         let target = |i: usize| Target {
             host: "img.example.net".into(),
             port: 443,
             path: format!("/img/{i:04}").into_bytes(),
         };
         for i in 0..100_000 {
-            images.remember_moved(&i.to_string(), target(i % 10_000), now);
+            images.remember_moved(&format!("{i:06}"), target(i % 10_000), now);
         }
-        let per = "img.example.net".len() + "/img/0000".len() + 96;
+        let per = "img.example.net".len() + "/img/0000".len() + 96 + 6 + piano_cache::ENTRY;
         assert_eq!(images.stats().moved as usize, MOVED_MEMORY / per);
     }
 
