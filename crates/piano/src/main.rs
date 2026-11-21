@@ -552,8 +552,8 @@ fn stop(cli: &Cli) -> ExitCode {
         Err(code) => return code,
     };
     // The process an upgrade replaced gets the signal passed on and stops within the same
-    // limit; it still holds the listening sockets until then, so a start right after
-    // this command would fail without waiting for it too.
+    // limit. It no longer listens, but waiting for it lets its last access log lines and
+    // traffic record be written before the service manager deals with what is left.
     let limit = Duration::from_secs(reply.limit_secs) + STOP_MARGIN;
     let deadline = std::time::Instant::now() + limit;
     let pids: Vec<u32> = std::iter::once(reply.pid)

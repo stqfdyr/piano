@@ -47,7 +47,8 @@ const CHECK_INVALID: i32 = 2;
 /// How this process was started, to start its successor the same way.
 #[derive(Debug, Clone)]
 pub struct Relaunch {
-    /// The binary as named at startup, so a file installed over it is what runs next.
+    /// The binary's path at startup, symlinks resolved, so a file installed over it is
+    /// what runs next.
     pub exe: PathBuf,
     pub config: PathBuf,
     pub log_level: Option<String>,
