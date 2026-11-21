@@ -85,16 +85,21 @@ impl Resolver {
                 source,
             })?
             .collect();
-        let first = addrs
-            .first()
-            .copied()
-            .ok_or_else(|| Error::NoAddress(host.to_owned()))?;
-        let public = addrs.into_iter().filter(|a| is_public(a.ip())).collect();
-        Addrs::new(ipv4_first(public)).ok_or_else(|| Error::NotPublic {
-            host: host.to_owned(),
-            ip: first.ip(),
-        })
+        keep_public(host, addrs)
     }
+}
+
+/// The public addresses among the answers for `host`, IPv4 first.
+fn keep_public(host: &str, addrs: Vec<SocketAddr>) -> Result<Addrs, Error> {
+    let first = addrs
+        .first()
+        .copied()
+        .ok_or_else(|| Error::NoAddress(host.to_owned()))?;
+    let public = addrs.into_iter().filter(|a| is_public(a.ip())).collect();
+    Addrs::new(ipv4_first(public)).ok_or_else(|| Error::NotPublic {
+        host: host.to_owned(),
+        ip: first.ip(),
+    })
 }
 
 /// Stable order with IPv4 addresses before IPv6 ones, without duplicates.
@@ -199,13 +204,15 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     let bits = u128::from(ip);
     let in_net =
         |net: u128, prefix: u32| bits & u128::MAX.checked_shl(128 - prefix).unwrap_or(0) == net;
-    // Global unicast is 2000::/3; within it, exclude documentation, Teredo, 6to4 and
-    // NAT64, which can embed private IPv4 addresses.
+    // Global unicast is 2000::/3, which leaves out NAT64 (64:ff9b::/96). Within it,
+    // exclude documentation, SRv6 segment identifiers, the IETF protocol block (Teredo,
+    // benchmarking, ORCHID) and 6to4; Teredo and 6to4 can embed private IPv4 addresses.
     in_net(0x2000 << 112, 3)
         && !in_net(0x2001_0db8 << 96, 32)
-        && !in_net(0x2001_0000 << 96, 32)
+        && !in_net(0x3fff << 112, 20)
+        && !in_net(0x5f00 << 112, 16)
+        && !in_net(0x2001 << 112, 23)
         && !in_net(0x2002 << 112, 16)
-        && !in_net(0x0064_ff9b << 96, 32)
 }
 
 type Entries = HashMap<(String, u16), (Arc<Addrs>, Instant)>;
@@ -294,12 +301,29 @@ mod tests {
     }
 
     #[test]
+    fn lookups_keep_only_public_addresses() {
+        let private = sa("127.0.0.1:443");
+        let e = keep_public("a.example.net", vec![private]).unwrap_err();
+        assert!(matches!(e, Error::NotPublic { .. }), "{e}");
+        let pub6 = sa("[2606:4700::1]:443");
+        let kept = keep_public("a.example.net", vec![pub6, private, sa("1.1.1.1:443")]).unwrap();
+        assert_eq!((kept.len(), kept.current()), (2, sa("1.1.1.1:443")));
+        assert!(matches!(
+            keep_public("a.example.net", vec![]),
+            Err(Error::NoAddress(_))
+        ));
+    }
+
+    #[test]
     fn public_addresses() {
         for ip in [
             "1.1.1.1",
             "104.16.0.1",
             "2606:4700::1",
             "2a01:4f8::1",
+            "3ffe::1",
+            "3fff:1000::1",
+            "2001:200::1",
             "::ffff:8.8.8.8",
         ] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
@@ -328,6 +352,12 @@ mod tests {
             "2002:7f00:1::",
             "64:ff9b::7f00:1",
             "2001::1",
+            "3fff::1",
+            "3fff:fff::1",
+            "5f00::1",
+            "2001:2::1",
+            "2001:20::1",
+            "2001:1ff::1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }

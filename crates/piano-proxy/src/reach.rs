@@ -209,10 +209,8 @@ pub(crate) fn redirect(
             path: client_path.to_vec(),
         },
     };
-    let target = follow::resolve(location, &base).map_err(|e| {
-        let shown = String::from_utf8_lossy(location);
-        refuse_redirect(format!("{e}: {:?}", clip(&shown, 200)))
-    })?;
+    let target = follow::resolve(location, &base)
+        .map_err(|e| refuse_redirect(format!("{e}: {:?}", location_origin(location))))?;
     // A site of this relay would receive the request again and could loop.
     if sites.find(target.host.as_bytes()).is_some() {
         return Err(refuse_redirect(format!(
@@ -227,6 +225,38 @@ pub(crate) fn redirect(
         )));
     };
     Ok(Hop { target, kind })
+}
+
+/// The scheme and host of a `Location`, as a refusal reason may show it: the path and
+/// query can carry signatures and the user info a password. A Location with an `@`
+/// anywhere, or whose host part is not plainly a host, shows at most its scheme.
+fn location_origin(location: &[u8]) -> String {
+    let s = String::from_utf8_lossy(location.trim_ascii());
+    let scheme_end = s.find(':').filter(|&c| {
+        let scheme = s[..c].as_bytes();
+        scheme.first().is_some_and(u8::is_ascii_alphabetic)
+            && scheme
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    let (scheme, rest) = match scheme_end {
+        Some(c) => (&s[..=c], &s[c + 1..]),
+        None => ("", &s[..]),
+    };
+    let Some(after) = rest.strip_prefix("//") else {
+        // Without `//`, what looks like a scheme can be a user name.
+        let shown = if s.contains('@') { "" } else { scheme };
+        return clip(shown, 100).to_owned();
+    };
+    let host = &after[..after.find(['/', '?', '#', '\\']).unwrap_or(after.len())];
+    let plain =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b':' | b'[' | b']');
+    let host = if s.contains('@') || !host.bytes().all(plain) {
+        ""
+    } else {
+        host
+    };
+    clip(&format!("{scheme}//{host}"), 100).to_owned()
 }
 
 /// A redirect that will not be followed. The reason ends up in the access log and the
@@ -267,4 +297,34 @@ pub(crate) fn clip(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusals_show_only_scheme_and_host() {
+        for (location, shown) in [
+            ("https://u:pw@cdn.example.net/f?md5=abc", "https://"),
+            (
+                "http://192.0.2.1:5244/d/a.mkv?sign=x",
+                "http://192.0.2.1:5244",
+            ),
+            ("https://cdn.example.net\\@evil.example.org/x", "https://"),
+            ("//a.example.net:0?expires=1", "//a.example.net:0"),
+            ("ftp://a.example.net/x?api_key=k", "ftp://a.example.net"),
+            ("javascript:alert(1)", "javascript:"),
+            ("https:a.example.net/p?sign=x", "https:"),
+            ("/relative/path?sign=x", ""),
+            ("https:admin:hunter2@cdn.example.net//x?sign=s", ""),
+            ("admin:hunter2@cdn.example.net//x", ""),
+            ("https://user:p/ss@cdn.example.net/f?sign=x", "https://"),
+            ("https://user:secret#@cdn.example.net/", "https://"),
+            ("https://cdn.example.net/f?next=a@b", "https://"),
+            ("https://cdn%2Eexample.net/x", "https://"),
+        ] {
+            assert_eq!(location_origin(location.as_bytes()), shown, "{location}");
+        }
+    }
 }

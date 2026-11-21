@@ -246,6 +246,15 @@ mod tests {
             ..base()
         };
         assert_eq!(resolve(b"y", &root).unwrap().path, b"/y");
+        // A backslash is a path byte here, not a separator: the target stays on this host.
+        assert_eq!(
+            ok("\\evil.example.org/x"),
+            (
+                "emby.example.net".into(),
+                443,
+                "/emby/videos/1/\\evil.example.org/x".into()
+            )
+        );
     }
 
     #[test]
@@ -264,6 +273,11 @@ mod tests {
             ("https://a.example.net:99999/", LocationError::Port),
             ("ftp://a.example.net/", LocationError::Scheme),
             ("javascript:alert(1)", LocationError::Scheme),
+            ("https:a.example.net/x", LocationError::Scheme),
+            (
+                "https://a.example.net\\@evil.example.org/",
+                LocationError::Credentials,
+            ),
         ] {
             assert_eq!(resolve(loc.as_bytes(), &base()), Err(err), "{loc}");
         }
