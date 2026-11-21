@@ -1,0 +1,38 @@
+name: upstream
+
+# Fails when cloudflare/pingora main has moved past the base commit of the fork in
+# third_party/pingora, so that upstream fixes get looked at the same week. Separate from
+# ci: a pending upstream change must not hold back a release.
+on:
+  schedule:
+    - cron: '41 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pingora:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: third_party/pingora/PATCHES.md
+          sparse-checkout-cone-mode: false
+      - name: Compare upstream main with the fork's base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(sed -n 's/^- Base commit: .\([0-9a-f]\{40\}\).*/\1/p' third_party/pingora/PATCHES.md)
+          test -n "$base" || { echo "no base commit in PATCHES.md"; exit 1; }
+          head=$(gh api repos/cloudflare/pingora/commits/main -q .sha)
+          if [ "$head" = "$base" ]; then
+            echo "upstream main is still the base, $base"
+            exit 0
+          fi
+          echo "::error::cloudflare/pingora main has moved past the fork's base"
+          gh api "repos/cloudflare/pingora/compare/$base...$head" \
+            -q '.status, (.commits[] | .sha[0:12] + " " + (.commit.message | split("\n")[0]))'
+          exit 1

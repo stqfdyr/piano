@@ -5,8 +5,7 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
-# Unmaintained crates reached only through the vendored pingora fork; each goes away
-# with a fork patch that drops or replaces the dependency.
+# Each ignored advisory says why the crate stays.
 ignore = [
     { id = "RUSTSEC-2026-0543", reason = "chrono (unmaintained, no vulnerability): local dates of the traffic record and times shown by top" },
 ]

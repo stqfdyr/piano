@@ -77,8 +77,8 @@ fn run(step: &str, mut cmd: Command) -> Result {
     Ok(())
 }
 
-/// Upper bound on running the tests, about three times what the whole suite takes. A
-/// hung test fails the run instead of holding it open.
+/// Upper bound on running the tests, several times what the whole suite takes (about
+/// 20 s). A hung test fails the run instead of holding it open.
 const TEST_LIMIT: Duration = Duration::from_secs(120);
 
 /// Like [`run`], but kills the command and everything it started once `limit` passes.
@@ -174,6 +174,14 @@ fn target_dir() -> PathBuf {
 /// `.sha256` file; returns the binary's path.
 fn dist() -> Result<PathBuf> {
     let mut build = cargo();
+    // RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS take precedence over the per-target flags
+    // below, which would then be dropped without a word: the CPU level among them.
+    for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
+        if std::env::var_os(var).is_some() {
+            eprintln!("    warning: {var} is set; dist ignores it");
+            build.env_remove(var);
+        }
+    }
     build
         .args([
             "build",
@@ -197,7 +205,7 @@ fn dist() -> Result<PathBuf> {
         return Err(format!("{} is dynamically linked", built.display()));
     }
 
-    let version = workspace_version()?;
+    let version = env!("CARGO_PKG_VERSION");
     let out_dir = target_dir.join("dist");
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
     let name = format!("piano-{version}-{DIST_PLATFORM}");
@@ -658,26 +666,6 @@ fn has_interpreter(elf: &[u8]) -> Result<bool> {
     Ok(false)
 }
 
-/// `version` from `[workspace.package]` in the root manifest.
-fn workspace_version() -> Result<String> {
-    let path = root().join("Cargo.toml");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut in_package = false;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_package = line == "[workspace.package]";
-        } else if in_package && let Some(v) = line.strip_prefix("version") {
-            let v = v
-                .trim_start()
-                .trim_start_matches('=')
-                .trim()
-                .trim_matches('"');
-            return Ok(v.to_owned());
-        }
-    }
-    Err("no version in [workspace.package]".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,10 +738,5 @@ mod tests {
         ] {
             assert_eq!(parse_github(url), None, "{url}");
         }
-    }
-
-    #[test]
-    fn reads_workspace_version() {
-        assert!(!workspace_version().unwrap().is_empty());
     }
 }
