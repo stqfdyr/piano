@@ -749,8 +749,8 @@ impl Plan {
                     p.pause = Some((at.parse().unwrap(), ms.parse().unwrap()));
                 }
                 "e" => p.etag = Some(v.to_owned()),
-                "x" => p.no_ranges = true,
-                "u" => p.unknown_length = true,
+                "x" if v.is_empty() => p.no_ranges = true,
+                "u" if v.is_empty() => p.unknown_length = true,
                 _ => panic!("unknown plan token {t}"),
             }
         }
