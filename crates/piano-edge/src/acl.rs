@@ -3,7 +3,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use log::info;
-use piano_config::IpNet;
+use piano_config::{IpNet, mask_v4, mask_v6};
 use piano_telemetry::logger::REFUSED;
 use pingora_core::listeners::ConnectionFilter;
 use std::net::{IpAddr, SocketAddr};
@@ -27,18 +27,8 @@ impl Acl {
         };
         for net in allow {
             match net.addr() {
-                IpAddr::V4(a) => {
-                    let mask = u32::MAX
-                        .checked_shl(32 - u32::from(net.prefix()))
-                        .unwrap_or(0);
-                    acl.v4.push((u32::from(a), mask));
-                }
-                IpAddr::V6(a) => {
-                    let mask = u128::MAX
-                        .checked_shl(128 - u32::from(net.prefix()))
-                        .unwrap_or(0);
-                    acl.v6.push((u128::from(a), mask));
-                }
+                IpAddr::V4(a) => acl.v4.push((u32::from(a), mask_v4(net.prefix()))),
+                IpAddr::V6(a) => acl.v6.push((u128::from(a), mask_v6(net.prefix()))),
             }
         }
         acl

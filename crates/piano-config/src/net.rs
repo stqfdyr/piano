@@ -39,11 +39,11 @@ impl IpNet {
 }
 
 /// Mask with the top `prefix` bits set.
-pub(crate) fn mask_v4(prefix: u8) -> u32 {
+pub fn mask_v4(prefix: u8) -> u32 {
     u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
 }
 
-pub(crate) fn mask_v6(prefix: u8) -> u128 {
+pub fn mask_v6(prefix: u8) -> u128 {
     u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0)
 }
 
@@ -162,7 +162,8 @@ mod tests {
             "example.com",
             "192.0.2.0/",
             "192.0.2.0/33",
-            "192.0.2.0/+8",
+            // A valid network but for the sign, which `u8` parsing would accept.
+            "192.0.0.0/+8",
             "192.0.2.0/ 8",
             "2001:db8::/129",
             "192.0.2.5/24",
