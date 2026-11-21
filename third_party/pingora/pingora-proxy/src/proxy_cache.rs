@@ -1226,7 +1226,7 @@ pub mod range_filter {
 
         // Match individual range parts, (e.g. "0-100", "-5", "1-")
         static RE_SINGLE_RANGE_PART: Lazy<Regex> =
-            Lazy::new(|| Regex::new(r"(?i)^\s*(?P<start>\d*)-(?P<end>\d*)\s*$").unwrap());
+            Lazy::new(|| Regex::new(r"(?-u)(?i)^\s*(?P<start>\d*)-(?P<end>\d*)\s*$").unwrap());
 
         // Convert bytes to UTF-8 string
         let range_str = match str::from_utf8(range) {

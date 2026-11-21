@@ -1823,7 +1823,7 @@ impl HttpSession {
 
 // Regex to parse request line that has illegal chars in it
 static REQUEST_LINE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\w+ (?P<uri>.+) HTTP/\d(?:\.\d)?").unwrap());
+    Lazy::new(|| Regex::new(r"^(?-u:\w)+ (?P<uri>.+) HTTP/(?-u:\d)(?:\.(?-u:\d))?").unwrap());
 
 // the chars httparse considers illegal in URL
 // Almost https://url.spec.whatwg.org/#query-percent-encode-set + {}

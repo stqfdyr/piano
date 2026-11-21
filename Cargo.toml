@@ -53,8 +53,9 @@ toml = { version = "1", default-features = false, features = ["parse", "display"
 # JSON rewriting: one pass over a body finds every place an upstream address may start.
 aho-corasick = "1"
 
-# UA rewrite rules in the configuration.
-regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case"] }
+# UA rewrite rules in the configuration. Perl classes (\d, \w, \s) and case-insensitive
+# matching are what such rules use; the rest of the Unicode tables is left out.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
 
 # Local calendar days of the traffic record; already in the tree through pingora-core,
 # which uses it without the clock. The clock brings iana-time-zone.

@@ -33,8 +33,7 @@ async-trait = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 once_cell = { workspace = true }
-clap = { version = "4", features = ["derive"] }
-regex = "1"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 rand = "0.8"
 
 [dev-dependencies]
