@@ -11,56 +11,27 @@ use std::time::{Duration, Instant};
 
 use crate::latency::{self, Buckets, Histogram, Ttfb};
 
-/// How a request ended; logged as `end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum End {
-    /// Finished normally, whatever status the upstream sent.
-    Ok,
-    ClientClosed,
-    ClientTimeout,
-    /// A redirect the relay would not follow; the client got 502.
-    RedirectRefused,
-    ConnectTimeout,
-    ConnectFailed,
-    UpstreamTimeout,
-    UpstreamClosed,
-    UpstreamError,
-    /// Ended because the process stops: a media stream or websocket on terminate.
-    Shutdown,
-    Internal,
+labelled! {
+    /// How a request ended; logged as `end`.
+    pub enum End {
+        /// Finished normally, whatever status the upstream sent.
+        Ok => "ok",
+        ClientClosed => "client_closed",
+        ClientTimeout => "client_timeout",
+        /// A redirect the relay would not follow; the client got 502.
+        RedirectRefused => "redirect_refused",
+        ConnectTimeout => "connect_timeout",
+        ConnectFailed => "connect_failed",
+        UpstreamTimeout => "upstream_timeout",
+        UpstreamClosed => "upstream_closed",
+        UpstreamError => "upstream_error",
+        /// Ended because the process stops: a media stream or websocket on terminate.
+        Shutdown => "shutdown",
+        Internal => "internal",
+    }
 }
 
 impl End {
-    pub const ALL: [End; 11] = [
-        End::Ok,
-        End::ClientClosed,
-        End::ClientTimeout,
-        End::RedirectRefused,
-        End::ConnectTimeout,
-        End::ConnectFailed,
-        End::UpstreamTimeout,
-        End::UpstreamClosed,
-        End::UpstreamError,
-        End::Shutdown,
-        End::Internal,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            End::Ok => "ok",
-            End::ClientClosed => "client_closed",
-            End::ClientTimeout => "client_timeout",
-            End::RedirectRefused => "redirect_refused",
-            End::ConnectTimeout => "connect_timeout",
-            End::ConnectFailed => "connect_failed",
-            End::UpstreamTimeout => "upstream_timeout",
-            End::UpstreamClosed => "upstream_closed",
-            End::UpstreamError => "upstream_error",
-            End::Shutdown => "shutdown",
-            End::Internal => "internal",
-        }
-    }
-
     /// Ends caused by the upstream side, which a client can do nothing about.
     pub fn is_upstream_failure(self) -> bool {
         matches!(
@@ -73,36 +44,16 @@ impl End {
                 | End::UpstreamError
         )
     }
-
-    fn index(self) -> usize {
-        self as usize
-    }
 }
 
-/// What the bytes of a request carried, as traffic is broken down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Media,
-    Image,
-    Socket,
-    /// API calls, subtitles and everything else.
-    Other,
-}
-
-impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Media, Kind::Image, Kind::Socket, Kind::Other];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Kind::Media => "media",
-            Kind::Image => "image",
-            Kind::Socket => "socket",
-            Kind::Other => "other",
-        }
-    }
-
-    fn index(self) -> usize {
-        self as usize
+labelled! {
+    /// What the bytes of a request carried, as traffic is broken down.
+    pub enum Kind {
+        Media => "media",
+        Image => "image",
+        Socket => "socket",
+        /// API calls, subtitles and everything else.
+        Other => "other",
     }
 }
 
@@ -425,16 +376,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn end_order_matches_indexes() {
+    fn labels_are_the_logged_and_stored_names() {
+        // The access log's `end` and the traffic record's keys; renaming one breaks
+        // readers of old lines and files.
+        assert_eq!(
+            End::ALL.map(End::as_str),
+            [
+                "ok",
+                "client_closed",
+                "client_timeout",
+                "redirect_refused",
+                "connect_timeout",
+                "connect_failed",
+                "upstream_timeout",
+                "upstream_closed",
+                "upstream_error",
+                "shutdown",
+                "internal",
+            ]
+        );
+        assert_eq!(
+            Kind::ALL.map(Kind::as_str),
+            ["media", "image", "socket", "other"]
+        );
+        assert_eq!(Ttfb::ALL.map(Ttfb::as_str), ["browse", "image", "media"]);
         for (i, e) in End::ALL.iter().enumerate() {
-            assert_eq!(e.index(), i, "{}", e.as_str());
-        }
-    }
-
-    #[test]
-    fn kind_order_matches_indexes() {
-        for (i, k) in Kind::ALL.iter().enumerate() {
-            assert_eq!(k.index(), i, "{}", k.as_str());
+            assert_eq!(e.index(), i);
         }
     }
 
@@ -512,16 +479,17 @@ mod tests {
         let t0 = Instant::now();
         let a = m.site("a");
         a.record_ttfb(Ttfb::Media, Duration::from_millis(200));
-        for minute in 1..=70u64 {
+        for minute in 1..=72u64 {
             m.tick_at(t0 + Duration::from_secs(minute * 60));
             a.record_ttfb(Ttfb::Browse, Duration::from_millis(50));
         }
-        let r = m.report_at(t0 + Duration::from_secs(70 * 60 + 30));
-        // Histograms kept at minutes 0, 5, … 70; the newest an hour old is minute 10.
-        assert_eq!(r.ttfb_span, Duration::from_secs(60 * 60 + 30));
+        let r = m.report_at(t0 + Duration::from_secs(72 * 60 + 30));
+        // Histograms kept at minutes 0, 5, … 70; the newest an hour old is minute 10,
+        // where one kept every minute would give minute 12.
+        assert_eq!(r.ttfb_span, Duration::from_secs(62 * 60 + 30));
         let recent = &r.sites[0].ttfb_recent;
-        // Recorded after the ticks of minutes 10 to 70.
-        assert_eq!(recent[Ttfb::Browse.index()].iter().sum::<u64>(), 61);
+        // Recorded after the ticks of minutes 10 to 72.
+        assert_eq!(recent[Ttfb::Browse.index()].iter().sum::<u64>(), 63);
         assert_eq!(recent[Ttfb::Media.index()].iter().sum::<u64>(), 0);
         assert_eq!(a.ttfb()[Ttfb::Media.index()].iter().sum::<u64>(), 1);
     }

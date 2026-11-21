@@ -31,30 +31,15 @@ const fn bounds() -> [u64; BUCKETS - 1] {
 /// Counts by bucket.
 pub type Buckets = [u64; BUCKETS];
 
-/// What a time to first byte is about; requests of other kinds are not timed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ttfb {
-    /// GET requests of the API, server information and playback information: what a
-    /// client waits for while browsing.
-    Browse,
-    Image,
-    /// The first byte of a media stream: the wait before playback starts.
-    Media,
-}
-
-impl Ttfb {
-    pub const ALL: [Ttfb; 3] = [Ttfb::Browse, Ttfb::Image, Ttfb::Media];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Ttfb::Browse => "browse",
-            Ttfb::Image => "image",
-            Ttfb::Media => "media",
-        }
-    }
-
-    pub(crate) fn index(self) -> usize {
-        self as usize
+labelled! {
+    /// What a time to first byte is about; requests of other kinds are not timed.
+    pub enum Ttfb {
+        /// GET requests of the API, server information and playback information: what a
+        /// client waits for while browsing.
+        Browse => "browse",
+        Image => "image",
+        /// The first byte of a media stream: the wait before playback starts.
+        Media => "media",
     }
 }
 
@@ -92,8 +77,11 @@ pub fn since(later: &Buckets, earlier: &Buckets) -> Buckets {
     std::array::from_fn(|i| later[i].saturating_sub(earlier[i]))
 }
 
-/// The `q` quantile (0 to 1) of the values counted in `counts`, interpolated within its
-/// bucket on a log scale (linearly in the first). `None` without values or when
+/// The `q` quantile (0 to 1) of the values counted in `counts`: the value of rank
+/// max(⌈q·n⌉, 1), each of a bucket's values taken to sit at the middle of its share of the
+/// bucket on a log scale (linearly in the first). A lone value thus reads as the
+/// geometric middle of its bucket rather than its upper bound, which a few samples per
+/// window would otherwise bias upwards by up to √2. `None` without values or when
 /// `counts` does not have [`BUCKETS`] entries. Values past the last bound read as
 /// that bound.
 pub fn quantile(counts: &[u64], q: f64) -> Option<Duration> {
@@ -104,7 +92,8 @@ pub fn quantile(counts: &[u64], q: f64) -> Option<Duration> {
     if total == 0 {
         return None;
     }
-    let rank = (q.clamp(0.0, 1.0) * total as f64).max(1.0);
+    // The tolerance keeps a q·n that rounding left just above a whole number on it.
+    let rank = (q.clamp(0.0, 1.0) * total as f64 - 1e-9).ceil().max(1.0) - 0.5;
     let mut below = 0u64;
     for (i, &n) in counts.iter().enumerate() {
         if n == 0 {
@@ -171,6 +160,27 @@ mod tests {
         }
         assert_eq!(quantile(&[0; BUCKETS], 0.5), None);
         assert_eq!(quantile(&[1, 2], 0.5), None);
+    }
+
+    #[test]
+    fn a_lone_value_reads_as_the_middle_of_its_bucket() {
+        let h = Histogram::default();
+        h.record(ms(3));
+        let middle = Duration::from_micros((2828.0f64 * 4000.0).sqrt() as u64);
+        assert_eq!(quantile(&h.read(), 0.5), Some(middle));
+        assert_eq!(quantile(&h.read(), 0.95), Some(middle));
+        let h = Histogram::default();
+        h.record(Duration::from_micros(400));
+        assert_eq!(quantile(&h.read(), 0.5), Some(Duration::from_micros(500)));
+    }
+
+    #[test]
+    fn a_whole_rank_is_not_rounded_up() {
+        // 0.07 × 100 is 7.000000000000001 in floating point; the 7th value is the answer.
+        let mut b = [0; BUCKETS];
+        b[0] = 7;
+        b[20] = 93;
+        assert!(quantile(&b, 0.07).unwrap() < Duration::from_millis(1));
     }
 
     #[test]
