@@ -146,8 +146,9 @@ fn run(rx: Receiver<Msg>, file: Option<File>, lost: &AtomicU64) {
         while let Some(msg) = next.take() {
             match msg {
                 Msg::Line(line) => {
-                    // Fails only when the buffer is full and cannot be written out; the
-                    // buffer keeps its lines for the next try, this one is gone.
+                    // Fails when the buffer cannot be written out to make room (it keeps
+                    // its lines for the next try) or a line longer than the buffer cannot
+                    // be written directly; either way this line is gone.
                     if let Some(w) = out.as_mut()
                         && let Err(e) = w.write_all(line.as_bytes())
                     {
@@ -196,7 +197,7 @@ fn flush(w: &mut BufWriter<File>, failing: &mut bool) {
 fn failed(e: &io::Error, failing: &mut bool) {
     if !*failing {
         *failing = true;
-        warn!("access log write failed, lines are being lost: {e}");
+        warn!("access log write failed: {e}");
     }
 }
 
@@ -206,7 +207,11 @@ fn close(mut w: BufWriter<File>, lost: &AtomicU64, failing: &mut bool) {
     // into_parts hands back the unwritten bytes instead of trying again on drop.
     if let (_, Ok(rest)) = w.into_parts() {
         let lines = rest.iter().filter(|&&b| b == b'\n').count();
-        lost.fetch_add(lines as u64, Ordering::Relaxed);
+        if lines > 0 {
+            // Also when the process exits, after the counter can no longer be read.
+            warn!("{lines} access log lines could not be written and are lost");
+            lost.fetch_add(lines as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -292,11 +297,18 @@ mod tests {
         }
         // The buffer holds what fits for a later try; the lines after it are lost.
         let held = (BUFFER / line.len()) as u64;
-        assert_eq!(log.dropped(), 300 - held);
+        // flush gives up after FLUSH_WAIT; a starved writer may count later.
+        let dropped = |n: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while log.dropped() != n && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            log.dropped()
+        };
+        assert_eq!(dropped(300 - held), 300 - held);
         // Leaving the file gives up what the buffer holds.
         log.set_path(None).unwrap();
-        log.flush();
-        assert_eq!(log.dropped(), 300);
+        assert_eq!(dropped(300), 300);
     }
 
     #[test]

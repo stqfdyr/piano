@@ -555,7 +555,7 @@ fn findings(s: &Status, now: u64) -> Vec<Finding> {
                 "{} access log lines lost since start; the disk was too slow or writes failed",
                 s.access_log.dropped
             ),
-            Some("the diagnostic log says why writes failed"),
+            Some("if writes failed, the diagnostic log says why"),
         ));
     }
     let hour = if s.recent_secs >= 3600 {
