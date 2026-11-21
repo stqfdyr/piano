@@ -1,4 +1,5 @@
 #!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034 # the variables are read by openrc-run
 # OpenRC service for piano. Installed by contrib/install.sh as /etc/init.d/piano;
 # settings go in /etc/conf.d/piano. A second instance:
 #   ln -s piano /etc/init.d/piano.NAME
