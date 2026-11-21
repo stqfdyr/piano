@@ -42,12 +42,28 @@ fi
 sum() { sha256sum "$1" | cut -d' ' -f1; }
 short() { echo "${1:-?}" | cut -c1-12; }
 # "PID SHA256" of the daemon answering on the control socket (its own report of the
-# binary it runs; empty from daemons older than that report), or nothing.
+# binary it runs; empty from daemons older than that report), or nothing when no daemon
+# answers (status exits 4). Fails when status fails otherwise or names no pid.
 daemon() {
 	[ -x "$bin" ] || return 0
-	"$bin" -c "$config" status --json 2>/dev/null | sed -n \
+	rc=0
+	json=$("$bin" -c "$config" status --json 2>/dev/null) || rc=$?
+	case $rc in
+	0) ;;
+	4) return 0 ;;
+	*)
+		echo "deploy: piano status failed (exit $rc)" >&2
+		return 1
+		;;
+	esac
+	got=$(printf '%s\n' "$json" | sed -n \
 		-e 's/^  "pid": \([0-9][0-9]*\),$/\1/p' \
-		-e 's/^    "binary_sha256": "\([0-9a-f]*\)",\{0,1\}$/\1/p' | tr '\n' ' '
+		-e 's/^    "binary_sha256": "\([0-9a-f]*\)",\{0,1\}$/\1/p' | tr '\n' ' ')
+	if [ -z "$(field "$got" 1)" ]; then
+		echo "deploy: no pid in piano status --json" >&2
+		return 1
+	fi
+	echo "$got"
 }
 field() { echo "$1" | cut -d' ' -f"$2"; }
 # install.sh keeps the binary it replaces as piano.prev. Its closing advice is what
@@ -95,7 +111,7 @@ esac
 old_sum=
 [ -f "$bin" ] && old_sum=$(sum "$bin")
 new_sum=$(sum "$new")
-before=$(daemon)
+before=$(daemon) || die "cannot tell whether a daemon runs; nothing changed"
 pid=$(field "$before" 1)
 
 # Puts the binary that was on disk before back.
@@ -129,17 +145,20 @@ if [ "$(field "$before" 2)" = "$new_sum" ]; then
 fi
 if ! "$bin" -c "$config" upgrade; then
 	restore
-	after=$(daemon)
+	after=$(daemon) || true
 	die "upgrade failed; pid $(field "$after" 1) serves $(short "$(field "$after" 2)")"
 fi
-after=$(daemon)
+after=$(daemon) || true
 now=$(field "$after" 1)
 reported=$(field "$after" 2)
 # A binary older than the report (a rollback) is taken on its new pid alone.
 if [ -z "$now" ] || [ "$now" = "$pid" ] || { [ -n "$reported" ] && [ "$reported" != "$new_sum" ]; }; then
 	restore
-	"$bin" -c "$config" upgrade >/dev/null || true
-	die "after the upgrade pid ${now:-?} does not report the deployed binary; went back"
+	if "$bin" -c "$config" upgrade >/dev/null; then
+		die "after the upgrade pid ${now:-?} does not report the deployed binary; went back"
+	fi
+	back=$(daemon) || true
+	die "after the upgrade pid ${now:-?} does not report the deployed binary, and switching back failed: pid $(field "$back" 1) serves $(short "$(field "$back" 2)"); run piano upgrade by hand"
 fi
 [ -n "$reported" ] || echo "deploy: this binary does not report its checksum; going by its new pid"
 echo "deploy: pid $pid -> $now, $version"
