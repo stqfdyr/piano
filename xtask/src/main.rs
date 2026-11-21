@@ -177,10 +177,10 @@ fn dist() -> Result<PathBuf> {
     // RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS take precedence over the per-target flags
     // below, which would then be dropped without a word: the CPU level among them.
     for var in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"] {
-        if std::env::var_os(var).is_some() {
+        if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
             eprintln!("    warning: {var} is set; dist ignores it");
-            build.env_remove(var);
         }
+        build.env_remove(var);
     }
     build
         .args([
@@ -205,6 +205,8 @@ fn dist() -> Result<PathBuf> {
         return Err(format!("{} is dynamically linked", built.display()));
     }
 
+    // xtask and piano both take the workspace version, which release.yml checks the tag
+    // against.
     let version = env!("CARGO_PKG_VERSION");
     let out_dir = target_dir.join("dist");
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
