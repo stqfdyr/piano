@@ -660,13 +660,14 @@ impl ProxyHttp for Relay {
             );
             return Ok(());
         }
-        if upstream_response.status != 200 || session.req_header().method == Method::HEAD {
+        if upstream_response.status != 200 {
             return Ok(());
         }
         if rewrite.probe && !is_json(upstream_response) {
             return Ok(());
         }
-        rewrite.collecting = true;
+        // HEAD describes what GET would send: no body to collect, the same headers.
+        rewrite.collecting = session.req_header().method != Method::HEAD;
         upstream_response.remove_header(&CONTENT_LENGTH);
         upstream_response.insert_header(TRANSFER_ENCODING, "chunked")?;
         weaken_etag(upstream_response)

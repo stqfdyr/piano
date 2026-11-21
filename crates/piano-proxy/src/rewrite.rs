@@ -286,6 +286,26 @@ mod tests {
     }
 
     #[test]
+    fn replaces_adjacent_names() {
+        assert_eq!(
+            rw(r#""emby.example.net""emby.example.net"https://emby.example.net"#),
+            r#""media.example.com""media.example.com"https://media.example.com:8443"#
+        );
+    }
+
+    #[test]
+    fn skips_anchors_inside_a_replaced_authority() {
+        // Only a name ending in "http" can hold the start of an "http://" anchor; no name
+        // under a reserved example domain does, so this is a single-label one.
+        let r = Rewriter::new(vec!["emby-http".into()], Vec::new()).unwrap();
+        let (out, n) = r
+            .rewrite(b"https://emby-http://emby-http/x", HOST, PUBLIC)
+            .unwrap();
+        assert_eq!(out, b"https://media.example.com:8443://emby-http/x");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
     fn keeps_the_bytes_around_replacements() {
         let body = "\u{4e2d}\"emby.example.net\"\u{6587}\n\t//emby.example.net";
         assert_eq!(

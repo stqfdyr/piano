@@ -213,7 +213,24 @@ impl Origin {
                     conn_counter[usize::from(is_h2)].fetch_add(1, Ordering::Relaxed);
                     let service = service_fn(move |req| {
                         counter.fetch_add(1, Ordering::Relaxed);
-                        handle(req, state.clone())
+                        let head = req.method() == hyper::Method::HEAD;
+                        let response = handle(req, state.clone());
+                        async move {
+                            let mut response = response.await?;
+                            // HTTP/1 drops the body of a HEAD response, but HTTP/2 sends
+                            // whatever it is given, which the client treats as a
+                            // protocol error.
+                            if head {
+                                if let Some(n) = response.body().size_hint().exact()
+                                    && !response.headers().contains_key(CONTENT_LENGTH)
+                                    && !matches!(response.status().as_u16(), 100..=199 | 204 | 304)
+                                {
+                                    response.headers_mut().insert(CONTENT_LENGTH, n.into());
+                                }
+                                *response.body_mut() = full(Bytes::new());
+                            }
+                            Ok::<_, Infallible>(response)
+                        }
                     });
                     let builder = auto::Builder::new(TokioExecutor::new());
                     let _ = builder
