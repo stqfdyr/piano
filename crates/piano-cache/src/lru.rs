@@ -3,8 +3,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-/// What an entry costs besides its key text and its value: the key in both tables, the
-/// use counter in both, and the shared key's reference counts.
+/// What an entry is counted beyond its key text and its value: the key in both tables,
+/// the use counter in both, and the shared key's reference counts. Hash-table slack,
+/// B-tree nodes and allocator rounding come on top, so for small entries the bound holds
+/// to within about a factor of two.
 pub const ENTRY: usize = 2 * size_of::<Arc<str>>() + 2 * size_of::<u64>() + 2 * size_of::<usize>();
 
 /// The bytes a value holds, for the store's bound. The store adds the key's.

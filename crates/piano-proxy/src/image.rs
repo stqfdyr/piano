@@ -226,7 +226,7 @@ enum Look {
 }
 
 impl Images {
-    /// `capacity` is the memory for image bodies in bytes.
+    /// `capacity` is the memory for stored images in bytes: bodies, headers and keys.
     pub fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(State {

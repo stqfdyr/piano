@@ -521,7 +521,7 @@ impl ShutdownSignalWatch for Signals {
     }
 }
 
-/// Bytes of image bodies the configuration allows.
+/// Bytes for stored images (bodies, headers and keys) the configuration allows.
 fn image_memory(config: &Config) -> usize {
     usize::try_from(config.cache.image_memory_mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
 }

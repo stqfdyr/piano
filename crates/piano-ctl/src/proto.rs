@@ -284,7 +284,8 @@ pub struct ReloadReply {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheStats {
     pub schema: u32,
-    /// Image bodies held, their bytes and the memory allowed for them.
+    /// Images held, the bytes they weigh (bodies, headers and keys) and the memory
+    /// allowed for them.
     pub images: u64,
     pub bytes: u64,
     pub capacity: u64,
