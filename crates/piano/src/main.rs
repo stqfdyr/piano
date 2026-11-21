@@ -80,8 +80,8 @@ enum Command {
     /// until they end (server.drain_timeout at most). Also applies settings that need a
     /// restart.
     Upgrade {
-        /// The new binary; by default the file the daemon was started from, which may
-        /// have been replaced since.
+        /// The new binary; by default the file the daemon was started from (a symlink
+        /// resolved at startup), which may have been replaced since.
         #[arg(long)]
         binary: Option<PathBuf>,
     },
@@ -533,8 +533,8 @@ fn top(cli: &Cli, interval: f64) -> ExitCode {
     }
 }
 
-/// The binary as this process was started from: a file installed over it later is what
-/// an upgrade runs.
+/// The binary as `/proc/self/exe` names it (symlinks resolved): a file installed over it
+/// later is what an upgrade runs. Without `/proc`, `piano` as found on PATH.
 fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("piano"))
 }

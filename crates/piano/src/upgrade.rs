@@ -24,7 +24,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Notify, oneshot};
 
 /// Attempts, one second apart, to hand the listening sockets to the new process once it
-/// listens for them; the new process waits as many seconds for them. pingora's main loop
+/// listens for them; the new process waits one attempt longer for them. pingora's main loop
 /// handles no signal while it tries, so a new process that dies just then must not hold
 /// it up for long.
 pub const HANDOFF_ATTEMPTS: usize = 5;
@@ -47,8 +47,8 @@ const CHECK_INVALID: i32 = 2;
 /// How this process was started, to start its successor the same way.
 #[derive(Debug, Clone)]
 pub struct Relaunch {
-    /// The binary's path at startup, symlinks resolved, so a file installed over it is
-    /// what runs next.
+    /// The binary as `/proc/self/exe` named it at startup (symlinks resolved), so a file
+    /// installed over it is what runs next, a symlink pointed elsewhere is not.
     pub exe: PathBuf,
     pub config: PathBuf,
     pub log_level: Option<String>,
