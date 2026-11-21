@@ -26,6 +26,17 @@ pub enum RouteClass {
 }
 
 impl RouteClass {
+    pub const ALL: [Self; 8] = [
+        Self::Media,
+        Self::Subtitle,
+        Self::Image,
+        Self::PlaybackInfo,
+        Self::Info,
+        Self::Socket,
+        Self::Api,
+        Self::Local,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Media => "media",
@@ -242,6 +253,13 @@ mod tests {
         ] {
             assert_eq!(classify(path), class, "{path}");
         }
+    }
+
+    #[test]
+    fn every_class_has_its_own_name() {
+        let names: std::collections::HashSet<_> =
+            RouteClass::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(names.len(), RouteClass::ALL.len());
     }
 
     #[test]

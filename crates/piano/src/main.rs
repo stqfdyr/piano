@@ -731,6 +731,20 @@ fn log(cli: &Cli, command: &LogCommand) -> ExitCode {
         Some(f) => f.clone(),
         None => match piano_config::load(&cli.config) {
             Ok(c) => match c.log.access_path() {
+                // Another file may come from another configuration; only this one's
+                // site names are known.
+                Some(_)
+                    if let Some(s) = site
+                        && !c.sites.iter().any(|x| &x.name == s) =>
+                {
+                    let names: Vec<&str> = c.sites.iter().map(|x| x.name.as_str()).collect();
+                    eprintln!(
+                        "--site {s:?}: no such site in {} (sites: {})",
+                        cli.config.display(),
+                        names.join(", ")
+                    );
+                    return ExitCode::from(exit::CONFIG);
+                }
                 Some(p) => p.to_owned(),
                 None => {
                     eprintln!(
