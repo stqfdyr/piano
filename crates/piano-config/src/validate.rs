@@ -531,6 +531,8 @@ mod tests {
         assert!(shown.contains("[[site]]"), "{shown}");
         let again = parse(&shown).unwrap().effective_toml().unwrap();
         assert_eq!(shown, again);
+        // The command-line tool's own reading of [control] knows every section.
+        assert!(crate::parse_control(&shown).is_ok());
     }
 
     #[test]

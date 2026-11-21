@@ -58,17 +58,18 @@ pub fn load(path: &Path) -> Result<Config, Error> {
         path: display.clone(),
         source,
     })?;
-    parse(&text).map_err(|e| match e {
-        Error::Parse { source, .. } => Error::Parse {
-            path: display,
-            source,
-        },
-        Error::Invalid { errors, .. } => Error::Invalid {
-            path: display,
-            errors,
-        },
-        other => other,
-    })
+    parse(&text).map_err(|e| e.at(display))
+}
+
+impl Error {
+    /// The same error, naming the file it is about.
+    fn at(self, path: String) -> Self {
+        match self {
+            Error::Parse { source, .. } => Error::Parse { path, source },
+            Error::Invalid { errors, .. } => Error::Invalid { path, errors },
+            other => other,
+        }
+    }
 }
 
 /// The `[control]` section of the configuration file at `path`, read without the rest of
@@ -80,20 +81,43 @@ pub fn load_control(path: &Path) -> Result<Control, Error> {
         path: display.clone(),
         source,
     })?;
-    parse_control(&text).map_err(|source| Error::Parse {
-        path: display,
-        source: Box::new(source),
-    })
+    parse_control(&text).map_err(|e| e.at(display))
 }
 
-fn parse_control(text: &str) -> Result<Control, toml::de::Error> {
-    /// Other sections are not looked at; `[control]` itself is checked as in [`Config`].
+fn parse_control(text: &str) -> Result<Control, Error> {
+    use serde::de::IgnoredAny;
+    /// The sections of [`Config`]: the others are not looked at, but an unknown one is an
+    /// error, since a misspelled `[control]` would otherwise leave the default socket.
     #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[expect(dead_code, reason = "only checked to exist")]
     struct OnlyControl {
         #[serde(default)]
         control: Control,
+        version: Option<IgnoredAny>,
+        server: Option<IgnoredAny>,
+        tls: Option<IgnoredAny>,
+        access: Option<IgnoredAny>,
+        limits: Option<IgnoredAny>,
+        upstream: Option<IgnoredAny>,
+        log: Option<IgnoredAny>,
+        cache: Option<IgnoredAny>,
+        traffic: Option<IgnoredAny>,
+        site: Option<IgnoredAny>,
     }
-    toml::from_str::<OnlyControl>(text).map(|c| c.control)
+    let control = toml::from_str::<OnlyControl>(text)
+        .map_err(|source| Error::Parse {
+            path: String::new(),
+            source: Box::new(source),
+        })?
+        .control;
+    if control.socket_path().is_some_and(|p| !p.is_absolute()) {
+        return Err(Error::Invalid {
+            path: String::new(),
+            errors: vec![ValidationError::RelativeSocket(control.socket)],
+        });
+    }
+    Ok(control)
 }
 
 /// Parses and validates configuration text.
@@ -133,6 +157,11 @@ mod tests {
     fn no_socket_is_guessed_from_a_file_that_is_not_toml_or_not_there() {
         assert!(parse_control("[control]\nsocket = \n").is_err());
         assert!(parse_control("[control]\nsokcet = \"/x\"\n").is_err());
+        assert!(parse_control("[contol]\nsocket = \"/run/b/ctl.sock\"\n").is_err());
+        assert!(matches!(
+            parse_control("[control]\nsocket = \"ctl.sock\"\n"),
+            Err(Error::Invalid { .. })
+        ));
         let missing = load_control(Path::new("/nonexistent/piano.toml")).unwrap_err();
         assert!(matches!(missing, Error::Read { .. }));
     }
