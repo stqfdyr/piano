@@ -670,6 +670,14 @@ mod tests {
             "{MINIMAL}[[site.ua]]\nmatch = '(?-u)\\xff'\nset = \"x\"\n"
         ))
         .unwrap();
+
+        // Perl classes and case-insensitive matching are built in (regex features).
+        let c = parse(&format!(
+            "{MINIMAL}[[site.ua]]\nmatch = '(?i)^emby\\w*/\\d+\\s'\nset = \"x\"\n"
+        ))
+        .unwrap();
+        let re = c.sites[0].ua[0].regex().unwrap();
+        assert!(re.is_match(b"EmbyTheater/4 (x)"));
     }
 
     #[test]
