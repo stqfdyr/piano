@@ -47,7 +47,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde", "std"] }
 
 # JSON rewriting: one pass over a body finds every place an upstream address may start.
