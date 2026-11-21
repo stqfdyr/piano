@@ -724,7 +724,7 @@ impl Live {
         self.access_log.flush();
     }
 
-    /// Access log lines lost because the disk could not keep up.
+    /// Access log lines lost because the disk was too slow or writes failed.
     pub fn dropped_access_lines(&self) -> u64 {
         self.access_log.dropped()
     }

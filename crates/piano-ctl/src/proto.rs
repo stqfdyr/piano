@@ -147,7 +147,7 @@ pub struct Certificate {
 pub struct AccessLog {
     /// `None` when the access log is off.
     pub path: Option<String>,
-    /// Lines lost since start because the disk could not keep up.
+    /// Lines lost since start: the disk was too slow, or writes failed.
     pub dropped: u64,
 }
 

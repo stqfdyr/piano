@@ -854,6 +854,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_credential_cut_by_the_length_cap_is_still_removed() {
+        // The cap falls 8 bytes into the key's value.
+        let head = format!("/Items?pad={}&api_key=", "a".repeat(2020));
+        assert_eq!(head.len(), MAX_PATH - 8);
+        let target = format!("{head}{}", "s".repeat(64));
+        let req = RequestHeader::build("GET", target.as_bytes(), None).unwrap();
+        assert_eq!(logged_path(&req), format!("{head}REDACTED"));
+    }
+
+    #[test]
+    fn durations_log_as_whole_milliseconds() {
+        assert_eq!(millis(Duration::from_micros(1_500_900)), 1500);
+        assert_eq!(millis(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
     fn absolute_form_becomes_origin_form() {
         for (target, want) in [
             (

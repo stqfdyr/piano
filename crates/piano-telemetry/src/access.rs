@@ -1,7 +1,8 @@
 //! The access log file: one JSON line per request, written by a dedicated thread.
 //!
 //! Requests never wait for the disk. Lines go through a bounded queue; when the queue
-//! is full because the disk stalls, lines are dropped and counted. The writer collects
+//! is full because the disk stalls, lines are dropped and counted, as are lines a
+//! failing write (a full disk) loses. The writer collects
 //! what is queued in a 64 KiB buffer and writes it out as soon as the queue is empty, so
 //! a burst costs one write and a line is on disk moments after its request ended, also
 //! when the process exits. Rotation is left to the system (logrotate):
@@ -14,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// Lines held while the disk is slow: about 2 MiB at typical line sizes.
@@ -36,7 +37,8 @@ pub struct AccessLog {
     tx: SyncSender<Msg>,
     path: Mutex<Option<PathBuf>>,
     enabled: AtomicBool,
-    dropped: AtomicU64,
+    /// Shared with the writer thread, which counts the lines failed writes lose.
+    dropped: Arc<AtomicU64>,
 }
 
 impl AccessLog {
@@ -45,14 +47,16 @@ impl AccessLog {
     pub fn open(path: Option<&Path>) -> io::Result<Self> {
         let file = path.map(open_file).transpose()?;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let lost = Arc::clone(&dropped);
         std::thread::Builder::new()
             .name("piano-access-log".to_owned())
-            .spawn(move || run(rx, file))?;
+            .spawn(move || run(rx, file, &lost))?;
         Ok(Self {
             tx,
             enabled: AtomicBool::new(path.is_some()),
             path: Mutex::new(path.map(Path::to_owned)),
-            dropped: AtomicU64::new(0),
+            dropped,
         })
     }
 
@@ -71,7 +75,8 @@ impl AccessLog {
         }
     }
 
-    /// Lines dropped because the writer fell behind.
+    /// Lines lost: dropped because the writer fell behind, or not written because a
+    /// write failed.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -132,7 +137,8 @@ fn open_file(path: &Path) -> io::Result<File> {
 }
 
 /// The writer thread: ends when every handle is gone, after writing what is queued.
-fn run(rx: Receiver<Msg>, file: Option<File>) {
+/// Counts in `lost` the lines that failed writes lose.
+fn run(rx: Receiver<Msg>, file: Option<File>, lost: &AtomicU64) {
     let mut out = file.map(|f| BufWriter::with_capacity(BUFFER, f));
     let mut failing = false;
     while let Ok(first) = rx.recv() {
@@ -140,19 +146,25 @@ fn run(rx: Receiver<Msg>, file: Option<File>) {
         while let Some(msg) = next.take() {
             match msg {
                 Msg::Line(line) => {
-                    if let Some(w) = out.as_mut() {
-                        report(w.write_all(line.as_bytes()), &mut failing);
+                    // Fails when the buffer cannot be written out to make room (it keeps
+                    // its lines for the next try) or a line longer than the buffer cannot
+                    // be written directly; either way this line is gone.
+                    if let Some(w) = out.as_mut()
+                        && let Err(e) = w.write_all(line.as_bytes())
+                    {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                        failed(&e, &mut failing);
                     }
                 }
                 Msg::Switch(file) => {
-                    if let Some(mut w) = out.take() {
-                        report(w.flush(), &mut failing);
+                    if let Some(w) = out.take() {
+                        close(w, lost, &mut failing);
                     }
                     out = file.map(|f| BufWriter::with_capacity(BUFFER, f));
                 }
                 Msg::Flush(done) => {
                     if let Some(w) = out.as_mut() {
-                        report(w.flush(), &mut failing);
+                        flush(w, &mut failing);
                     }
                     let _ = done.send(());
                 }
@@ -160,23 +172,46 @@ fn run(rx: Receiver<Msg>, file: Option<File>) {
             next = rx.try_recv().ok();
         }
         if let Some(w) = out.as_mut() {
-            report(w.flush(), &mut failing);
+            flush(w, &mut failing);
         }
+    }
+    if let Some(w) = out.take() {
+        close(w, lost, &mut failing);
     }
 }
 
-/// Logs the first failure of a streak and the recovery after it.
-fn report(result: io::Result<()>, failing: &mut bool) {
-    match result {
-        Err(e) if !*failing => {
-            *failing = true;
-            warn!("access log write failed, lines are being lost: {e}");
-        }
+/// Writes out the buffer. Only a write that reached the file ends a streak of failures:
+/// lines that merely fit in the buffer say nothing about the disk.
+fn flush(w: &mut BufWriter<File>, failing: &mut bool) {
+    match w.flush() {
         Ok(()) if *failing => {
             *failing = false;
             info!("access log writes recovered");
         }
-        _ => {}
+        Ok(()) => {}
+        Err(e) => failed(&e, failing),
+    }
+}
+
+/// Logs the first failure of a streak.
+fn failed(e: &io::Error, failing: &mut bool) {
+    if !*failing {
+        *failing = true;
+        warn!("access log write failed: {e}");
+    }
+}
+
+/// Writes out and closes `w`; lines it still holds after a failed write are lost.
+fn close(mut w: BufWriter<File>, lost: &AtomicU64, failing: &mut bool) {
+    flush(&mut w, failing);
+    // into_parts hands back the unwritten bytes instead of trying again on drop.
+    if let (_, Ok(rest)) = w.into_parts() {
+        let lines = rest.iter().filter(|&&b| b == b'\n').count();
+        if lines > 0 {
+            // Also when the process exits, after the counter can no longer be read.
+            warn!("{lines} access log lines could not be written and are lost");
+            lost.fetch_add(lines as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -249,6 +284,31 @@ mod tests {
         log.flush();
         assert_eq!(read(&a), "1\n");
         assert!(AccessLog::open(Some(&d.0.join("missing/c.log"))).is_err());
+    }
+
+    #[test]
+    fn lines_failed_writes_lose_count_as_dropped() {
+        // Every write to /dev/full fails with ENOSPC.
+        let log = AccessLog::open(Some(Path::new("/dev/full"))).unwrap();
+        let line = format!("{}\n", "x".repeat(499));
+        for _ in 0..300 {
+            log.write(line.clone());
+            log.flush();
+        }
+        // The buffer holds what fits for a later try; the lines after it are lost.
+        let held = (BUFFER / line.len()) as u64;
+        // flush gives up after FLUSH_WAIT; a starved writer may count later.
+        let dropped = |n: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while log.dropped() != n && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            log.dropped()
+        };
+        assert_eq!(dropped(300 - held), 300 - held);
+        // Leaving the file gives up what the buffer holds.
+        log.set_path(None).unwrap();
+        assert_eq!(dropped(300), 300);
     }
 
     #[test]

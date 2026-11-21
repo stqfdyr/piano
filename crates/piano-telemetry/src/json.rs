@@ -135,8 +135,8 @@ mod tests {
     #[test]
     fn escapes_strings() {
         let mut s = String::new();
-        escape_into(&mut s, "q\"b\\n\nc\x01\x7fé");
-        assert_eq!(s, "\"q\\\"b\\\\n\\nc\\u0001\\u007fé\"");
+        escape_into(&mut s, "q\"b\\n\nc\x01\x7fé ~");
+        assert_eq!(s, "\"q\\\"b\\\\n\\nc\\u0001\\u007fé ~\"");
     }
 
     #[test]
