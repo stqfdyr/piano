@@ -78,7 +78,7 @@ pub fn since(later: &Buckets, earlier: &Buckets) -> Buckets {
 }
 
 /// The `q` quantile (0 to 1) of the values counted in `counts`: the value of rank
-/// ⌈q·n⌉, each of a bucket's values taken to sit at the middle of its share of the
+/// max(⌈q·n⌉, 1), each of a bucket's values taken to sit at the middle of its share of the
 /// bucket on a log scale (linearly in the first). A lone value thus reads as the
 /// geometric middle of its bucket rather than its upper bound, which a few samples per
 /// window would otherwise bias upwards by up to √2. `None` without values or when
@@ -92,7 +92,8 @@ pub fn quantile(counts: &[u64], q: f64) -> Option<Duration> {
     if total == 0 {
         return None;
     }
-    let rank = (q.clamp(0.0, 1.0) * total as f64).ceil().max(1.0) - 0.5;
+    // The tolerance keeps a q·n that rounding left just above a whole number on it.
+    let rank = (q.clamp(0.0, 1.0) * total as f64 - 1e-9).ceil().max(1.0) - 0.5;
     let mut below = 0u64;
     for (i, &n) in counts.iter().enumerate() {
         if n == 0 {
@@ -171,6 +172,15 @@ mod tests {
         let h = Histogram::default();
         h.record(Duration::from_micros(400));
         assert_eq!(quantile(&h.read(), 0.5), Some(Duration::from_micros(500)));
+    }
+
+    #[test]
+    fn a_whole_rank_is_not_rounded_up() {
+        // 0.07 × 100 is 7.000000000000001 in floating point; the 7th value is the answer.
+        let mut b = [0; BUCKETS];
+        b[0] = 7;
+        b[20] = 93;
+        assert!(quantile(&b, 0.07).unwrap() < Duration::from_millis(1));
     }
 
     #[test]
