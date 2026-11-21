@@ -406,11 +406,12 @@ where
                         .respond_error(400)
                         .await
                         .unwrap_or_else(|e| {
-                            error!("failed to send error response to downstream: {e}");
+                            debug!("failed to send error response to downstream: {e}");
                         });
                 } else {
-                    // otherwise the connection must be broken, no need to send anything
-                    error!(
+                    // otherwise the connection must be broken, no need to send anything;
+                    // clients break it at will, so this is not an error of the server
+                    debug!(
                         "Fail to proxy: {e}, downstream session type: {}",
                         downstream_session.session_type()
                     );
@@ -439,7 +440,7 @@ where
                 .respond_error(405)
                 .await
                 .unwrap_or_else(|e| {
-                    error!("failed to send error response to downstream: {e}");
+                    debug!("failed to send error response to downstream: {e}");
                 });
             downstream_session.shutdown().await;
             return None;
