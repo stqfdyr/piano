@@ -442,7 +442,7 @@ impl Engine {
                     // The response covered less than asked; another request continues.
                     return Ok(false);
                 }
-                finish(session).await?;
+                until_stop(&mut self.stop, finish(session)).await?;
                 Ok(true)
             }
             Msg::Failed(e) => {
@@ -487,10 +487,13 @@ impl Engine {
         }
         ctx.cf_ray = resp.headers.get("cf-ray").cloned();
         self.head_sent = true;
-        session
-            .write_response_header(resp, false)
-            .await
-            .map_err(|e| e.into_down())
+        until_stop(&mut self.stop, async {
+            session
+                .write_response_header(resp, false)
+                .await
+                .map_err(|e| e.into_down())
+        })
+        .await
     }
 
     /// Takes the head of a later request if it continues the body; drops the request
@@ -561,30 +564,42 @@ impl Engine {
         if let Some(s) = self.sources.pop() {
             s.detach();
         }
-        finish(session).await?;
+        until_stop(&mut self.stop, finish(session)).await?;
         Ok(true)
     }
 
     async fn write(&mut self, session: &mut Session, data: Bytes) -> Result<()> {
         let n = data.len() as u64;
         self.stream.set_writing(true);
-        // A client that stopped reading holds the write for up to the downstream write
-        // timeout; the stream still ends at once when the process terminates.
-        let written = tokio::select! {
-            w = session.write_response_body(Some(data), false) => Some(w),
-            _ = self.stop.wait_for(|t| *t) => None,
-        };
+        let written = until_stop(&mut self.stop, async {
+            session
+                .write_response_body(Some(data), false)
+                .await
+                .map_err(|e| e.into_down())
+        })
+        .await;
         self.stream.set_writing(false);
-        let Some(written) = written else {
-            return Error::e_explain(TERMINATED, "media stream ended at shutdown");
-        };
-        written.map_err(|e| e.into_down())?;
+        written?;
         self.pos += n;
         self.stream.add_sent(n);
         self.spec.counters.add_sent(Kind::Media, n);
         self.progress = Instant::now();
         self.unproductive = 0;
         Ok(())
+    }
+}
+
+/// Awaits a write to the client unless the process terminates first: a client that
+/// stopped reading holds a write for up to the downstream write timeout. A write that
+/// completes in the same poll as the signal still counts.
+async fn until_stop<T>(
+    stop: &mut watch::Receiver<bool>,
+    io: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        r = io => r,
+        _ = stop.wait_for(|t| *t) => Error::e_explain(TERMINATED, "media stream ended at shutdown"),
     }
 }
 

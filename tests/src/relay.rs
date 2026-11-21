@@ -154,7 +154,7 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
 
         [upstream]
         connect_timeout = "2s"
-        read_timeout = "{read_timeout}s"
+        read_timeout = "{read_timeout}ms"
         extra_roots = [{roots}]
 
         [log]
@@ -176,7 +176,7 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         allow = allow.join(", "),
         roots = roots.join(", "),
         limits = setup.limits,
-        read_timeout = setup.read_timeout.as_secs(),
+        read_timeout = setup.read_timeout.as_millis(),
     )
 }
 
