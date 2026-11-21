@@ -304,6 +304,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clipping_keeps_whole_characters() {
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(clip("abc", 2), "ab");
+        // "é" takes bytes 1 and 2.
+        assert_eq!(clip("aéb", 2), "a");
+        assert_eq!(clip("aéb", 3), "aé");
+        assert_eq!(clip("é", 1), "");
+    }
+
+    #[test]
     fn refusals_show_only_scheme_and_host() {
         for (location, shown) in [
             ("https://u:pw@cdn.example.net/f?md5=abc", "https://"),

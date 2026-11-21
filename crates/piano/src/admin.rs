@@ -552,10 +552,10 @@ fn findings(s: &Status, now: u64) -> Vec<Finding> {
             Level::Warn,
             "access_log_dropped",
             format!(
-                "{} access log lines lost since start; the disk did not keep up",
+                "{} access log lines lost since start; the disk was too slow or writes failed",
                 s.access_log.dropped
             ),
-            None,
+            Some("the diagnostic log says why writes failed"),
         ));
     }
     let hour = if s.recent_secs >= 3600 {

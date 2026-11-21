@@ -56,5 +56,14 @@ mod tests {
         assert_eq!(a.0 >> 32, b.0 >> 32);
         assert_eq!(a.to_string().len(), 16);
         assert_eq!(Id(0xab).to_string(), "00000000000000ab");
+        // The high half is the start time, which keeps ids apart across restarts.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!((a.0 >> 32).abs_diff(now & 0xffff_ffff) < 60);
+        let c = connection();
+        assert_ne!(c, connection());
+        assert_eq!(c.0 >> 32, a.0 >> 32);
     }
 }
