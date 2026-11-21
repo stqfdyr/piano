@@ -1,7 +1,7 @@
 //! The Emby websocket, relayed as an HTTP/1.1 upgrade.
 
 use piano_e2e::SITE_HOST;
-use piano_e2e::client::{Proto, connect};
+use piano_e2e::client::{Proto, connect, read_head};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
@@ -28,21 +28,6 @@ async fn world() -> World {
         _origin: origin,
         relay,
     }
-}
-
-/// Reads up to the end of the response header.
-async fn read_head(io: &mut (impl AsyncRead + Unpin)) -> String {
-    let mut buf = Vec::new();
-    while !buf.ends_with(b"\r\n\r\n") {
-        let mut b = [0u8; 1];
-        assert_eq!(
-            io.read(&mut b).await.unwrap(),
-            1,
-            "closed inside the header"
-        );
-        buf.push(b[0]);
-    }
-    String::from_utf8(buf).unwrap()
 }
 
 async fn echo(io: &mut (impl AsyncRead + AsyncWrite + Unpin), msg: &[u8]) {

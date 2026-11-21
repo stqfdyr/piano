@@ -1,7 +1,7 @@
 //! SIGTERM: requests in progress finish, media streams and websockets end at once, and
 //! the relay exits as soon as no client connection is left.
 
-use piano_e2e::client::{Proto, client, connect};
+use piano_e2e::client::{Proto, client, connect, read_head};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup, SHUTDOWN_TIMEOUT_SECS};
@@ -177,17 +177,8 @@ async fn a_websocket_ends_at_once() {
     );
     io.write_all(req.as_bytes()).await.unwrap();
     io.flush().await.unwrap();
-    let mut head = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !head.ends_with(b"\r\n\r\n") {
-            let mut b = [0u8; 1];
-            assert_eq!(io.read(&mut b).await.unwrap(), 1, "closed inside the head");
-            head.push(b[0]);
-        }
-    })
-    .await
-    .expect("no upgrade response");
-    assert!(head.starts_with(b"HTTP/1.1 101"));
+    let head = read_head(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
     let World {
         ca: _ca,
         _origin,

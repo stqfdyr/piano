@@ -1,7 +1,6 @@
 //! Bounds on client connections, mounted upstream hosts and certificate renewal.
 
-use crate::read_response;
-use piano_e2e::client::{Proto, client, connect};
+use piano_e2e::client::{Proto, client, connect, read_response};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
