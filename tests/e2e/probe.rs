@@ -76,6 +76,7 @@ async fn walks_the_site_through_the_relay() {
         note("public")
     );
     assert_eq!(note("views"), "2 libraries");
+    assert_eq!(origin.logouts(), 1);
     assert_eq!(note("playback"), "direct stream: relative");
     assert_eq!(note("media"), &format!("of {PROBE_MEDIA_LEN} bytes"));
     let media = r.steps.iter().find(|s| s.name == "media").unwrap();
@@ -101,7 +102,10 @@ async fn a_refused_login_stops_after_the_public_step() {
         origin.addr.port(),
     ));
     // Wrong credentials are not tried again with the next User-Agent.
-    let r = probe(&relay, &args(Some("wrong"), false, &["A/1", "B/1"])).await;
+    // The site by its name, as well as by its host.
+    let mut by_name = args(Some("wrong"), false, &["A/1", "B/1"]);
+    by_name.site = relay.config().sites[0].name.clone();
+    let r = probe(&relay, &by_name).await;
     assert!(!r.ok());
     assert_eq!(names(&r), ["login", "public", "public"]);
     assert_eq!(r.steps[0].status, Some(401));
@@ -181,6 +185,7 @@ async fn direct_goes_where_the_upstream_sends_a_client() {
     let r = probe(&relay, &args(Some(PROBE_PASSWORD), false, &[&ua])).await;
     let failed: Vec<_> = r.steps.iter().filter(|s| !s.ok).map(|s| s.name).collect();
     assert_eq!(failed, ["playback"], "{r:#?}");
+    assert_eq!(r.steps.last().unwrap().note, "no stream to read");
 }
 
 #[tokio::test]

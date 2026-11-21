@@ -471,18 +471,12 @@ impl Probe<'_> {
             return Ok((None, stream_path(url)));
         }
         let s = StreamUrl::parse(url)?;
-        let own = s.host.eq_ignore_ascii_case(&self.target.name);
-        // Through the relay the playback step has refused other hosts already, and the
-        // site is reached on the relay's address whatever port the URL names.
-        if !self.direct || (own && s.tls && s.port == self.target.addr.port()) {
+        if !self.direct || s.is_at(self.target) {
             return Ok((None, s.path));
         }
-        let ip = if own {
+        let ip = if s.host.eq_ignore_ascii_case(&self.target.name) {
             self.target.addr.ip()
-        } else if let Ok(ip) = s.host.parse::<IpAddr>() {
-            if !is_public(ip) {
-                return Err(format!("stream on a non-public address {ip}"));
-            }
+        } else if let Some(ip) = s.address()? {
             ip
         } else {
             self.resolver
@@ -908,6 +902,22 @@ impl<'u> StreamUrl<'u> {
             path,
         })
     }
+
+    /// Whether the URL is on `target` itself: same host, port and https. Through the
+    /// relay only this matters for the path, as the playback step has refused other
+    /// hosts and the site is reached on the relay's address.
+    fn is_at(&self, target: &Target) -> bool {
+        self.tls && self.port == target.addr.port() && self.host.eq_ignore_ascii_case(&target.name)
+    }
+
+    /// The host as an address when it is one; a client could not reach a non-public one.
+    fn address(&self) -> Result<Option<IpAddr>, String> {
+        match self.host.parse::<IpAddr>() {
+            Ok(ip) if !is_public(ip) => Err(format!("stream on a non-public address {ip}")),
+            Ok(ip) => Ok(Some(ip)),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 /// The answer as JSON, or why it is not.
@@ -1141,6 +1151,10 @@ mod tests {
             p("//[2001:db8::1]:8920/v"),
             Ok((true, "2001:db8::1".into(), 8920, "/v".into()))
         );
+        assert_eq!(
+            p("//[2001:db8::1]/v"),
+            Ok((true, "2001:db8::1".into(), 443, "/v".into()))
+        );
         assert!(p("ftp://cdn.example.net/v").is_err());
         assert!(p("https://cdn.example.net:0/v").is_err());
         assert!(p("https:///v").is_err());
@@ -1151,6 +1165,68 @@ mod tests {
         assert_eq!(
             Target::new("192.0.2.5:80".parse().unwrap(), "cdn.example.net", false).authority,
             "cdn.example.net"
+        );
+    }
+
+    #[test]
+    fn where_a_direct_probe_reads_a_stream() {
+        let upstream = Target::new("203.0.113.7:443".parse().unwrap(), "emby.example.net", true);
+        let at = |u: &str| StreamUrl::parse(u).unwrap().is_at(&upstream);
+        assert!(at("https://EMBY.example.net/v"));
+        assert!(!at("https://emby.example.net:8920/v"));
+        assert!(!at("http://emby.example.net:443/v"));
+        assert!(!at("https://vod.example.net/v"));
+        let address = |u: &str| StreamUrl::parse(u).unwrap().address();
+        assert_eq!(address("https://vod.example.net/v"), Ok(None));
+        assert_eq!(
+            address("http://203.0.113.9:8096/v"),
+            Err("stream on a non-public address 203.0.113.9".into())
+        );
+        assert_eq!(
+            address("http://1.1.1.1:8096/v"),
+            Ok(Some("1.1.1.1".parse().unwrap()))
+        );
+        assert!(address("http://[::1]/v").is_err());
+    }
+
+    #[test]
+    fn names_a_relayed_answer_must_not_contain() {
+        let config = piano_config::parse(
+            r#"[tls]
+cert = "/etc/piano/fullchain.pem"
+key = "/etc/piano/privkey.pem"
+
+[access]
+allow = ["192.0.2.7"]
+
+[[site]]
+host = "media.example.com"
+upstream = "https://Origin.example.net"
+aliases = ["alias.example.net"]
+mounts = { "/__v" = "vod.example.net" }
+"#,
+        );
+        let Ok(config) = config else {
+            panic!("{config:?}")
+        };
+        let client = Client {
+            connector: Connector::new(None),
+        };
+        let target = Target::new("127.0.0.1:443".parse().unwrap(), "media.example.com", true);
+        let resolver = Resolver::system();
+        let probe = Probe {
+            client: &client,
+            target: &target,
+            resolver: &resolver,
+            site: &config.sites[0],
+            direct: false,
+            own_agent: true,
+            session: None,
+            steps: Vec::new(),
+        };
+        assert_eq!(
+            probe.upstream_names(),
+            ["origin.example.net", "alias.example.net", "vod.example.net"]
         );
     }
 
