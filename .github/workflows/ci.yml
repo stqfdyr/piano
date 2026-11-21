@@ -4,26 +4,58 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # New RustSec advisories make cargo deny fail without any change here.
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pull request runs are dropped; every commit on main keeps its result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # No debug info: on this workspace a cold test build takes 72 s instead of 112 s and
+  # the target directory (the cache) 1.0 GB instead of 2.5 GB. Panic messages still
+  # name the file and line.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   ci:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The toolchain, components and musl target come from rust-toolchain.toml.
-      - run: rustup show active-toolchain || rustup toolchain install
+      # Installs what rust-toolchain.toml names.
+      - run: rustup toolchain install
       - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-deny@0.21.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Pull requests read main's cache and never write their own, so they cannot
+          # evict it or hand anything to main.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask ci
+
+  # Releases are static musl builds, which the job above never makes; a dependency
+  # update or a libc call can break them without failing anything else.
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --package piano --target x86_64-unknown-linux-musl

@@ -8,26 +8,46 @@ permissions:
   contents: read
 
 jobs:
-  # Builds with read-only permissions: dependency build scripts and tests never see a
-  # token that can publish or sign.
+  # Builds with read-only permissions: dependency build scripts never see a token that
+  # can publish or sign. No cache: a release is built from scratch.
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    permissions:
+      contents: read
+      checks: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
-        with:
-          tool: cargo-deny@0.21.0
+      - run: rustup toolchain install
       - name: Check the tag against the workspace version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "piano") | .version')
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, workspace $version"; exit 1; }
-      # A release is only cut from a tree that passes the same checks as a pull request.
-      - run: cargo xtask ci
+      # A release is cut only from a commit on main that passed ci there; the checks are
+      # not run again. A tag pushed right after a merge waits for that run.
+      - name: Check the tag is on main and passed ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" -q .status)
+          case $status in
+          identical | behind) ;;
+          *) echo "$GITHUB_SHA is not on main ($status)"; exit 1 ;;
+          esac
+          for _ in $(seq 60); do
+            conclusions=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=ci" \
+              -q '[.check_runs[] | .conclusion // "pending"] | join(" ")')
+            case " $conclusions " in
+            *" success "*) exit 0 ;;
+            *" pending "*) sleep 30 ;;
+            *) echo "ci on $GITHUB_SHA: ${conclusions:-not run}"; exit 1 ;;
+            esac
+          done
+          echo "ci on $GITHUB_SHA did not finish in 30 minutes"
+          exit 1
       - run: cargo xtask dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
