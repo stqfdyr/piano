@@ -187,6 +187,24 @@ async fn compressed_upstream_bodies_pass_unchanged() {
 }
 
 #[tokio::test]
+async fn head_requests_carry_the_upstream_headers_unchanged() {
+    let w = world("").await;
+    let length = json_doc(&w.origin_host(), 0).len().to_string();
+    for proto in [Proto::H1, Proto::H2] {
+        for path in [PLAYBACK_INFO, "/__json"] {
+            let r = w.send(proto, "HEAD", path, Some("gzip")).await;
+            assert_eq!(r.status, 200, "{proto:?} {path}");
+            assert!(r.body.is_empty(), "{proto:?} {path}");
+            assert_eq!(r.header("content-length"), length, "{proto:?} {path}");
+            assert_eq!(r.header("content-encoding"), "", "{proto:?} {path}");
+            assert_eq!(r.header("etag"), "\"v1\"", "{proto:?} {path}");
+        }
+    }
+    let lines = w.relay.access_lines(ACCESS_LOG, 4);
+    assert!(lines.iter().all(|l| l["end"] == "ok"), "{lines:?}");
+}
+
+#[tokio::test]
 async fn server_domains_follow_the_site_setting() {
     let path = "/emby/System/Ext/ServerDomains";
     let w = world("").await;
