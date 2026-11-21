@@ -50,7 +50,10 @@ impl Default for Server {
         Self {
             listen: vec!["[::]:443".to_owned()],
             threads: 0,
+            // Covers the 99.9th percentile of API requests at both relays (about 9 s);
+            // longer ones are image transfers a client retries.
             shutdown_timeout: Duration::from_secs(10),
+            // Media requests at both relays lasted at most 66 minutes.
             drain_timeout: Duration::from_secs(2 * 3600),
         }
     }
@@ -142,7 +145,11 @@ impl Default for Upstream {
             // of cases; slower ones are mostly lost SYNs, which a fresh attempt to the
             // next address beats.
             connect_timeout: Duration::from_secs(3),
+            // Cold media files at an upstream were seen to send nothing for up to 50 s
+            // and then stream normally; the media engine hedges long before this.
             read_timeout: Duration::from_secs(60),
+            // Three quarters of the 400 s after which Cloudflare closes idle
+            // connections, so the relay never sends on one being closed.
             idle_timeout: Duration::from_secs(300),
             h2: true,
             extra_roots: Vec::new(),
@@ -271,18 +278,6 @@ pub enum LogLevel {
     Trace,
 }
 
-impl LogLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
-        }
-    }
-}
-
 /// One public host relayed to one upstream Emby server.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -352,6 +347,14 @@ pub struct UaRule {
     #[serde(rename = "match")]
     pub pattern: String,
     pub set: String,
+}
+
+impl UaRule {
+    /// The compiled pattern. Header values are bytes, so it matches bytes; validation and
+    /// the relay both compile through here.
+    pub fn regex(&self) -> Result<regex::bytes::Regex, regex::Error> {
+        regex::bytes::Regex::new(&self.pattern)
+    }
 }
 
 impl Config {

@@ -1,11 +1,18 @@
 use crate::{Config, UpstreamLimit};
 use std::collections::HashSet;
+use std::net::SocketAddr;
 
 /// One problem found while validating a configuration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationError {
     #[error("server.listen is empty")]
     NoListen,
+    #[error("server.listen entry {0:?} must be an IP address and port, such as \"[::]:443\"")]
+    BadListen(String),
+    #[error("server.listen has {0} more than once")]
+    DuplicateListen(String),
+    #[error("version {0} is not supported; this piano reads version 1")]
+    BadVersion(u32),
     #[error("no [[site]] configured")]
     NoSites,
     #[error(
@@ -17,8 +24,13 @@ pub enum ValidationError {
     BadHost { site: String, host: String },
     #[error("host {0:?} is used by more than one site")]
     DuplicateHost(String),
-    #[error("site name {0:?} is used by more than one site")]
+    #[error(
+        "site name {0:?} is used by more than one site; give the sites distinct names \
+         (a name left out is the first label of the host)"
+    )]
     DuplicateName(String),
+    #[error("site name {0:?} must be 1 to 64 ASCII letters, digits, '.', '_' or '-'")]
+    BadName(String),
     #[error("site {site:?}: alias {host:?} is not a valid lowercase DNS name")]
     BadAlias { site: String, host: String },
     #[error(
@@ -48,7 +60,7 @@ pub enum ValidationError {
         prefix: String,
         host: String,
     },
-    #[error("limits.{name} {reason}")]
+    #[error("{name} {reason}")]
     BadLimit {
         name: &'static str,
         reason: &'static str,
@@ -69,6 +81,15 @@ pub enum ValidationError {
         site: String,
         other: String,
         upstream: String,
+    },
+    #[error(
+        "site {site:?}: upstream {host:?} is the public host of site {other:?}; requests \
+         would come back to the relay"
+    )]
+    UpstreamIsSite {
+        site: String,
+        host: String,
+        other: String,
     },
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
@@ -161,6 +182,14 @@ pub fn is_dns_name(s: &str) -> bool {
             .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// ASCII letters, digits, `.`, `_` and `-`: site names go into `key=value` log
+/// records, command arguments and the traffic record.
+fn is_site_name(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Whether follow entry `pattern` (a name or `*.<domain>`) matches lowercase `host`.
 /// The wildcard stands for exactly one label.
 pub fn host_matches(pattern: &str, host: &str) -> bool {
@@ -182,8 +211,23 @@ fn same_limit(a: Option<UpstreamLimit>, b: Option<UpstreamLimit>) -> bool {
 
 pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
+    if let Some(version) = config.version
+        && version != 1
+    {
+        errors.push(ValidationError::BadVersion(version));
+    }
     if config.server.listen.is_empty() {
         errors.push(ValidationError::NoListen);
+    }
+    let mut listen = HashSet::new();
+    for entry in &config.server.listen {
+        match entry.parse::<SocketAddr>() {
+            Ok(addr) if !listen.insert(addr) => {
+                errors.push(ValidationError::DuplicateListen(entry.clone()));
+            }
+            Ok(_) => {}
+            Err(_) => errors.push(ValidationError::BadListen(entry.clone())),
+        }
     }
     if config.log.access_path().is_some_and(|p| !p.is_absolute()) {
         errors.push(ValidationError::RelativeAccessLog(
@@ -210,10 +254,14 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     if config.access.allow.is_empty() {
         errors.push(ValidationError::NoAccess);
     }
-    let limits = &config.limits;
+    let (limits, upstream) = (&config.limits, &config.upstream);
+    // Zero is an immediate timeout, not the absence of one.
     for (name, d) in [
-        ("handshake_timeout", limits.handshake_timeout),
-        ("keepalive_timeout", limits.keepalive_timeout),
+        ("limits.handshake_timeout", limits.handshake_timeout),
+        ("limits.keepalive_timeout", limits.keepalive_timeout),
+        ("upstream.connect_timeout", upstream.connect_timeout),
+        ("upstream.read_timeout", upstream.read_timeout),
+        ("upstream.idle_timeout", upstream.idle_timeout),
     ] {
         if d.get() < std::time::Duration::from_secs(1) {
             errors.push(ValidationError::BadLimit {
@@ -224,9 +272,14 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     }
     if limits.max_connections == 0 {
         errors.push(ValidationError::BadLimit {
-            name: "max_connections",
+            name: "limits.max_connections",
             reason: "must be at least 1",
         });
+    }
+    for site in &mut config.sites {
+        if site.name.is_empty() {
+            site.name = site.host.split('.').next().unwrap_or_default().to_owned();
+        }
     }
     let site_hosts: Vec<(String, String)> = config
         .sites
@@ -236,8 +289,8 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     let mut hosts = HashSet::new();
     let mut names = HashSet::new();
     for site in &mut config.sites {
-        if site.name.is_empty() {
-            site.name = site.host.split('.').next().unwrap_or_default().to_owned();
+        if !is_site_name(&site.name) {
+            errors.push(ValidationError::BadName(site.name.clone()));
         }
         if !is_dns_name(&site.host) {
             errors.push(ValidationError::BadHost {
@@ -272,8 +325,7 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
             }
         }
         for (prefix, host) in &site.mounts {
-            let ok = prefix.len() > 1
-                && prefix.starts_with('/')
+            let ok = prefix.starts_with('/')
                 && !prefix.ends_with('/')
                 && !prefix.contains(['?', '#'])
                 && !prefix.contains("//");
@@ -332,7 +384,7 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
             }
         }
         for (index, rule) in site.ua.iter().enumerate() {
-            let reason = if let Err(e) = regex::Regex::new(&rule.pattern) {
+            let reason = if let Err(e) = rule.regex() {
                 Some(e.to_string())
             } else if rule.set.is_empty() || !rule.set.bytes().all(|b| (0x20..0x7f).contains(&b)) {
                 Some("set must be non-empty printable ASCII".to_owned())
@@ -348,7 +400,19 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
             }
         }
         match UpstreamUrl::parse(&site.upstream) {
-            Ok(origin) => site.upstream_url = Some(origin),
+            Ok(origin) => {
+                // Site hosts lead to the relay, whatever the port.
+                for (other_name, other_host) in &site_hosts {
+                    if origin.host == *other_host {
+                        errors.push(ValidationError::UpstreamIsSite {
+                            site: site.name.clone(),
+                            host: origin.host.clone(),
+                            other: other_name.clone(),
+                        });
+                    }
+                }
+                site.upstream_url = Some(origin);
+            }
             Err(reason) => errors.push(ValidationError::BadUpstream {
                 site: site.name.clone(),
                 url: site.upstream.clone(),
@@ -429,7 +493,10 @@ mod tests {
     #[test]
     fn effective_configuration_round_trips() {
         let text = format!(
-            "{MINIMAL}\n[[site.ua]]\nmatch = \"^$\"\nset = \"EmbyMini/1\"\n[site.mounts]\n\"/__v\" = \"v.example.net\""
+            "{MINIMAL}upstream_limit = {{ burst = 200, per_sec = 0.1 }}\nh2 = false\nserver_domains = \"pass\"\n\
+             block = [\"/a\\\"b\", \"/c\\\\d\", \"/é\"]\n\
+             [[site.ua]]\nmatch = '^$|(?i)\\(.*Pot\"Player/'\nset = \"Emby'Mini/1\"\n\
+             [site.mounts]\n\"/__v\" = \"v.example.net\"\n\"/__w\" = \"w.example.net\""
         );
         let shown = parse(&text).unwrap().effective_toml().unwrap();
         assert!(shown.contains("keepalive_timeout = \"10m\""), "{shown}");
@@ -567,6 +634,12 @@ mod tests {
         );
         let errs = errors(&text);
         assert_eq!(errs.len(), 2, "{errs:?}");
+
+        // Patterns match header bytes, which need not be UTF-8.
+        parse(&format!(
+            "{MINIMAL}[[site.ua]]\nmatch = '(?-u)\\xff'\nset = \"x\"\n"
+        ))
+        .unwrap();
     }
 
     #[test]
@@ -585,6 +658,160 @@ max_connections = 0
         );
         let errs = errors(&text);
         assert_eq!(errs.len(), 3, "{errs:?}");
+        let at_least = format!(
+            "{MINIMAL}[limits]\nhandshake_timeout = \"1s\"\nkeepalive_timeout = \"1s\"\nmax_connections = 1\n"
+        );
+        parse(&at_least).unwrap();
+    }
+
+    #[test]
+    fn upstream_timeouts_are_at_least_a_second() {
+        let text = format!(
+            "{MINIMAL}[upstream]\nconnect_timeout = \"0s\"\nread_timeout = \"999ms\"\nidle_timeout = \"0ms\"\n"
+        );
+        let names: Vec<&str> = errors(&text)
+            .iter()
+            .map(|e| match e {
+                ValidationError::BadLimit { name, .. } => *name,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "upstream.connect_timeout",
+                "upstream.read_timeout",
+                "upstream.idle_timeout"
+            ]
+        );
+        parse(&format!(
+            "{MINIMAL}[upstream]\nconnect_timeout = \"1s\"\nread_timeout = \"1s\"\nidle_timeout = \"1s\"\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn listen_entries_are_distinct_addresses() {
+        let c = parse(&format!(
+            "{MINIMAL}[server]\nlisten = [\"0.0.0.0:443\", \"[::]:8443\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(c.server.listen.len(), 2);
+        let text = format!(
+            "{MINIMAL}[server]\nlisten = [\"443\", \"localhost:443\", \"[::]:443\", \"[0::]:443\"]\n"
+        );
+        assert_eq!(
+            errors(&text),
+            [
+                ValidationError::BadListen("443".into()),
+                ValidationError::BadListen("localhost:443".into()),
+                ValidationError::DuplicateListen("[0::]:443".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_version_one_is_read() {
+        parse(&format!("version = 1\n{MINIMAL}")).unwrap();
+        assert_eq!(
+            errors(&format!("version = 2\n{MINIMAL}")),
+            [ValidationError::BadVersion(2)]
+        );
+    }
+
+    #[test]
+    fn site_names() {
+        let named = |name: &str| format!("{MINIMAL}name = \"{name}\"\n");
+        parse(&named("uhd-2.main_a")).unwrap();
+        parse(&named(&"a".repeat(64))).unwrap();
+        for bad in ["a b", "a=b", "é", &"a".repeat(65)] {
+            assert_eq!(
+                errors(&named(bad)),
+                [ValidationError::BadName(bad.into())],
+                "{bad}"
+            );
+        }
+        // Names left out are the first label of the host, before any check uses them.
+        let text = format!(
+            "{MINIMAL}\n[[site]]\nhost = \"media.example.org\"\nupstream = \"https://up.example.net\"\n\
+             [[site]]\nhost = \"tv.example.org\"\nupstream = \"https://up.example.net\"\nfollow = [\"*.example.com\"]\n"
+        );
+        let errs = errors(&text);
+        assert_eq!(
+            errs,
+            [
+                ValidationError::DuplicateName("media".into()),
+                ValidationError::FollowCoversSite {
+                    site: "tv".into(),
+                    entry: "*.example.com".into(),
+                    other: "media".into(),
+                },
+            ]
+        );
+        assert!(
+            errs[0].to_string().contains("distinct names"),
+            "{}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn upstream_must_not_be_a_site() {
+        let text = format!(
+            "{MINIMAL}\n[[site]]\nhost = \"tv.example.com\"\nupstream = \"https://media.example.com:8920\"\n"
+        );
+        assert_eq!(
+            errors(&text),
+            [ValidationError::UpstreamIsSite {
+                site: "tv".into(),
+                host: "media.example.com".into(),
+                other: "media".into(),
+            }]
+        );
+        let own = MINIMAL.replace("https://emby.example.net", "https://media.example.com");
+        assert!(matches!(
+            errors(&own)[..],
+            [ValidationError::UpstreamIsSite { .. }]
+        ));
+    }
+
+    #[test]
+    fn dns_name_lengths() {
+        let label = "a".repeat(63);
+        let name = |n: usize| format!("{label}.{label}.{label}.{}", "b".repeat(n));
+        assert_eq!(name(61).len(), 253);
+        assert!(is_dns_name(&name(61)));
+        assert!(!is_dns_name(&name(62)));
+        assert!(!is_dns_name(""));
+        assert!(!is_dns_name(&format!("{}.com", "a".repeat(64))));
+    }
+
+    #[test]
+    fn block_entries() {
+        let with = |path: &str| format!("{MINIMAL}block = [\"{path}\"]\n");
+        parse(&with("/emby/api/danmu/")).unwrap();
+        for bad in ["emby/api", "/a?b", "/a#b"] {
+            assert_eq!(
+                errors(&with(bad)),
+                [ValidationError::BadBlock {
+                    site: "media".into(),
+                    path: bad.into()
+                }],
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_configurations_list_every_error() {
+        let text =
+            format!("{MINIMAL}[limits]\nmax_connections = 0\n[upstream]\nread_timeout = \"0s\"\n");
+        let shown = parse(&text).unwrap_err().to_string();
+        assert_eq!(
+            shown,
+            "invalid configuration in :\n  - upstream.read_timeout must be at least 1s\n  - \
+             limits.max_connections must be at least 1"
+        );
     }
 
     #[test]

@@ -259,7 +259,14 @@ impl Fixed {
 
 /// The diagnostic log threshold for a configured level.
 pub fn level_filter(level: piano_config::LogLevel) -> log::LevelFilter {
-    piano_telemetry::logger::parse_level(level.as_str()).unwrap_or(log::LevelFilter::Info)
+    use piano_config::LogLevel;
+    match level {
+        LogLevel::Error => log::LevelFilter::Error,
+        LogLevel::Warn => log::LevelFilter::Warn,
+        LogLevel::Info => log::LevelFilter::Info,
+        LogLevel::Debug => log::LevelFilter::Debug,
+        LogLevel::Trace => log::LevelFilter::Trace,
+    }
 }
 
 /// Raises the soft limit on open files to the hard limit, and warns when even that
