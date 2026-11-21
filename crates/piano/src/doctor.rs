@@ -14,9 +14,11 @@ use pingora_core::protocols::ALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DOCTOR_SCHEMA: u32 = 1;
@@ -51,6 +53,13 @@ pub struct Report {
 }
 
 impl Report {
+    /// Whether the configuration did not load, which leaves no other check.
+    pub fn config_failed(&self) -> bool {
+        self.checks
+            .first()
+            .is_some_and(|c| c.group == "configuration" && c.level == Level::Error)
+    }
+
     /// The worst level found.
     pub fn worst(&self) -> Level {
         self.checks
@@ -70,9 +79,19 @@ pub struct Input<'a> {
     pub socket: Option<&'a Path>,
     /// The service user when no daemon runs.
     pub user: &'a str,
-    /// sha256 of the binary installed where this command was started from.
-    pub installed_sha256: Option<String>,
+    /// Binaries on disk to compare with the running one: the file at the daemon's path,
+    /// and this command's when it is another file.
+    pub installed: Vec<Installed>,
     pub resolver: Resolver,
+}
+
+/// A binary on disk.
+pub struct Installed {
+    pub path: PathBuf,
+    /// Its sha256, or why it cannot be read.
+    pub sha256: Result<String, String>,
+    /// `path` is where the daemon was started from, which `piano upgrade` runs again.
+    pub started_from: bool,
 }
 
 /// Runs every check; a configuration that does not load leaves only that check.
@@ -111,6 +130,7 @@ pub async fn run(input: &Input<'_>) -> Report {
     daemon(&mut out, &config, input);
     listening(&mut out, &config, input.status);
     upstreams(&mut out, &config, &input.resolver).await;
+    wildcards(&mut out, &config);
     out.report()
 }
 
@@ -139,22 +159,7 @@ fn certificate(out: &mut Checks, config: &Config) {
     match piano_edge::tls::SniTable::load(config) {
         Ok(table) => {
             let info = table.info();
-            let now = unix_now();
-            let (level, detail) = match info.not_after {
-                None => (Level::Warn, "expiry unreadable".to_owned()),
-                Some(t) if t <= now => (Level::Error, "expired".to_owned()),
-                Some(t) => {
-                    let days = (t - now).div_euclid(86_400);
-                    let level = if days < CERT_ERROR_DAYS {
-                        Level::Error
-                    } else if days < CERT_WARN_DAYS {
-                        Level::Warn
-                    } else {
-                        Level::Ok
-                    };
-                    (level, format!("covers every site, expires in {days} days"))
-                }
-            };
+            let (level, detail) = expiry(info.not_after, unix_now());
             out.push(
                 "configuration",
                 level,
@@ -184,6 +189,25 @@ fn certificate(out: &mut Checks, config: &Config) {
             "upstream.extra_roots".into(),
             e.to_string(),
         );
+    }
+}
+
+/// How soon a certificate expiring at `not_after` does, at `now` (both Unix seconds).
+fn expiry(not_after: Option<i64>, now: i64) -> (Level, String) {
+    match not_after {
+        None => (Level::Warn, "expiry unreadable".to_owned()),
+        Some(t) if t <= now => (Level::Error, "expired".to_owned()),
+        Some(t) => {
+            let days = (t - now).div_euclid(86_400);
+            let level = if days < CERT_ERROR_DAYS {
+                Level::Error
+            } else if days < CERT_WARN_DAYS {
+                Level::Warn
+            } else {
+                Level::Ok
+            };
+            (level, format!("covers every site, expires in {days} days"))
+        }
     }
 }
 
@@ -277,7 +301,13 @@ fn permits(who: &Who, mode: u32, owner: u32, group: u32, want: Want) -> bool {
 fn reach(who: &Who, path: &Path, want: Want) -> Result<(), String> {
     let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
     for target in [path, real.as_path()] {
-        for dir in target.ancestors().skip(1) {
+        // A relative path's last ancestor is empty; the real path covers the directories
+        // above it.
+        for dir in target
+            .ancestors()
+            .skip(1)
+            .filter(|d| !d.as_os_str().is_empty())
+        {
             let m = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             if !permits(who, m.mode(), m.uid(), m.gid(), Want::Enter) {
                 return Err(format!("cannot enter {}", dir.display()));
@@ -309,6 +339,7 @@ fn access(out: &mut Checks, config: &Config, input: &Input<'_>) {
         }
     };
     let group = "access";
+    let systemd = Path::new("/run/systemd/system").exists();
     let label = |p: &Path| format!("{} reads {}", who.name, p.display());
     for path in [input.config, &config.tls.cert, &config.tls.key] {
         match reach(&who, path, Want::Read) {
@@ -345,9 +376,61 @@ fn access(out: &mut Checks, config: &Config, input: &Input<'_>) {
             }
         });
         match result {
-            Ok(()) => out.push(group, Level::Ok, what, String::new()),
+            Ok(()) => {
+                let hint = sandbox_hint(dir).filter(|_| systemd).unwrap_or_default();
+                out.push(group, Level::Ok, what, hint.into());
+            }
             Err(e) => out.push(group, Level::Error, what, e),
         }
+    }
+}
+
+/// What the shipped service unit needs to let the daemon write in `dir`: nothing in its
+/// own directories or the private /tmp, `ReadWritePaths=` elsewhere under
+/// `ProtectSystem=strict`, and also `ProtectHome=no` under home directories.
+fn sandbox_hint(dir: &Path) -> Option<&'static str> {
+    let under = |dirs: &[&str]| dirs.iter().any(|d| dir.starts_with(d));
+    if under(&CREATED_AT_START) || under(&["/tmp", "/var/tmp"]) {
+        None
+    } else if under(&["/home", "/root", "/run/user"]) {
+        Some(
+            "under systemd the service unit must also set ProtectHome=no and list it in ReadWritePaths=",
+        )
+    } else {
+        Some("under systemd the service unit must also list it in ReadWritePaths=")
+    }
+}
+
+/// Compares the binaries on disk with the running one (`running`, its sha256).
+fn binaries(out: &mut Checks, installed: &[Installed], running: Option<&str>) {
+    let group = "daemon";
+    let Some(running) = running else {
+        if !installed.is_empty() {
+            out.push(
+                group,
+                Level::Skip,
+                "binary".into(),
+                "the running binary is too old to report its checksum".into(),
+            );
+        }
+        return;
+    };
+    for i in installed {
+        let path = i.path.display();
+        let detail = match (&i.sha256, i.started_from) {
+            (Ok(sha), _) if sha == running => continue,
+            (Ok(_), true) => format!(
+                "{path} is not the binary running; piano upgrade switches to it without \
+                 dropping streams"
+            ),
+            (Ok(_), false) => format!(
+                "{path}, which runs this command, is not the binary running; piano upgrade \
+                 {path} switches to it without dropping streams"
+            ),
+            (Err(e), true) => format!("{path}, which piano upgrade runs, cannot be read: {e}"),
+            (Err(_), false) => continue,
+        };
+        out.push(group, Level::Warn, "binary".into(), detail);
     }
 }
 
@@ -394,23 +477,7 @@ fn daemon(out: &mut Checks, config: &Config, input: &Input<'_>) {
             );
         }
     }
-    match (&input.installed_sha256, &s.process.binary_sha256) {
-        (Some(installed), Some(running)) if installed != running => out.push(
-            group,
-            Level::Warn,
-            "binary".into(),
-            "the installed binary is not the one running; piano upgrade switches to it \
-             without dropping streams"
-                .into(),
-        ),
-        (Some(_), None) => out.push(
-            group,
-            Level::Skip,
-            "binary".into(),
-            "the running binary is too old to report its checksum".into(),
-        ),
-        _ => {}
-    }
+    binaries(out, &input.installed, s.process.binary_sha256.as_deref());
     for f in &s.findings {
         let level = match f.level {
             FindingLevel::Warn => Level::Warn,
@@ -474,30 +541,37 @@ fn listening(out: &mut Checks, config: &Config, status: Option<&Status>) {
             .filter(|(port, _)| *port == addr.port())
             .filter_map(|(_, inode)| socket_owner(*inode))
             .collect();
-        let daemon = status.map(|s| s.pid);
-        let others: Vec<String> = owners
-            .iter()
-            .filter(|(pid, comm)| Some(*pid) != daemon && !(daemon.is_some() && comm == "piano"))
-            .map(|(pid, comm)| format!("{comm} (pid {pid})"))
-            .collect();
-        let (level, detail) = match (daemon, others.is_empty()) {
-            (_, false) => (
-                Level::Error,
-                format!("port {} is held by {}", addr.port(), others.join(", ")),
-            ),
-            (Some(pid), true) => (Level::Ok, format!("served by pid {pid}")),
-            (None, true) if owners.is_empty() && !held.iter().any(|(p, _)| *p == addr.port()) => {
-                (Level::Ok, "free".to_owned())
-            }
-            (None, true) => (
-                Level::Warn,
-                format!(
-                    "port {} is in use by a process this user cannot see",
-                    addr.port()
-                ),
-            ),
-        };
+        let in_use = held.iter().any(|(p, _)| *p == addr.port());
+        let (level, detail) = port_verdict(addr.port(), status.map(|s| s.pid), &owners, in_use);
         out.push("listening", level, listen.clone(), detail);
+    }
+}
+
+/// The verdict on listening `port`, given the running daemon's pid, the processes this
+/// user can see holding it, and whether anyone listens on it. A draining predecessor of
+/// the daemon (also `piano`) does not conflict.
+fn port_verdict(
+    port: u16,
+    daemon: Option<u32>,
+    owners: &BTreeSet<(u32, String)>,
+    in_use: bool,
+) -> (Level, String) {
+    let others: Vec<String> = owners
+        .iter()
+        .filter(|(pid, comm)| Some(*pid) != daemon && !(daemon.is_some() && comm == "piano"))
+        .map(|(pid, comm)| format!("{comm} (pid {pid})"))
+        .collect();
+    match (daemon, others.is_empty()) {
+        (_, false) => (
+            Level::Error,
+            format!("port {port} is held by {}", others.join(", ")),
+        ),
+        (Some(pid), true) => (Level::Ok, format!("served by pid {pid}")),
+        (None, true) if !in_use => (Level::Ok, "free".to_owned()),
+        (None, true) => (
+            Level::Warn,
+            format!("port {port} is in use by a process this user cannot see"),
+        ),
     }
 }
 
@@ -566,6 +640,21 @@ async fn upstreams(out: &mut Checks, config: &Config, resolver: &Resolver) {
     }
 }
 
+/// Wildcard follow names, which are not checked: the hosts they stand for are known only
+/// when a redirect names one.
+fn wildcards(out: &mut Checks, config: &Config) {
+    for site in &config.sites {
+        for name in site.follow.iter().filter(|h| h.starts_with("*.")) {
+            out.push(
+                "upstreams",
+                Level::Skip,
+                format!("{}: {name}", site.name),
+                "checked when a redirect names a host".into(),
+            );
+        }
+    }
+}
+
 /// Resolves `host` and completes a verified TLS handshake with its first address.
 async fn handshake(
     connector: &TransportConnector,
@@ -622,6 +711,23 @@ fn uptime(secs: u64) -> String {
         () if m > 0 => format!("{m}m"),
         () => format!("{secs}s"),
     }
+}
+
+/// The file process `pid` was started from, at its path now; `None` when its link
+/// cannot be read (another user's process).
+pub fn started_from(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|link| undeleted(&link))
+}
+
+/// An `exe` link's path without the " (deleted)" the kernel appends once the file
+/// there was replaced.
+fn undeleted(link: &Path) -> PathBuf {
+    let b = link.as_os_str().as_bytes();
+    PathBuf::from(OsStr::from_bytes(
+        b.strip_suffix(b" (deleted)").unwrap_or(b),
+    ))
 }
 
 /// sha256 of a file, in hex.
@@ -686,5 +792,133 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         assert!(reach(&me, &exe, Want::Read).is_ok());
         assert!(reach(&me, Path::new("/nonexistent/x"), Want::Read).is_err());
+        // Relative to the package directory, where tests run.
+        assert_eq!(reach(&me, Path::new("Cargo.toml"), Want::Read), Ok(()));
+        assert_eq!(reach(&me, Path::new("src/doctor.rs"), Want::Read), Ok(()));
+    }
+
+    #[test]
+    fn certificate_expiry_levels() {
+        let day = 86_400;
+        let now = 1_000 * day;
+        let at = |days: i64| expiry(Some(now + days * day), now).0;
+        assert_eq!(expiry(None, now).0, Level::Warn);
+        assert_eq!(expiry(Some(now), now).0, Level::Error);
+        assert_eq!(at(CERT_ERROR_DAYS), Level::Warn);
+        assert_eq!(
+            expiry(Some(now + CERT_ERROR_DAYS * day - 1), now).0,
+            Level::Error
+        );
+        assert_eq!(at(CERT_WARN_DAYS), Level::Ok);
+        assert_eq!(
+            expiry(Some(now + CERT_WARN_DAYS * day - 1), now).0,
+            Level::Warn
+        );
+        assert_eq!(
+            expiry(Some(now + 30 * day + 5), now).1,
+            "covers every site, expires in 30 days"
+        );
+    }
+
+    #[test]
+    fn who_holds_a_port() {
+        let owners = |list: &[(u32, &str)]| -> BTreeSet<(u32, String)> {
+            list.iter().map(|(p, c)| (*p, (*c).to_owned())).collect()
+        };
+        let v =
+            |daemon, list: &[(u32, &str)], in_use| port_verdict(443, daemon, &owners(list), in_use);
+        assert_eq!(v(None, &[], false), (Level::Ok, "free".into()));
+        assert_eq!(v(None, &[], true).0, Level::Warn);
+        assert_eq!(
+            v(None, &[(7, "nginx")], true),
+            (Level::Error, "port 443 is held by nginx (pid 7)".into())
+        );
+        assert_eq!(
+            v(Some(9), &[(9, "piano")], true),
+            (Level::Ok, "served by pid 9".into())
+        );
+        // A draining predecessor shares the port with the daemon; with no daemon running
+        // a piano holding it is a conflict.
+        assert_eq!(v(Some(9), &[(8, "piano"), (9, "piano")], true).0, Level::Ok);
+        assert_eq!(v(None, &[(8, "piano")], true).0, Level::Error);
+        assert_eq!(
+            v(Some(9), &[(7, "nginx"), (9, "piano")], true).0,
+            Level::Error
+        );
+        // The daemon's socket can be invisible to this user.
+        assert_eq!(v(Some(9), &[], true).0, Level::Ok);
+    }
+
+    #[test]
+    fn binary_differences() {
+        let installed = |path: &str, sha256: Result<&str, &str>, started_from| Installed {
+            path: path.into(),
+            sha256: sha256.map(str::to_owned).map_err(str::to_owned),
+            started_from,
+        };
+        let warnings = |list: &[Installed], running| {
+            let mut out = Checks::default();
+            binaries(&mut out, list, running);
+            out.0
+                .into_iter()
+                .map(|c| (c.level, c.detail))
+                .collect::<Vec<_>>()
+        };
+        let daemon = installed("/usr/local/bin/piano", Ok("a"), true);
+        assert!(warnings(&[daemon], Some("a")).is_empty());
+        let daemon = installed("/usr/local/bin/piano", Ok("b"), true);
+        assert_eq!(
+            warnings(&[daemon], Some("a")),
+            [(
+                Level::Warn,
+                "/usr/local/bin/piano is not the binary running; piano upgrade switches to it \
+                 without dropping streams"
+                    .into()
+            )]
+        );
+        // Upgraded from another path: the service manager's binary still differs.
+        let list = [
+            installed("/opt/piano-new", Ok("a"), true),
+            installed("/usr/local/bin/piano", Ok("b"), false),
+        ];
+        let w = warnings(&list, Some("a"));
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].1.contains("piano upgrade /usr/local/bin/piano"),
+            "{w:?}"
+        );
+        // The daemon's file is gone: piano upgrade would fail.
+        let list = [installed("/tmp/piano-x", Err("not found"), true)];
+        assert!(warnings(&list, Some("a"))[0].1.contains("cannot be read"));
+        let list = [installed("/x", Ok("b"), true)];
+        assert_eq!(warnings(&list, None)[0].0, Level::Skip);
+    }
+
+    #[test]
+    fn uptimes() {
+        assert_eq!(uptime(40), "40s");
+        assert_eq!(uptime(5 * 60 + 7), "5m");
+        assert_eq!(uptime(2 * 3600 + 5 * 60), "2h 5m");
+        assert_eq!(uptime(3 * 86_400 + 4 * 3600 + 59), "3d 4h");
+    }
+
+    #[test]
+    fn replaced_binaries_are_read_at_their_path() {
+        assert_eq!(
+            undeleted(Path::new("/usr/local/bin/piano (deleted)")),
+            Path::new("/usr/local/bin/piano")
+        );
+        assert_eq!(undeleted(Path::new("/opt/piano")), Path::new("/opt/piano"));
+        assert_eq!(
+            started_from(std::process::id()),
+            Some(std::env::current_exe().unwrap())
+        );
+        let hint = |d: &str| sandbox_hint(Path::new(d));
+        assert_eq!(hint("/var/log/piano"), None);
+        assert_eq!(hint("/var/lib/piano/sub"), None);
+        assert_eq!(hint("/tmp/piano"), None);
+        assert!(hint("/srv/logs").is_some_and(|h| h.contains("ReadWritePaths=")));
+        assert!(hint("/home/u/logs").is_some_and(|h| h.contains("ProtectHome=no")));
+        assert!(hint("/var/log/pianola").is_some());
     }
 }
