@@ -1,6 +1,6 @@
 use crate::{Config, UpstreamLimit};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// One problem found while validating a configuration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -9,8 +9,11 @@ pub enum ValidationError {
     NoListen,
     #[error("server.listen entry {0:?} must be an IP address and port, such as \"[::]:443\"")]
     BadListen(String),
-    #[error("server.listen has {0} more than once")]
-    DuplicateListen(String),
+    #[error(
+        "server.listen entries {0:?} and {1:?} cannot both be bound: same port, and the \
+         address of one covers the other (\"[::]\" takes IPv4 too)"
+    )]
+    OverlappingListen(String, String),
     #[error("version {0} is not supported; this piano reads version 1")]
     BadVersion(u32),
     #[error("no [[site]] configured")]
@@ -29,7 +32,10 @@ pub enum ValidationError {
          (a name left out is the first label of the host)"
     )]
     DuplicateName(String),
-    #[error("site name {0:?} must be 1 to 64 ASCII letters, digits, '.', '_' or '-'")]
+    #[error(
+        "site name {0:?} must be 1 to 64 ASCII letters, digits, '_' or '-', starting with a \
+         letter or digit"
+    )]
     BadName(String),
     #[error("site {site:?}: alias {host:?} is not a valid lowercase DNS name")]
     BadAlias { site: String, host: String },
@@ -182,12 +188,26 @@ pub fn is_dns_name(s: &str) -> bool {
             .is_some_and(|tld| !tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// ASCII letters, digits, `.`, `_` and `-`: site names go into `key=value` log
-/// records, command arguments and the traffic record.
+/// ASCII letters, digits, `_` and `-`, starting with a letter or digit: site names go
+/// into `key=value` log records, the traffic record and command arguments, where they
+/// must not read as an option or be mistaken for a host.
 fn is_site_name(s: &str) -> bool {
-    (1..=64).contains(&s.len())
+    s.len() <= 64
+        && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Whether two listening addresses cannot both be bound: the same port, and the same
+/// address or a wildcard covering the other. Listeners are dual-stack, so the IPv6
+/// wildcard covers IPv4 too.
+fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
+    let covers = |wild: IpAddr, other: IpAddr| match wild {
+        IpAddr::V6(w) => w.is_unspecified(),
+        IpAddr::V4(w) => w.is_unspecified() && other.is_ipv4(),
+    };
+    let (x, y) = (a.ip().to_canonical(), b.ip().to_canonical());
+    a.port() == b.port() && (x == y || covers(x, y) || covers(y, x))
 }
 
 /// Whether follow entry `pattern` (a name or `*.<domain>`) matches lowercase `host`.
@@ -219,16 +239,22 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
     if config.server.listen.is_empty() {
         errors.push(ValidationError::NoListen);
     }
-    let mut listen = HashSet::new();
+    let mut listen: Vec<(&String, SocketAddr)> = Vec::new();
     for entry in &config.server.listen {
-        match entry.parse::<SocketAddr>() {
-            Ok(addr) if !listen.insert(addr) => {
-                errors.push(ValidationError::DuplicateListen(entry.clone()));
-            }
-            Ok(_) => {}
-            Err(_) => errors.push(ValidationError::BadListen(entry.clone())),
+        let Ok(addr) = entry.parse::<SocketAddr>() else {
+            errors.push(ValidationError::BadListen(entry.clone()));
+            continue;
+        };
+        if let Some((other, _)) = listen.iter().find(|(_, a)| overlaps(*a, addr)) {
+            errors.push(ValidationError::OverlappingListen(
+                (*other).clone(),
+                entry.clone(),
+            ));
         }
+        listen.push((entry, addr));
     }
+    // Clients reach the site hosts on 443, wherever the relay listens.
+    let relay_ports: HashSet<u16> = listen.iter().map(|(_, a)| a.port()).chain([443]).collect();
     if config.log.access_path().is_some_and(|p| !p.is_absolute()) {
         errors.push(ValidationError::RelativeAccessLog(
             config.log.access.clone(),
@@ -276,7 +302,9 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
             reason: "must be at least 1",
         });
     }
+    let mut named = Vec::with_capacity(config.sites.len());
     for site in &mut config.sites {
+        named.push(!site.name.is_empty());
         if site.name.is_empty() {
             site.name = site.host.split('.').next().unwrap_or_default().to_owned();
         }
@@ -288,8 +316,9 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
         .collect();
     let mut hosts = HashSet::new();
     let mut names = HashSet::new();
-    for site in &mut config.sites {
-        if !is_site_name(&site.name) {
+    for (site, named) in config.sites.iter_mut().zip(named) {
+        // A name taken from an invalid host is reported as the host.
+        if named && !is_site_name(&site.name) {
             errors.push(ValidationError::BadName(site.name.clone()));
         }
         if !is_dns_name(&site.host) {
@@ -401,9 +430,8 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
         }
         match UpstreamUrl::parse(&site.upstream) {
             Ok(origin) => {
-                // Site hosts lead to the relay, whatever the port.
                 for (other_name, other_host) in &site_hosts {
-                    if origin.host == *other_host {
+                    if origin.host == *other_host && relay_ports.contains(&origin.port) {
                         errors.push(ValidationError::UpstreamIsSite {
                             site: site.name.clone(),
                             host: origin.host.clone(),
@@ -693,10 +721,25 @@ max_connections = 0
     #[test]
     fn listen_entries_are_distinct_addresses() {
         let c = parse(&format!(
-            "{MINIMAL}[server]\nlisten = [\"0.0.0.0:443\", \"[::]:8443\"]\n"
+            "{MINIMAL}[server]\nlisten = [\"0.0.0.0:443\", \"[::]:8443\", \"192.0.2.1:8443\"]\n"
+        ));
+        assert!(c.is_err(), "[::] covers IPv4");
+        let c = parse(&format!(
+            "{MINIMAL}[server]\nlisten = [\"192.0.2.1:443\", \"192.0.2.2:443\", \"[2001:db8::1]:443\", \"0.0.0.0:8443\", \"[2001:db8::1]:8443\"]\n"
         ))
         .unwrap();
-        assert_eq!(c.server.listen.len(), 2);
+        assert_eq!(c.server.listen.len(), 5);
+        for (a, b) in [
+            ("0.0.0.0:443", "192.0.2.1:443"),
+            ("[::]:443", "0.0.0.0:443"),
+            ("[::ffff:192.0.2.1]:443", "192.0.2.1:443"),
+        ] {
+            let text = format!("{MINIMAL}[server]\nlisten = [\"{a}\", \"{b}\"]\n");
+            assert_eq!(
+                errors(&text),
+                [ValidationError::OverlappingListen(a.into(), b.into())]
+            );
+        }
         let text = format!(
             "{MINIMAL}[server]\nlisten = [\"443\", \"localhost:443\", \"[::]:443\", \"[0::]:443\"]\n"
         );
@@ -705,7 +748,7 @@ max_connections = 0
             [
                 ValidationError::BadListen("443".into()),
                 ValidationError::BadListen("localhost:443".into()),
-                ValidationError::DuplicateListen("[0::]:443".into()),
+                ValidationError::OverlappingListen("[::]:443".into(), "[0::]:443".into()),
             ]
         );
     }
@@ -722,9 +765,9 @@ max_connections = 0
     #[test]
     fn site_names() {
         let named = |name: &str| format!("{MINIMAL}name = \"{name}\"\n");
-        parse(&named("uhd-2.main_a")).unwrap();
+        parse(&named("uhd-2_main")).unwrap();
         parse(&named(&"a".repeat(64))).unwrap();
-        for bad in ["a b", "a=b", "é", &"a".repeat(65)] {
+        for bad in ["a b", "a=b", "é", "-x", "tv.example.com", &"a".repeat(65)] {
             assert_eq!(
                 errors(&named(bad)),
                 [ValidationError::BadName(bad.into())],
@@ -757,9 +800,16 @@ max_connections = 0
 
     #[test]
     fn upstream_must_not_be_a_site() {
-        let text = format!(
-            "{MINIMAL}\n[[site]]\nhost = \"tv.example.com\"\nupstream = \"https://media.example.com:8920\"\n"
-        );
+        let tv = |port: u16, listen: &str| {
+            format!(
+                "{MINIMAL}\n[[site]]\nhost = \"tv.example.com\"\nupstream = \"https://media.example.com:{port}\"\n\
+                 [server]\nlisten = [\"{listen}\"]\n"
+            )
+        };
+        // Another server on the relay's host, on a port the relay does not serve.
+        parse(&tv(8920, "[::]:443")).unwrap();
+        assert_eq!(errors(&tv(443, "[::]:8443")).len(), 1);
+        let text = tv(8920, "[::]:8920");
         assert_eq!(
             errors(&text),
             [ValidationError::UpstreamIsSite {

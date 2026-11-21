@@ -63,8 +63,8 @@ upstream = "https://emby.example.net"
   `true`) also lets loopback addresses in, which is how `piano probe` reaches the relay.
 - The certificate must cover every site host. Connections without SNI, or for a host
   that is not a site, are refused during the TLS handshake.
-- Upstreams must be `https://` with a DNS name that is not a site host of this relay;
-  certificate verification is always on.
+- Upstreams must be `https://` with a DNS name, and not a site host of this relay on
+  443 or a port it listens on; certificate verification is always on.
   Extra trust anchors can be added with `[upstream] extra_roots = ["/path/ca.pem"]`;
   each file holds one or more PEM `BEGIN CERTIFICATE` sections, and they are added to the system roots,
   not substituted for them.
