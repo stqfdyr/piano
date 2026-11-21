@@ -2,15 +2,41 @@
 
 use std::time::Duration;
 
-/// How long a response may be served from a shared cache, capped at `max`; `None` when
-/// it must not be stored or revalidated before every use. `s-maxage` wins over
-/// `max-age`; without either nothing is stored, since image endpoints that want caching
-/// say so.
-pub fn shared_ttl(cache_control: Option<&[u8]>, max: Duration) -> Option<Duration> {
-    let value = cache_control?;
+/// What a response allows a shared cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// No lifetime given.
+    Unstated,
+    /// Not to be stored, or stale at once.
+    Never,
+    /// Fresh for this long.
+    For(Duration),
+}
+
+impl Freshness {
+    /// The lifetime of a response that may be stored.
+    pub fn ttl(self) -> Option<Duration> {
+        match self {
+            Self::For(d) => Some(d),
+            Self::Unstated | Self::Never => None,
+        }
+    }
+}
+
+/// How long a response may be served from a shared cache, capped at `max`.
+/// `cache_control` holds every `Cache-Control` field line, which together form one list.
+/// `s-maxage` wins over `max-age`; image endpoints that want caching say so, so a
+/// response without either is not stored.
+pub fn shared_ttl<'a>(
+    cache_control: impl IntoIterator<Item = &'a [u8]>,
+    max: Duration,
+) -> Freshness {
     let mut max_age = None;
     let mut s_maxage = None;
-    for directive in value.split(|&b| b == b',') {
+    let directives = cache_control
+        .into_iter()
+        .flat_map(|line| line.split(|&b| b == b','));
+    for directive in directives {
         let directive = directive.trim_ascii();
         let (name, arg) = match directive.iter().position(|&b| b == b'=') {
             Some(i) => (&directive[..i], Some(directive[i + 1..].trim_ascii())),
@@ -19,7 +45,7 @@ pub fn shared_ttl(cache_control: Option<&[u8]>, max: Duration) -> Option<Duratio
         let name = name.trim_ascii();
         let is = |n: &str| name.eq_ignore_ascii_case(n.as_bytes());
         if is("no-store") || is("private") || is("no-cache") {
-            return None;
+            return Freshness::Never;
         }
         let secs = || {
             let a = arg?;
@@ -33,19 +59,22 @@ pub fn shared_ttl(cache_control: Option<&[u8]>, max: Duration) -> Option<Duratio
             s_maxage = secs();
         }
     }
-    let secs = s_maxage.or(max_age)?;
-    (secs > 0).then(|| Duration::from_secs(secs).min(max))
+    match s_maxage.or(max_age) {
+        None => Freshness::Unstated,
+        Some(0) => Freshness::Never,
+        Some(secs) => Freshness::For(Duration::from_secs(secs).min(max)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shared_ttl;
+    use super::{Freshness, shared_ttl};
     use std::time::Duration;
 
     const MAX: Duration = Duration::from_secs(30 * 86_400);
 
     fn ttl(v: &str) -> Option<u64> {
-        shared_ttl(Some(v.as_bytes()), MAX).map(|d| d.as_secs())
+        shared_ttl([v.as_bytes()], MAX).ttl().map(|d| d.as_secs())
     }
 
     #[test]
@@ -63,6 +92,23 @@ mod tests {
         assert_eq!(ttl("no-store, max-age=60"), None);
         assert_eq!(ttl("no-cache"), None);
         assert_eq!(ttl("max-age=x"), None);
-        assert_eq!(shared_ttl(None, MAX), None);
+        assert_eq!(shared_ttl(std::iter::empty(), MAX), Freshness::Unstated);
+        let f = |v: &str| shared_ttl([v.as_bytes()], MAX);
+        assert_eq!(f("public"), Freshness::Unstated);
+        assert_eq!(f("max-age=x"), Freshness::Unstated);
+        assert_eq!(f("max-age=0"), Freshness::Never);
+        assert_eq!(f("s-maxage=0, max-age=60"), Freshness::Never);
+        assert_eq!(f("max-age=60, private"), Freshness::Never);
+    }
+
+    #[test]
+    fn field_lines_form_one_list() {
+        let lines = |l: &[&'static str]| {
+            shared_ttl(l.iter().map(|s| s.as_bytes()), MAX)
+                .ttl()
+                .map(|d| d.as_secs())
+        };
+        assert_eq!(lines(&["public, max-age=60", "private"]), None);
+        assert_eq!(lines(&["max-age=60", "s-maxage=600"]), Some(600));
     }
 }
