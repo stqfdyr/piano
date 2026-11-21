@@ -83,22 +83,27 @@ const TEST_LIMIT: Duration = Duration::from_secs(120);
 
 /// Like [`run`], but kills the command and everything it started once `limit` passes.
 fn run_limited(step: &str, cmd: Command, limit: Duration) -> Result {
-    run_bounded(step, cmd, limit, None).map(drop)
+    run_bounded(step, cmd, limit, None, false).map(drop)
 }
 
 /// Runs `cmd` in its own process group with `input` (if any) on stdin, killing the
-/// group once `limit` passes. With `input`, returns what it printed on stdout; it must
-/// print little, as stdout is read only after it exits.
+/// group once `limit` passes. With `capture`, returns what it printed on stdout, which
+/// must be little, as it is read only after the command exits; otherwise its output goes
+/// straight to ours.
 fn run_bounded(
     step: &str,
     mut cmd: Command,
     limit: Duration,
     input: Option<&[u8]>,
+    capture: bool,
 ) -> Result<Vec<u8>> {
     eprintln!("==> {step} (limit {}s)", limit.as_secs());
     let start = Instant::now();
     if input.is_some() {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
+        cmd.stdin(Stdio::piped());
+    }
+    if capture {
+        cmd.stdout(Stdio::piped());
     }
     // Its own process group, so what it starts goes with it.
     let mut child = cmd
@@ -492,7 +497,7 @@ fn fetch_release(tag: &str) -> Result<PathBuf> {
             "--pattern",
             &format!("{archive}.sha256"),
         ]);
-    run_bounded("download", download, DOWNLOAD_LIMIT, None)?;
+    run_bounded("download", download, DOWNLOAD_LIMIT, None, false)?;
 
     let mut check = Command::new("sha256sum");
     check
@@ -514,7 +519,7 @@ fn fetch_release(tag: &str) -> Result<PathBuf> {
             "--source-ref",
             &format!("refs/tags/{tag}"),
         ]);
-    run_bounded("attestation", attestation, ATTESTATION_LIMIT, None)?;
+    run_bounded("attestation", attestation, ATTESTATION_LIMIT, None, false)?;
 
     let mut unpack = Command::new("tar");
     unpack
@@ -572,6 +577,7 @@ fn deploy(d: &Deploy<'_>) -> Result {
         mktemp,
         Duration::from_secs(30),
         Some(b""),
+        true,
     )?;
     let dir = String::from_utf8_lossy(&out).trim().to_owned();
     let plain = dir.starts_with(REMOTE_DIR_PREFIX)
@@ -588,10 +594,10 @@ fn deploy(d: &Deploy<'_>) -> Result {
         .args(SSH_OPTIONS)
         .args(&files)
         .arg(format!("{}:{dir}/", d.host));
-    if let Err(e) = run_bounded("copy", scp, COPY_LIMIT, None) {
+    if let Err(e) = run_bounded("copy", scp, COPY_LIMIT, None, false) {
         let mut clean = ssh(d.host);
         clean.args(["rm", "-rf", &dir]);
-        let _ = run_bounded("clean up", clean, Duration::from_secs(30), Some(b""));
+        let _ = run_bounded("clean up", clean, Duration::from_secs(30), Some(b""), false);
         return Err(e);
     }
 
@@ -606,13 +612,13 @@ fn deploy(d: &Deploy<'_>) -> Result {
         d.instance.unwrap_or("-"),
     ]);
     remote.args(binary.as_deref());
-    let mut child_out = run_bounded("install", remote, REMOTE_LIMIT, Some(DEPLOY_SH.as_bytes()));
-    if let Ok(out) = child_out.as_mut() {
-        std::io::stdout()
-            .write_all(out)
-            .map_err(|e| format!("stdout: {e}"))?;
-    }
-    child_out?;
+    run_bounded(
+        "install",
+        remote,
+        REMOTE_LIMIT,
+        Some(DEPLOY_SH.as_bytes()),
+        false,
+    )?;
     if !rollback {
         let instance = d
             .instance
