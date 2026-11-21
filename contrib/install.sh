@@ -147,6 +147,10 @@ fi
 as_user() { su -s /bin/sh -c "$1" "$user" sh "$2"; }
 grant() {
 	p=$1
+	case $p in
+	/*) ;;
+	*) die "$p is not an absolute path; the service does not run in $PWD" ;;
+	esac
 	for target in "$p" "$(readlink -f "$p")"; do
 		# One directory per line, top down: names may hold spaces.
 		dirs=
@@ -182,8 +186,10 @@ if [ "$new_config" = no ] && [ "$cert_access" = yes ]; then
 	# config show writes a path as a basic string, or as a literal one when it holds
 	# a quote or a backslash; a basic string with escapes is not read.
 	paths=$("$piano" -c "$config" config show | sed -nE \
+		-e '/^\[tls\]$/,/^\[/{' \
 		-e 's/^[[:space:]]*(cert|key)[[:space:]]*=[[:space:]]*"([^"\\]*)"[[:space:]]*$/\2/p' \
-		-e "s/^[[:space:]]*(cert|key)[[:space:]]*=[[:space:]]*'([^']*)'[[:space:]]*\$/\\2/p")
+		-e "s/^[[:space:]]*(cert|key)[[:space:]]*=[[:space:]]*'([^']*)'[[:space:]]*\$/\\2/p" \
+		-e '}')
 	[ "$(printf '%s\n' "$paths" | grep -c .)" -eq 2 ] ||
 		die "cannot read the certificate and key paths from piano config show; run again with --no-cert-access"
 	while IFS= read -r f; do
