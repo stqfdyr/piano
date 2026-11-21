@@ -67,6 +67,12 @@ impl ContentRange {
             complete,
         })
     }
+
+    /// Bytes the range covers; `None` when the count does not fit in a `u64`, which only
+    /// `bytes 0-18446744073709551615/*` reaches.
+    fn len(&self) -> Option<u64> {
+        (self.last - self.first).checked_add(1)
+    }
 }
 
 /// The parts of a response head that decide whether its body can be continued.
@@ -86,7 +92,9 @@ pub struct Head<'a> {
 pub enum Mismatch {
     #[error("status {0} instead of 206")]
     Status(u16),
-    #[error("no satisfied Content-Range, or a length that disagrees with it")]
+    #[error(
+        "no satisfied Content-Range with a complete length, or a length that disagrees with it"
+    )]
     ContentRange,
     #[error("range does not cover the resume offset")]
     Offset,
@@ -137,7 +145,7 @@ impl Resume {
             206 => {
                 let cr = ContentRange::parse(head.content_range?)?;
                 let complete = cr.complete?;
-                if length.is_some_and(|l| l != cr.last - cr.first + 1) {
+                if length.is_some_and(|l| Some(l) != cr.len()) {
                     return None;
                 }
                 (cr.first, cr.last + 1, complete)
@@ -183,10 +191,12 @@ impl Resume {
             Some(v) => Some(parse_number(v).ok_or(Mismatch::ContentRange)?),
             None => None,
         };
-        if length.is_some_and(|l| l != cr.last - cr.first + 1) {
+        if length.is_some_and(|l| Some(l) != cr.len()) {
             return Err(Mismatch::ContentRange);
         }
-        if cr.complete != Some(self.complete) {
+        // Without a complete length the response says nothing about the representation:
+        // only this request is unusable.
+        if cr.complete.ok_or(Mismatch::ContentRange)? != self.complete {
             return Err(Mismatch::Length);
         }
         if self.etag.is_some() && self.etag.as_deref() != head.etag {
@@ -264,6 +274,14 @@ mod tests {
             ContentRange::parse(b"bytes 5-9/*").map(|c| c.complete),
             Some(None)
         );
+        assert_eq!(
+            ContentRange::parse(b"bytes 5-5/10"),
+            Some(ContentRange {
+                first: 5,
+                last: 5,
+                complete: Some(10)
+            })
+        );
         for bad in [
             &b"bytes */1000"[..],
             b"bytes 9-5/1000",
@@ -298,6 +316,11 @@ mod tests {
         };
         let r = Resume::of(&whole).unwrap();
         assert_eq!((r.start, r.end, r.complete), (0, 1000, 1000));
+        let sized = Head {
+            content_length: Some(b"100"),
+            ..partial(b"bytes 100-199/1000", None)
+        };
+        assert!(Resume::of(&sized).is_some());
 
         // Unknown length, no range support, unknown complete length, wrong length.
         let live = Head {
@@ -314,7 +337,11 @@ mod tests {
             content_length: Some(b"5"),
             ..partial(b"bytes 0-9/100", None)
         };
-        for h in [live, no_ranges, star, short] {
+        let empty = Head {
+            content_length: Some(b"0"),
+            ..whole
+        };
+        for h in [live, no_ranges, star, short, empty] {
             assert_eq!(Resume::of(&h), None, "{h:?}");
         }
         assert_eq!(
@@ -343,7 +370,23 @@ mod tests {
             ..partial(b"bytes 150-199/1000", Some(b"\"a\""))
         };
         assert_eq!(r.check(&long, 150), Err(Mismatch::ContentRange));
-        let cases: [(Head<'_>, Mismatch); 6] = [
+        let sized = Head {
+            content_length: Some(b"50"),
+            ..partial(b"bytes 150-199/1000", Some(b"\"a\""))
+        };
+        assert_eq!(r.check(&sized, 150), Ok((150, 200)));
+        // A response whose last byte is the resume offset still continues the body.
+        assert_eq!(
+            r.check(&partial(b"bytes 100-150/1000", Some(b"\"a\"")), 150),
+            Ok((100, 151))
+        );
+        // A count that does not fit in a u64 is a mismatch, not an overflow.
+        let huge = Head {
+            content_length: Some(b"0"),
+            ..partial(b"bytes 0-18446744073709551615/*", Some(b"\"a\""))
+        };
+        assert_eq!(r.check(&huge, 150), Err(Mismatch::ContentRange));
+        let cases: [(Head<'_>, Mismatch); 8] = [
             (
                 Head {
                     status: 200,
@@ -353,7 +396,15 @@ mod tests {
             ),
             (partial(b"garbage", Some(b"\"a\"")), Mismatch::ContentRange),
             (
+                partial(b"bytes 150-199/*", Some(b"\"a\"")),
+                Mismatch::ContentRange,
+            ),
+            (
                 partial(b"bytes 151-199/1000", Some(b"\"a\"")),
+                Mismatch::Offset,
+            ),
+            (
+                partial(b"bytes 100-149/1000", Some(b"\"a\"")),
                 Mismatch::Offset,
             ),
             (
@@ -376,6 +427,17 @@ mod tests {
         let bare = Resume::of(&partial(b"bytes 0-9/10", None)).unwrap();
         assert_eq!(
             bare.check(&partial(b"bytes 5-9/10", Some(b"\"x\"")), 5),
+            Ok((5, 10))
+        );
+        // A validator the first response lacked is not compared.
+        assert_eq!(
+            bare.check(
+                &Head {
+                    last_modified: Some(b"Tue, 01 Jan 2030 00:00:00 GMT"),
+                    ..partial(b"bytes 5-9/10", None)
+                },
+                5
+            ),
             Ok((5, 10))
         );
         let lm = Resume::of(&Head {
