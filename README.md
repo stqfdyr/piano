@@ -65,7 +65,7 @@ upstream = "https://emby.example.net"
   that is not a site, are refused during the TLS handshake.
 - Upstreams must be `https://` with a DNS name; certificate verification is always on.
   Extra trust anchors can be added with `[upstream] extra_roots = ["/path/ca.pem"]`;
-  each file is PEM with at least one certificate, and they are added to the system roots,
+  each file holds one or more PEM `BEGIN CERTIFICATE` sections, and they are added to the system roots,
   not substituted for them.
 
 ## Run

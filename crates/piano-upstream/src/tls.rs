@@ -18,7 +18,7 @@ pub enum Error {
         path: PathBuf,
         source: rustls::pki_types::pem::Error,
     },
-    #[error("no certificate in {path}")]
+    #[error("no PEM CERTIFICATE section in {path}")]
     NoCertificate { path: PathBuf },
     #[error("root certificate in {path} is unusable: {source}")]
     BadRoot {
@@ -93,34 +93,47 @@ fn add_pem_roots(roots: &mut RootCertStore, path: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
 
-    /// Writes `content` to a file of its own and returns its path.
-    fn file(name: &str, content: &[u8]) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("piano-upstream-tls-{}-{name}", std::process::id()));
-        std::fs::write(&path, content).unwrap();
-        path
+    /// A directory of its own, removed when dropped, so a failing test leaves nothing.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("piano-upstream-tls-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(&self, name: &str, content: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn extra_roots_without_a_certificate_are_refused() {
+        let dir = Dir::new();
         let key = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
         let bad = b"-----BEGIN CERTIFICATE-----\n%%%%\n-----END CERTIFICATE-----\n";
-        let empty = file("empty.pem", b"");
-        let der = file("root.der", &[0x30, 0x82, 0x01, 0x0a]);
-        let key = file("key.pem", key);
-        let bad = file("bad.pem", bad);
         let mut roots = RootCertStore::empty();
-        for path in [&empty, &der, &key] {
-            let e = add_pem_roots(&mut roots, path).unwrap_err();
+        for path in [
+            dir.file("empty.pem", b""),
+            dir.file("root.der", &[0x30, 0x82, 0x01, 0x0a]),
+            dir.file("key.pem", key),
+        ] {
+            let e = add_pem_roots(&mut roots, &path).unwrap_err();
             assert!(matches!(e, Error::NoCertificate { .. }), "{e}");
         }
-        let e = add_pem_roots(&mut roots, &bad).unwrap_err();
-        assert!(matches!(e, Error::Read { .. }), "{e}");
-        let missing = std::env::temp_dir().join("piano-upstream-tls-missing.pem");
-        let e = add_pem_roots(&mut roots, &missing).unwrap_err();
-        assert!(matches!(e, Error::Read { .. }), "{e}");
-        for path in [empty, der, key, bad] {
-            std::fs::remove_file(path).unwrap();
+        for path in [dir.file("bad.pem", bad), dir.0.join("missing.pem")] {
+            let e = add_pem_roots(&mut roots, &path).unwrap_err();
+            assert!(matches!(e, Error::Read { .. }), "{e}");
         }
     }
 }
