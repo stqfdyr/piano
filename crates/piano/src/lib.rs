@@ -350,7 +350,6 @@ pub fn build_with(
             |p| p.to_string_lossy().into_owned(),
         ),
         upgrade_sock_connect_accept_max_retries: Some(upgrade::HANDOFF_ATTEMPTS),
-        pid_file: "/run/piano/piano.pid".to_owned(),
         ..ServerConf::default()
     };
     let opt = predecessor.map(|_| Opt {
@@ -858,6 +857,19 @@ mod tests {
             "#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn only_configuration_errors_count_as_such() {
+        let io = || std::io::Error::other("x");
+        assert!(!Error::AccessLog(io()).is_config());
+        assert!(
+            !Error::Resolve(piano_upstream::resolve::Error::NoAddress(
+                "a.example.net".into()
+            ))
+            .is_config()
+        );
+        assert!(Error::Unvalidated("a".into()).is_config());
     }
 
     #[test]
