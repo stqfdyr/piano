@@ -111,7 +111,15 @@ impl Admin {
         // Reading files and resolving new origins block.
         let result = tokio::task::spawn_blocking(move || {
             let config = piano_config::load(&path).map_err(crate::Error::from)?;
-            let warnings = config.warnings();
+            let mut warnings: Vec<String> =
+                config.warnings().iter().map(ToString::to_string).collect();
+            // The running TLS client stays as it is, so a roots file that no longer loads
+            // would otherwise only show at the next start.
+            if let Err(e) = piano_upstream::tls::client_config(&config.upstream.extra_roots) {
+                warnings.push(format!(
+                    "upstream.extra_roots: {e}; the next start will fail"
+                ));
+            }
             let level = config.log.level;
             live.apply(&config).map(|fixed| (fixed, warnings, level))
         })
@@ -122,7 +130,6 @@ impl Admin {
                 if self.level_override.is_none() {
                     logger::set_level(crate::level_filter(level));
                 }
-                let warnings: Vec<String> = warnings.iter().map(ToString::to_string).collect();
                 for w in &warnings {
                     warn!("{w}");
                 }

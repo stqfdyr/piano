@@ -158,6 +158,23 @@ async fn reload_reports_success_failure_and_settings_that_need_a_restart() {
     let s: Status = ask(w.relay.control_socket(), "status").await;
     let codes: Vec<&str> = s.findings.iter().map(|f| f.code.as_str()).collect();
     assert_eq!(codes, ["restart_needed"]);
+
+    // A roots file that no longer loads is reported, while the running TLS client keeps
+    // the roots it started with.
+    let empty = [String::new()];
+    w.relay.write_config(&RelaySetup {
+        extra_roots: &empty,
+        ..setup(&[], "")
+    });
+    let r: ReloadReply = ask(w.relay.control_socket(), "reload").await;
+    assert!(r.ok, "{r:?}");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("upstream.extra_roots")),
+        "{r:?}"
+    );
+    assert_eq!(get(&w.ca, &w.relay, "/__info").await, 200);
 }
 
 #[tokio::test]

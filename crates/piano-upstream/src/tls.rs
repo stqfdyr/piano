@@ -18,6 +18,8 @@ pub enum Error {
         path: PathBuf,
         source: rustls::pki_types::pem::Error,
     },
+    #[error("no PEM CERTIFICATE section in {path}")]
+    NoCertificate { path: PathBuf },
     #[error("root certificate in {path} is unusable: {source}")]
     BadRoot {
         path: PathBuf,
@@ -63,6 +65,9 @@ pub fn client_config(extra_roots: &[PathBuf]) -> Result<ClientTls, Error> {
     })
 }
 
+/// Adds every certificate in the PEM file at `path`. Sections of other kinds are
+/// skipped, so a file without any certificate (empty, DER, a key) is an error rather
+/// than a silent no-op.
 fn add_pem_roots(roots: &mut RootCertStore, path: &Path) -> Result<(), Error> {
     let certs = CertificateDer::pem_file_iter(path)
         .and_then(|it| it.collect::<Result<Vec<_>, _>>())
@@ -70,6 +75,11 @@ fn add_pem_roots(roots: &mut RootCertStore, path: &Path) -> Result<(), Error> {
             path: path.to_owned(),
             source,
         })?;
+    if certs.is_empty() {
+        return Err(Error::NoCertificate {
+            path: path.to_owned(),
+        });
+    }
     for cert in certs {
         roots.add(cert).map_err(|source| Error::BadRoot {
             path: path.to_owned(),
@@ -77,4 +87,53 @@ fn add_pem_roots(roots: &mut RootCertStore, path: &Path) -> Result<(), Error> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory of its own, removed when dropped, so a failing test leaves nothing.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("piano-upstream-tls-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(&self, name: &str, content: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn extra_roots_without_a_certificate_are_refused() {
+        let dir = Dir::new();
+        let key = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let bad = b"-----BEGIN CERTIFICATE-----\n%%%%\n-----END CERTIFICATE-----\n";
+        let mut roots = RootCertStore::empty();
+        for path in [
+            dir.file("empty.pem", b""),
+            dir.file("root.der", &[0x30, 0x82, 0x01, 0x0a]),
+            dir.file("key.pem", key),
+        ] {
+            let e = add_pem_roots(&mut roots, &path).unwrap_err();
+            assert!(matches!(e, Error::NoCertificate { .. }), "{e}");
+        }
+        for path in [dir.file("bad.pem", bad), dir.0.join("missing.pem")] {
+            let e = add_pem_roots(&mut roots, &path).unwrap_err();
+            assert!(matches!(e, Error::Read { .. }), "{e}");
+        }
+    }
 }
