@@ -9,7 +9,8 @@
 //!   percent-decoded `to` as `Location`.
 //! - `/__loop/N`: 302 to `/__loop/N-1`, until `/__loop/0` answers 200 `done`.
 //! - `/__cdn`: an empty 200 carrying the headers a CDN-fronted Emby sends (`server`,
-//!   `cf-ray`, `alt-svc`, `nel`, `report-to`, its own HSTS and frame policy) and two
+//!   `cf-ray`, `alt-svc`, `nel`, `report-to`, `reporting-endpoints`,
+//!   `speculation-rules`, its own HSTS and frame policy) and two
 //!   cookies, one scoped to the origin host.
 //! - `/__seq/{key}/{codes}`: the n-th request for `key` gets the n-th status of the
 //!   comma-separated `codes` (the last one repeats) and `n` as its body.
@@ -63,6 +64,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_rustls::TlsAcceptor;
@@ -126,10 +128,12 @@ type Seqs = Arc<Mutex<HashMap<String, usize>>>;
 /// The `Range` header of every scripted media file request, per key.
 type Seen = Arc<Mutex<HashMap<String, Vec<Option<String>>>>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct State {
     seqs: Seqs,
     seen: Seen,
+    /// Changes to closed when the [`Origin`] is dropped; connection tasks end then.
+    closed: watch::Receiver<()>,
 }
 
 pub struct Origin {
@@ -139,6 +143,8 @@ pub struct Origin {
     conns: Arc<[AtomicUsize; 2]>,
     state: State,
     task: JoinHandle<()>,
+    /// Dropped with the origin, which ends every connection still open.
+    _close: watch::Sender<()>,
 }
 
 impl Origin {
@@ -182,7 +188,12 @@ impl Origin {
         let counter = Arc::clone(&requests);
         let conns: Arc<[AtomicUsize; 2]> = Arc::default();
         let conn_counter = Arc::clone(&conns);
-        let state = State::default();
+        let (close, closed) = watch::channel(());
+        let state = State {
+            seqs: Seqs::default(),
+            seen: Seen::default(),
+            closed,
+        };
         let shared = state.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -193,6 +204,7 @@ impl Origin {
                 let counter = Arc::clone(&counter);
                 let conn_counter = Arc::clone(&conn_counter);
                 let state = shared.clone();
+                let mut closed = state.closed.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
@@ -203,9 +215,12 @@ impl Origin {
                         counter.fetch_add(1, Ordering::Relaxed);
                         handle(req, state.clone())
                     });
-                    let _ = auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(TokioIo::new(tls), service)
-                        .await;
+                    let builder = auto::Builder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection_with_upgrades(TokioIo::new(tls), service);
+                    tokio::select! {
+                        _ = conn => {}
+                        _ = closed.changed() => {}
+                    }
                 });
             }
         });
@@ -215,6 +230,7 @@ impl Origin {
             conns,
             state,
             task,
+            _close: close,
         }
     }
 
@@ -271,7 +287,7 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
         req.headers_mut().insert(hyper::header::HOST, v);
     }
     if req.uri().path().eq_ignore_ascii_case("/embywebsocket") {
-        return Ok(websocket(&mut req));
+        return Ok(websocket(&mut req, state.closed.clone()));
     }
     if let Some(response) = emby(&mut req).await {
         return Ok(response);
@@ -396,6 +412,8 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
                 "report-to",
                 r#"{"group":"cf-nel","endpoints":[{"url":"https://a.nel.example.net/report"}]}"#,
             )
+            .header("reporting-endpoints", "default=\"https://a.example.net/r\"")
+            .header("speculation-rules", "\"/rules.json\"")
             .header("x-frame-options", "DENY")
             .header("set-cookie", "s=1; Path=/; Domain=origin.example.net")
             .header("set-cookie", "t=2; Path=/")
@@ -594,7 +612,7 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
 }
 
 /// Answers an upgrade request with 101 and echoes the upgraded stream.
-fn websocket(req: &mut Request<Incoming>) -> Response<ResBody> {
+fn websocket(req: &mut Request<Incoming>, closed: watch::Receiver<()>) -> Response<ResBody> {
     let wants = req
         .headers()
         .get("upgrade")
@@ -606,12 +624,16 @@ fn websocket(req: &mut Request<Incoming>) -> Response<ResBody> {
             .unwrap();
     }
     let upgrade = hyper::upgrade::on(req);
+    let mut closed = closed;
     tokio::spawn(async move {
         let Ok(upgraded) = upgrade.await else {
             return;
         };
         let (mut rd, mut wr) = tokio::io::split(TokioIo::new(upgraded));
-        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+        tokio::select! {
+            _ = tokio::io::copy(&mut rd, &mut wr) => {}
+            _ = closed.changed() => {}
+        }
     });
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -629,18 +651,27 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
+/// Decompresses one gzip stream that must span all of `data`.
 pub fn gunzip(data: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let mut out = Vec::new();
-    flate2::read::GzDecoder::new(data)
-        .read_to_end(&mut out)
-        .unwrap();
+    let mut dec = flate2::bufread::GzDecoder::new(data);
+    dec.read_to_end(&mut out).unwrap();
+    assert!(dec.into_inner().is_empty(), "bytes after the gzip stream");
     out
 }
 
+/// Decompresses one brotli stream that must span all of `data`.
 pub fn unbrotli(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     brotli::BrotliDecompress(&mut &data[..], &mut out).unwrap();
+    // The decoder ignores what follows the stream; a stream that still decodes without
+    // its last byte had bytes after it.
+    let short = &data[..data.len().saturating_sub(1)];
+    assert!(
+        brotli::BrotliDecompress(&mut &short[..], &mut Vec::new()).is_err(),
+        "bytes after the brotli stream"
+    );
     out
 }
 
@@ -976,5 +1007,48 @@ mod tests {
                 .enumerate()
                 .all(|(i, &b)| b == pattern_byte(i as u64))
         );
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    fn brotli(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut out = Vec::new();
+        let mut enc = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+        enc.write_all(data).unwrap();
+        drop(enc);
+        out
+    }
+
+    #[test]
+    fn decompressors_round_trip() {
+        assert_eq!(gunzip(&gzip(b"hello")), b"hello");
+        assert_eq!(unbrotli(&brotli(b"hello")), b"hello");
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes after the gzip stream")]
+    fn gunzip_refuses_trailing_bytes() {
+        let mut z = gzip(b"hello");
+        z.extend_from_slice(b"junk");
+        gunzip(&z);
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes after the brotli stream")]
+    fn unbrotli_refuses_trailing_bytes() {
+        let mut z = brotli(b"hello");
+        z.extend_from_slice(b"junk");
+        unbrotli(&z);
+    }
+
+    #[test]
+    #[should_panic]
+    fn gunzip_refuses_a_truncated_stream() {
+        let z = gzip(b"hello");
+        gunzip(&z[..z.len() - 3]);
     }
 }

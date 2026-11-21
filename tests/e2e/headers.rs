@@ -103,7 +103,13 @@ async fn response_policy_hides_reporting_and_moves_cookies() {
         let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto);
         let res = c.get(url(&w, "/__cdn")).send().await.unwrap();
         let h = res.headers();
-        for hidden in ["alt-svc", "nel", "report-to"] {
+        for hidden in [
+            "alt-svc",
+            "nel",
+            "report-to",
+            "reporting-endpoints",
+            "speculation-rules",
+        ] {
             assert!(h.get(hidden).is_none(), "{proto:?}: {hidden}");
         }
         for (name, value) in [
