@@ -12,15 +12,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # Superseded pull request runs are dropped; every commit on main keeps its result.
+  # A newer push to a pull request replaces its run; runs on main each have a group of
+  # their own, so none is cancelled and every commit there keeps its result (releases
+  # depend on it).
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  # No debug info: on this workspace a cold test build takes 72 s instead of 112 s and
-  # the target directory (the cache) 1.0 GB instead of 2.5 GB. Panic messages still
-  # name the file and line.
+  # No debug info: builds faster and makes the target directory, which is the cache,
+  # less than half the size. Panic messages still name the file and line.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
 
@@ -45,7 +46,8 @@ jobs:
       - run: cargo xtask ci
 
   # Releases are static musl builds, which the job above never makes; a dependency
-  # update or a libc call can break them without failing anything else.
+  # update or a libc call can break them without failing anything else. This is the
+  # release build with the same target, flags and static check, minus LTO for speed.
   musl:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -58,4 +60,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo build --locked --package piano --target x86_64-unknown-linux-musl
+      - run: cargo xtask dist
+        env:
+          CARGO_PROFILE_RELEASE_LTO: 'false'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'

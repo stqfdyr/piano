@@ -12,10 +12,11 @@ jobs:
   # can publish or sign. No cache: a release is built from scratch.
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # Up to 60 minutes waiting for ci, then the release build.
+    timeout-minutes: 90
     permissions:
       contents: read
-      checks: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -26,8 +27,9 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "piano") | .version')
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, workspace $version"; exit 1; }
-      # A release is cut only from a commit on main that passed ci there; the checks are
-      # not run again. A tag pushed right after a merge waits for that run.
+      # A release is cut only from a commit on main whose latest ci run there (push or
+      # weekly) passed; the checks are not run again. A tag pushed right after a merge
+      # waits for that run. A failed query counts as not finished yet.
       - name: Check the tag is on main and passed ci
         env:
           GH_TOKEN: ${{ github.token }}
@@ -37,16 +39,19 @@ jobs:
           identical | behind) ;;
           *) echo "$GITHUB_SHA is not on main ($status)"; exit 1 ;;
           esac
-          for _ in $(seq 60); do
-            conclusions=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=ci" \
-              -q '[.check_runs[] | .conclusion // "pending"] | join(" ")')
-            case " $conclusions " in
-            *" success "*) exit 0 ;;
-            *" pending "*) sleep 30 ;;
-            *) echo "ci on $GITHUB_SHA: ${conclusions:-not run}"; exit 1 ;;
+          for _ in $(seq 120); do
+            latest=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci --branch main \
+              --commit "$GITHUB_SHA" --limit 20 --json event,status,conclusion \
+              -q '[.[] | select(.event == "push" or .event == "schedule")][0]
+                  | if . == null then "none" elif .status != "completed" then "running"
+                    else .conclusion end' || echo unknown)
+            case $latest in
+            success) exit 0 ;;
+            none | running | unknown) sleep 30 ;;
+            *) echo "latest ci run on $GITHUB_SHA: $latest"; exit 1 ;;
             esac
           done
-          echo "ci on $GITHUB_SHA did not finish in 30 minutes"
+          echo "no finished ci run on $GITHUB_SHA after 60 minutes"
           exit 1
       - run: cargo xtask dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
