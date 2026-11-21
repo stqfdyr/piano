@@ -706,6 +706,22 @@ mod tests {
     }
 
     #[test]
+    fn status_json_keeps_the_lines_deploy_reads() {
+        // xtask/src/deploy.sh picks these lines out of `piano status --json` with sed,
+        // by their indentation; main.rs prints with to_string_pretty.
+        let mut s = status();
+        s.process.binary_sha256 = Some("0a1b".into());
+        let json = serde_json::to_string_pretty(&s).unwrap();
+        let lines: Vec<&str> = json.lines().collect();
+        assert!(lines.contains(&r#"  "pid": 1,"#), "{json}");
+        assert!(
+            lines.contains(&r#"    "binary_sha256": "0a1b""#)
+                || lines.contains(&r#"    "binary_sha256": "0a1b","#),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn upstream_failures_and_errors_come_first() {
         let mut s = status();
         let mut recent = Counts::default();
