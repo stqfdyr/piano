@@ -59,7 +59,7 @@ impl UaRules {
     pub fn new(rules: &[piano_config::UaRule]) -> Result<Self, UaRuleError> {
         rules
             .iter()
-            .map(|r| Ok((Regex::new(&r.pattern)?, HeaderValue::from_str(&r.set)?)))
+            .map(|r| Ok((r.regex()?, HeaderValue::from_str(&r.set)?)))
             .collect::<Result<Vec<_>, UaRuleError>>()
             .map(Self)
     }

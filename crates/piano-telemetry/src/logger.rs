@@ -225,7 +225,7 @@ pub fn set_level(level: LevelFilter) {
     log::set_max_level(level);
 }
 
-/// Parses a level name as used in the configuration and on the command line.
+/// Parses a level name given on the command line.
 pub fn parse_level(s: &str) -> Option<LevelFilter> {
     s.parse().ok()
 }
