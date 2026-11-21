@@ -34,6 +34,7 @@ use pingora_core::protocols::Digest;
 use pingora_core::protocols::http::compression::Algorithm;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
+use pingora_http::authority::{RawTargetAuthority, raw_target_authority};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, SHUTDOWN_ENDED, Session};
 use std::net::SocketAddr;
@@ -222,6 +223,25 @@ fn weaken_etag(resp: &mut ResponseHeader) -> Result<()> {
     }
     let weak = [b"W/", etag.as_bytes()].concat();
     resp.insert_header(ETAG, weak)
+}
+
+/// Rewrites an absolute-form request target (RFC 9112 §3.2.2) to origin-form, keeping
+/// the original bytes. Ingress already required `Host` to equal its authority, so
+/// nothing is lost, and mounts, image keys, redirects and upstream requests all see a
+/// path. False for any other target without a path, such as `*` or `x:/a`: its URI
+/// reads as `/` while the raw bytes would go upstream, so routing could not judge it.
+fn to_origin_form(req: &mut RequestHeader) -> Result<bool> {
+    let RawTargetAuthority::Absolute { path_and_query, .. } = raw_target_authority(req.raw_path())
+    else {
+        return Ok(req.raw_path().starts_with(b"/"));
+    };
+    let mut target = Vec::with_capacity(path_and_query.len() + 1);
+    if !path_and_query.starts_with(b"/") {
+        target.push(b'/');
+    }
+    target.extend_from_slice(path_and_query);
+    req.set_raw_path(&target)?;
+    Ok(true)
 }
 
 fn request_authority(req: &RequestHeader) -> Option<&[u8]> {
@@ -414,11 +434,14 @@ impl ProxyHttp for Relay {
             session.respond_error(421).await?;
             return Ok(true);
         }
+        if !to_origin_form(session.req_header_mut())? {
+            ctx.class = RouteClass::Local;
+            session.respond_error(400).await?;
+            return Ok(true);
+        }
         ctx.sites = Some(Arc::clone(&sites));
         ctx.site = index;
         let site = ctx.site()?;
-        let authority = request_authority(session.req_header()).unwrap_or_default();
-        let public = public_authority(&site.host, authority);
         let server_domains = site.policy.server_domains;
 
         let path = session.req_header().uri.path();
@@ -450,7 +473,8 @@ impl ProxyHttp for Relay {
             target,
             kind: TargetKind::Upstream,
         });
-        if matches!(ctx.class, RouteClass::Info | RouteClass::PlaybackInfo) {
+        // Whether the response body is collected for rewriting, and if so as a probe.
+        let probe = if matches!(ctx.class, RouteClass::Info | RouteClass::PlaybackInfo) {
             let mode = if route::is_server_domains(path) {
                 server_domains
             } else {
@@ -462,24 +486,22 @@ impl ProxyHttp for Relay {
                     respond_local(session, 404, b"").await?;
                     return Ok(true);
                 }
-                ServerDomains::Pass => {}
-                ServerDomains::Rewrite => {
-                    ctx.rewrite = Some(Rewrite {
-                        probe: false,
-                        authority: public,
-                        collecting: false,
-                        body: Vec::new(),
-                    });
-                    enable_compression(session);
-                }
+                ServerDomains::Pass => None,
+                ServerDomains::Rewrite => Some(false),
             }
         } else if ctx.class == RouteClass::Api
             && session.req_header().method == Method::GET
             && self.probe_due()
         {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(probe) = probe {
+            let authority = request_authority(session.req_header()).unwrap_or_default();
             ctx.rewrite = Some(Rewrite {
-                probe: true,
-                authority: public,
+                probe,
+                authority: public_authority(&ctx.site()?.host, authority),
                 collecting: false,
                 body: Vec::new(),
             });
@@ -823,6 +845,37 @@ impl ProxyHttp for Relay {
         }
         if self.access.enabled() {
             self.access.write(access_line(session, e, end, ctx));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_form_becomes_origin_form() {
+        for (target, want) in [
+            (
+                &b"https://media.example.com:8443/a/b?c=1"[..],
+                &b"/a/b?c=1"[..],
+            ),
+            (b"http://media.example.com?q=1", b"/?q=1"),
+            (b"https://media.example.com", b"/"),
+            (b"https://media.example.com/a\xffb", b"/a\xffb"),
+            (b"/already/origin?x", b"/already/origin?x"),
+        ] {
+            let mut req = RequestHeader::build("GET", target, None).unwrap();
+            assert!(to_origin_form(&mut req).unwrap());
+            assert_eq!(req.raw_path(), want, "{}", String::from_utf8_lossy(target));
+        }
+        for target in [&b"*"[..], b"x:/emby/System/Info", b"urn:x"] {
+            let mut req = RequestHeader::build("OPTIONS", target, None).unwrap();
+            assert!(
+                !to_origin_form(&mut req).unwrap(),
+                "{}",
+                String::from_utf8_lossy(target)
+            );
         }
     }
 }

@@ -157,6 +157,48 @@ async fn mounted_prefix_goes_to_its_host_without_the_prefix() {
 }
 
 #[tokio::test]
+async fn absolute_form_targets_are_relayed_by_their_path() {
+    let w = world("", "mounts = { \"/__m/vod1\" = \"vod1.example.net\" }").await;
+    let port = w.relay.addr.port();
+    for (path, host) in [
+        ("/__echo/a?b=1", ORIGIN_HOST),
+        ("/__m/vod1/__echo/a?b=1", VOD),
+    ] {
+        let mut tls = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
+        let req = format!(
+            "GET https://{SITE_HOST}:{port}{path} HTTP/1.1\r\nhost: {SITE_HOST}:{port}\r\nconnection: close\r\n\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(got.starts_with("HTTP/1.1 200"), "{path}: {got}");
+        assert!(got.contains("GET /__echo/a?b=1 "), "{path}: {got}");
+        let origin_port = w.origin.addr.port();
+        assert!(
+            got.contains(&format!("host: {host}:{origin_port}")),
+            "{path}: {got}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn targets_without_a_path_are_refused() {
+    let w = world("", "").await;
+    for target in ["x:/emby/System/Info", "*"] {
+        let mut tls = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
+        let req = format!("OPTIONS {target} HTTP/1.1\r\nhost: {SITE_HOST}\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let (head, _) = read_response(&mut tls).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{target}: {head}");
+    }
+    assert_eq!(w.origin.requests(), 0);
+}
+
+#[tokio::test]
 async fn renewed_certificate_files_are_picked_up() {
     let w = world("", "").await;
     assert!(!w.relay.refresh_certs().unwrap());
