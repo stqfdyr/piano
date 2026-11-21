@@ -257,7 +257,7 @@ async fn access_log_shows_each_hop_and_why_a_redirect_was_refused() {
 
     for (l, reason) in lines[1..]
         .iter()
-        .zip([EVIL, "scheme", "credentials: \"https://192.0.2.1\""])
+        .zip([EVIL, "scheme", "credentials: \"https://\""])
     {
         assert_eq!(l["end"], "redirect_refused", "{l}");
         assert_eq!(l["status"], 502, "{l}");
