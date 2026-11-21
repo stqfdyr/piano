@@ -205,7 +205,7 @@ impl Origin {
                 let conn_counter = Arc::clone(&conn_counter);
                 let state = shared.clone();
                 let mut closed = state.closed.clone();
-                tokio::spawn(async move {
+                let serve = async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
@@ -216,9 +216,13 @@ impl Origin {
                         handle(req, state.clone())
                     });
                     let builder = auto::Builder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection_with_upgrades(TokioIo::new(tls), service);
+                    let _ = builder
+                        .serve_connection_with_upgrades(TokioIo::new(tls), service)
+                        .await;
+                };
+                tokio::spawn(async move {
                     tokio::select! {
-                        _ = conn => {}
+                        () = serve => {}
                         _ = closed.changed() => {}
                     }
                 });
@@ -1043,6 +1047,13 @@ mod codec_tests {
         let mut z = brotli(b"hello");
         z.extend_from_slice(b"junk");
         unbrotli(&z);
+    }
+
+    #[test]
+    #[should_panic]
+    fn unbrotli_refuses_a_truncated_stream() {
+        let z = brotli(b"hello");
+        let _ = unbrotli(&z[..z.len() - 1]);
     }
 
     #[test]
