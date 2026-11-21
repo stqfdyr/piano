@@ -339,15 +339,26 @@ fn doctor(cli: &Cli, user: &str) -> ExitCode {
         let value = piano_ctl::call(socket, "status", STATUS_TIMEOUT).ok()?;
         serde_json::from_value(value).ok()
     });
-    let installed_sha256 = std::env::current_exe()
-        .ok()
-        .and_then(|exe| piano::doctor::file_sha256(&exe).ok());
+    // What `piano upgrade` would run: the file at the daemon's path, else this command's.
+    let installed = status
+        .as_ref()
+        .and_then(|s| piano::doctor::started_from(s.pid))
+        .map(|path| (path, true))
+        .or_else(|| std::env::current_exe().ok().map(|path| (path, false)))
+        .and_then(|(path, started_from)| {
+            let sha256 = piano::doctor::file_sha256(&path).ok()?;
+            Some(piano::doctor::Installed {
+                path,
+                sha256,
+                started_from,
+            })
+        });
     let input = piano::doctor::Input {
         config: &cli.config,
         status: status.as_ref(),
         socket: socket.as_deref(),
         user,
-        installed_sha256,
+        installed,
         resolver: Resolver::system(),
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -374,12 +385,8 @@ fn doctor(cli: &Cli, user: &str) -> ExitCode {
     } else {
         print!("{}", render::doctor(&report, render::color(cli.no_color)));
     }
-    let config_failed = report
-        .checks
-        .first()
-        .is_some_and(|c| c.group == "configuration" && c.level == Level::Error);
     match report.worst() {
-        _ if config_failed => ExitCode::from(exit::CONFIG),
+        _ if report.config_failed() => ExitCode::from(exit::CONFIG),
         Level::Error => ExitCode::from(exit::RUNTIME),
         Level::Warn => ExitCode::from(exit::WARNINGS),
         Level::Ok | Level::Skip => ExitCode::SUCCESS,

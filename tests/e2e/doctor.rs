@@ -1,6 +1,6 @@
 //! `piano doctor` against a relay running in this process.
 
-use piano::doctor::{Check, Input, Level, Report, run};
+use piano::doctor::{Check, Input, Installed, Level, Report, run};
 use piano_ctl::proto::Status;
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
@@ -16,7 +16,11 @@ async fn doctor(relay: &Relay, status: Option<&Status>, installed: Option<&str>)
         status,
         socket: Some(&relay.control_socket()),
         user: "nobody",
-        installed_sha256: installed.map(str::to_owned),
+        installed: installed.map(|sha256| Installed {
+            path: "/usr/local/bin/piano".into(),
+            sha256: sha256.to_owned(),
+            started_from: true,
+        }),
         resolver: Resolver::system().with_override(ORIGIN_HOST, &[IpAddr::from([127, 0, 0, 1])]),
     };
     tokio::time::timeout(Duration::from_secs(60), run(&input))
@@ -44,12 +48,14 @@ async fn a_healthy_relay_and_what_changes_after_it_loaded() {
     let leaf = ca.leaf(&[SITE_HOST]);
     let mut setup = RelaySetup::new(&leaf, &roots, origin.addr.port());
     setup.control = true;
+    setup.site_toml = "follow = [\"*.cdn.example.net\"]\n";
     let relay = Relay::start(&setup);
     let s = status(&relay);
     let running = s.process.binary_sha256.clone();
 
     let r = doctor(&relay, Some(&s), running.as_deref()).await;
-    assert_eq!(r.worst(), Level::Ok, "{r:#?}");
+    // Only the wildcard is not checked.
+    assert_eq!(r.worst(), Level::Skip, "{r:#?}");
     assert!(
         r.checks
             .iter()
@@ -65,9 +71,15 @@ async fn a_healthy_relay_and_what_changes_after_it_loaded() {
         find(&r, "listening", "127.0.0.1").detail,
         format!("served by pid {}", s.pid)
     );
+    assert!(!r.config_failed());
     let up = find(&r, "upstreams", ORIGIN_HOST);
     assert_eq!(up.level, Level::Ok);
     assert!(up.detail.starts_with("127.0.0.1 in "), "{}", up.detail);
+    // A wildcard is listed as not checked.
+    assert_eq!(
+        find(&r, "upstreams", "*.cdn.example.net").level,
+        Level::Skip
+    );
 
     // The file changes after loading, and another binary is installed.
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -76,10 +88,10 @@ async fn a_healthy_relay_and_what_changes_after_it_loaded() {
     assert_eq!(r.worst(), Level::Warn, "{r:#?}");
     let changed = find(&r, "daemon", ".toml");
     assert!(changed.detail.contains("piano reload"), "{changed:?}");
-    assert!(
-        find(&r, "daemon", "binary")
-            .detail
-            .contains("piano upgrade")
+    assert_eq!(
+        find(&r, "daemon", "binary").detail,
+        "/usr/local/bin/piano is not the binary running; piano upgrade switches to it \
+         without dropping streams"
     );
 }
 
@@ -122,4 +134,5 @@ async fn a_broken_configuration_is_the_only_check() {
     let r = doctor(&relay, None, None).await;
     assert_eq!(r.checks.len(), 1, "{r:#?}");
     assert_eq!(r.checks[0].level, Level::Error);
+    assert!(r.config_failed());
 }
