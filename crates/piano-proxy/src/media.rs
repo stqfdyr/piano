@@ -165,6 +165,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
 pub(crate) fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
     let mut up = req.clone();
     up.set_version(Version::HTTP_11);
+    debug_assert!(req.raw_path().starts_with(b"/"));
     up.set_raw_path(req.raw_path())?;
     let nominated: Vec<HeaderName> = req
         .headers

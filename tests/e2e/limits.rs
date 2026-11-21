@@ -186,6 +186,19 @@ async fn absolute_form_targets_are_relayed_by_their_path() {
 }
 
 #[tokio::test]
+async fn targets_without_a_path_are_refused() {
+    let w = world("", "").await;
+    for target in ["x:/emby/System/Info", "*"] {
+        let mut tls = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
+        let req = format!("OPTIONS {target} HTTP/1.1\r\nhost: {SITE_HOST}\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let (head, _) = read_response(&mut tls).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{target}: {head}");
+    }
+    assert_eq!(w.origin.requests(), 0);
+}
+
+#[tokio::test]
 async fn renewed_certificate_files_are_picked_up() {
     let w = world("", "").await;
     assert!(!w.relay.refresh_certs().unwrap());

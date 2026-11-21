@@ -228,18 +228,20 @@ fn weaken_etag(resp: &mut ResponseHeader) -> Result<()> {
 /// Rewrites an absolute-form request target (RFC 9112 §3.2.2) to origin-form, keeping
 /// the original bytes. Ingress already required `Host` to equal its authority, so
 /// nothing is lost, and mounts, image keys, redirects and upstream requests all see a
-/// path.
-fn to_origin_form(req: &mut RequestHeader) -> Result<()> {
+/// path. False for any other target without a path, such as `*` or `x:/a`: its URI
+/// reads as `/` while the raw bytes would go upstream, so routing could not judge it.
+fn to_origin_form(req: &mut RequestHeader) -> Result<bool> {
     let RawTargetAuthority::Absolute { path_and_query, .. } = raw_target_authority(req.raw_path())
     else {
-        return Ok(());
+        return Ok(req.raw_path().starts_with(b"/"));
     };
     let mut target = Vec::with_capacity(path_and_query.len() + 1);
     if !path_and_query.starts_with(b"/") {
         target.push(b'/');
     }
     target.extend_from_slice(path_and_query);
-    req.set_raw_path(&target)
+    req.set_raw_path(&target)?;
+    Ok(true)
 }
 
 fn request_authority(req: &RequestHeader) -> Option<&[u8]> {
@@ -432,7 +434,11 @@ impl ProxyHttp for Relay {
             session.respond_error(421).await?;
             return Ok(true);
         }
-        to_origin_form(session.req_header_mut())?;
+        if !to_origin_form(session.req_header_mut())? {
+            ctx.class = RouteClass::Local;
+            session.respond_error(400).await?;
+            return Ok(true);
+        }
         ctx.sites = Some(Arc::clone(&sites));
         ctx.site = index;
         let site = ctx.site()?;
@@ -860,8 +866,16 @@ mod tests {
             (b"/already/origin?x", b"/already/origin?x"),
         ] {
             let mut req = RequestHeader::build("GET", target, None).unwrap();
-            to_origin_form(&mut req).unwrap();
+            assert!(to_origin_form(&mut req).unwrap());
             assert_eq!(req.raw_path(), want, "{}", String::from_utf8_lossy(target));
+        }
+        for target in [&b"*"[..], b"x:/emby/System/Info", b"urn:x"] {
+            let mut req = RequestHeader::build("OPTIONS", target, None).unwrap();
+            assert!(
+                !to_origin_form(&mut req).unwrap(),
+                "{}",
+                String::from_utf8_lossy(target)
+            );
         }
     }
 }
