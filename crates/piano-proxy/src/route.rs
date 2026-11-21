@@ -245,6 +245,24 @@ mod tests {
     }
 
     #[test]
+    fn times_what_a_client_waits_on() {
+        let (get, post) = (Method::GET, Method::POST);
+        for (class, get_ttfb, post_ttfb) in [
+            (Media, Some(Ttfb::Media), Some(Ttfb::Media)),
+            (Image, Some(Ttfb::Image), Some(Ttfb::Image)),
+            (PlaybackInfo, Some(Ttfb::Browse), Some(Ttfb::Browse)),
+            (Info, Some(Ttfb::Browse), Some(Ttfb::Browse)),
+            (Api, Some(Ttfb::Browse), None),
+            (Subtitle, None, None),
+            (Socket, None, None),
+            (Local, None, None),
+        ] {
+            assert_eq!(class.ttfb(&get), get_ttfb, "{class:?} GET");
+            assert_eq!(class.ttfb(&post), post_ttfb, "{class:?} POST");
+        }
+    }
+
+    #[test]
     fn server_domains_path() {
         assert!(is_server_domains("/emby/System/Ext/ServerDomains"));
         assert!(is_server_domains("/system/ext/serverdomains/"));

@@ -821,7 +821,6 @@ impl ProxyHttp for Relay {
             Ok(site) => &site.counters,
             Err(_) => &self.unrouted,
         };
-        // Bytes first: a reader that sees the request counted sees its bytes too.
         if !ctx.sent_counted {
             let sent = session.as_downstream().body_bytes_sent() as u64;
             counters.add_sent(ctx.class.kind(), sent);
