@@ -18,7 +18,7 @@ use piano_edge::tls::{CertStore, SniRecorder, SniTable};
 use piano_media::Streams;
 use piano_proxy::{Images, MAX_ATTEMPTS, Policy, Relay, Site, SiteError, Sites, Stop};
 use piano_telemetry::{AccessLog, Metrics};
-use piano_upstream::{Origin, PeerOptions, Resolver};
+use piano_upstream::{Addrs, Origin, PeerOptions, Resolver};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::listeners::tls::TlsSettings;
@@ -523,13 +523,13 @@ impl Live {
     /// changed; an upstream whose lookup fails keeps the addresses it has. Blocks on
     /// the lookups.
     pub fn refresh_origins(&self) {
-        let sites = self.sites.load();
-        let mut done: Vec<(&str, u16)> = Vec::new();
+        let sites = self.sites.load_full();
+        let mut done: Vec<*const Addrs> = Vec::new();
         for origin in sites.iter().map(|s| &s.origin) {
-            if done.contains(&(origin.host.as_str(), origin.port)) {
+            if done.contains(&Arc::as_ptr(&origin.addrs)) {
                 continue;
             }
-            done.push((&origin.host, origin.port));
+            done.push(Arc::as_ptr(&origin.addrs));
             match self.resolver.resolve_blocking(&origin.host, origin.port) {
                 Ok(fresh) => {
                     if let Some((old, new)) = origin.addrs.update(fresh) {
@@ -765,8 +765,10 @@ impl Live {
     }
 }
 
-/// Builds the site table. An origin already in `current` keeps its addresses and the
-/// one in use, so a reload does not move its pooled connections to a new bucket.
+/// Builds the site table. Sites with the same upstream share its addresses, so one
+/// site's failover and every refresh reach all of them; an origin already in `current`
+/// keeps its addresses and the one in use, so a reload does not move its pooled
+/// connections to a new bucket.
 fn build_sites(
     config: &Config,
     resolver: &Resolver,
@@ -780,12 +782,13 @@ fn build_sites(
             .upstream_url
             .as_ref()
             .ok_or_else(|| Error::Unvalidated(site.name.clone()))?;
-        let known = current.and_then(|c| {
-            c.iter()
-                .map(|s| &s.origin)
-                .find(|o| o.host == url.host && o.port == url.port)
-                .map(|o| Arc::clone(&o.addrs))
-        });
+        let same = |o: &&Origin| o.host == url.host && o.port == url.port;
+        let known = sites
+            .iter()
+            .map(|s: &Site| &s.origin)
+            .find(same)
+            .or_else(|| current.and_then(|c| c.iter().map(|s| &s.origin).find(same)))
+            .map(|o| Arc::clone(&o.addrs));
         let addrs = match known {
             Some(a) => a,
             None => Arc::new(resolver.resolve_blocking(&url.host, url.port)?),
@@ -851,6 +854,52 @@ mod tests {
         assert_eq!(open_files_needed(&config("")), 1024 * 2 + 3 * 128 + 64);
         let two = config(r#"listen = ["192.0.2.1:443", "198.51.100.1:443"]"#);
         assert_eq!(open_files_needed(&two), 2 * 1024 * 2 + 3 * 128 + 64);
+    }
+
+    #[test]
+    fn sites_with_one_upstream_share_its_addresses() {
+        let config = piano_config::parse(
+            r#"
+            [tls]
+            cert = "/etc/piano/fullchain.pem"
+            key  = "/etc/piano/privkey.pem"
+
+            [access]
+            allow = ["192.0.2.7"]
+
+            [[site]]
+            host     = "a.example.com"
+            upstream = "https://emby.example.net"
+
+            [[site]]
+            host     = "b.example.com"
+            upstream = "https://emby.example.net"
+
+            [[site]]
+            host     = "c.example.com"
+            upstream = "https://other.example.net"
+            "#,
+        )
+        .unwrap();
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        let resolver = Resolver::system()
+            .with_override("emby.example.net", &[ip("192.0.2.1"), ip("192.0.2.2")])
+            .with_override("other.example.net", &[ip("192.0.2.3")]);
+        let metrics = Metrics::new();
+        let sites = build_sites(&config, &resolver, None, &metrics).unwrap();
+        let addrs: Vec<&Arc<Addrs>> = sites.iter().map(|s| &s.origin.addrs).collect();
+        assert!(Arc::ptr_eq(addrs[0], addrs[1]));
+        assert!(!Arc::ptr_eq(addrs[0], addrs[2]));
+        // A failover seen by one site is seen by the other.
+        let sa = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+        addrs[0].failed(sa("192.0.2.1:443"));
+        assert_eq!(addrs[1].current(), sa("192.0.2.2:443"));
+        // A reload keeps the addresses of the upstreams it already knows.
+        let again = build_sites(&config, &resolver, Some(&sites), &metrics).unwrap();
+        assert!(Arc::ptr_eq(
+            &again.iter().nth(1).unwrap().origin.addrs,
+            addrs[0]
+        ));
     }
 
     #[test]

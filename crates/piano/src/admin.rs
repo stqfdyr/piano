@@ -121,10 +121,7 @@ impl Admin {
                 ));
             }
             let level = config.log.level;
-            let fixed = live.apply(&config)?;
-            // Upstreams kept from the running configuration are looked up again too.
-            live.refresh_origins();
-            Ok::<_, crate::Error>((fixed, warnings, level))
+            live.apply(&config).map(|fixed| (fixed, warnings, level))
         })
         .await;
         let now = SystemTime::now();
@@ -140,6 +137,10 @@ impl Admin {
                     warn!("restart needed for: {}", fixed.join(", "));
                 }
                 info!("configuration reloaded from {}", self.path.display());
+                // Upstreams kept from the running configuration are looked up again in the
+                // background, so a slow resolver does not hold up the reply.
+                let live = Arc::clone(&self.live);
+                drop(tokio::task::spawn_blocking(move || live.refresh_origins()));
                 let mut state = self.state();
                 state.loaded = now;
                 state.restart_needed.clone_from(&fixed);
