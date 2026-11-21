@@ -328,7 +328,7 @@ pub fn build_with(
     let client_tls = piano_upstream::tls::client_config(&config.upstream.extra_roots)?;
     let metrics = Arc::new(Metrics::new());
     // A fresh start serves the sites whose upstream resolves and retries the others; an
-    // upgrade fails instead, leaving the old process serving with the addresses it has.
+    // upgrade fails instead and the old process goes on serving.
     let sites = Arc::new(ArcSwap::from_pointee(build_sites(
         config,
         &resolver,
@@ -546,10 +546,21 @@ impl Live {
     /// changed; an upstream whose lookup fails keeps the addresses it has. Blocks on
     /// the lookups.
     pub fn refresh_origins(&self) {
+        self.look_up(false);
+    }
+
+    /// Like [`Self::refresh_origins`] for the upstreams without addresses only.
+    pub fn resolve_unresolved(&self) {
+        self.look_up(true);
+    }
+
+    fn look_up(&self, unresolved_only: bool) {
         let sites = self.sites.load_full();
         let mut done: Vec<*const Addrs> = Vec::new();
         for origin in sites.iter().map(|s| &s.origin) {
-            if done.contains(&Arc::as_ptr(&origin.addrs)) {
+            if done.contains(&Arc::as_ptr(&origin.addrs))
+                || (unresolved_only && !origin.addrs.is_empty())
+            {
                 continue;
             }
             done.push(Arc::as_ptr(&origin.addrs));

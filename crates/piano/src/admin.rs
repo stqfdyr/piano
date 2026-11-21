@@ -20,8 +20,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) const CERT_WARN_DAYS: i64 = 14;
 /// Few enough days left that clients will soon refuse the certificate.
 pub(crate) const CERT_ERROR_DAYS: i64 = 3;
-/// What status shows as the address of an upstream that does not resolve yet.
-const UNRESOLVED: &str = "unresolved";
 /// Share of a limit in use from which status warns.
 const NEAR_LIMIT_PERCENT: u64 = 80;
 
@@ -314,11 +312,7 @@ impl Admin {
                     name: s.name.clone(),
                     host: s.host.clone(),
                     upstream: format!("{}:{}", s.origin.host, s.origin.port),
-                    address: s
-                        .origin
-                        .addrs
-                        .current()
-                        .map_or_else(|| UNRESOLVED.to_owned(), |a| a.to_string()),
+                    address: s.origin.addrs.current().map(|a| a.to_string()),
                     traffic: Traffic {
                         total: counts
                             .map(|c| wire(&c.total))
@@ -372,18 +366,30 @@ impl Admin {
         };
         drop(state);
         status.findings = findings(&status, unix(now));
-        for s in live
-            .sites
-            .load()
-            .iter()
-            .filter(|s| s.origin.addrs.is_empty())
-        {
+        // Sites with one upstream share its address table: one finding per table.
+        let sites = live.sites.load();
+        let mut unresolved: Vec<&piano_upstream::Origin> = Vec::new();
+        for s in sites.iter().filter(|s| s.origin.addrs.is_empty()) {
+            if !unresolved
+                .iter()
+                .any(|o| Arc::ptr_eq(&o.addrs, &s.origin.addrs))
+            {
+                unresolved.push(&s.origin);
+            }
+        }
+        for origin in unresolved {
+            let names: Vec<&str> = sites
+                .iter()
+                .filter(|s| Arc::ptr_eq(&s.origin.addrs, &origin.addrs))
+                .map(|s| s.name.as_str())
+                .collect();
             status.findings.push(finding(
                 Level::Error,
                 "upstream_unresolved",
                 format!(
-                    "{}: upstream {} has not resolved since startup; its requests fail",
-                    s.name, s.origin.host
+                    "{}: upstream {} has not resolved since startup; requests fail",
+                    names.join(", "),
+                    origin.host
                 ),
                 Some(&format!(
                     "the lookup is retried every {} s; piano doctor shows why it fails",
@@ -688,7 +694,7 @@ mod tests {
                 name: "a".into(),
                 host: "a.example.com".into(),
                 upstream: "emby.example.net:443".into(),
-                address: "192.0.2.1:443".into(),
+                address: Some("192.0.2.1:443".into()),
                 ttfb: latencies(None),
                 traffic: Traffic {
                     total: wire(&Counts::default()),

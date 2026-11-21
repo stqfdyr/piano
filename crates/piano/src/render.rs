@@ -326,8 +326,8 @@ pub fn status(s: &Status, color: Color) -> String {
         .map(|x| {
             let ip = x
                 .address
-                .rsplit_once(':')
-                .map_or(x.address.as_str(), |(ip, _)| ip);
+                .as_deref()
+                .map_or("unresolved", |a| a.rsplit_once(':').map_or(a, |(ip, _)| ip));
             (
                 x.name.as_str(),
                 &x.traffic.recent,

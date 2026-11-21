@@ -54,12 +54,18 @@ impl Reloader {
 
     /// Starts looking the upstreams up again unless the previous round still runs. Not
     /// awaited: a slow resolver must not hold up signals and the minute tick.
-    fn refresh_origins(&self, running: &mut Option<JoinHandle<()>>) {
+    fn refresh_origins(&self, running: &mut Option<JoinHandle<()>>, unresolved_only: bool) {
         if running.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
         let live = Arc::clone(self.admin.live());
-        *running = Some(tokio::task::spawn_blocking(move || live.refresh_origins()));
+        *running = Some(tokio::task::spawn_blocking(move || {
+            if unresolved_only {
+                live.resolve_unresolved();
+            } else {
+                live.refresh_origins();
+            }
+        }));
     }
 
     async fn record_traffic(&self) {
@@ -142,11 +148,11 @@ impl ServiceWithDependents for Reloader {
                     self.record_traffic().await;
                 }
                 _ = certs.tick() => self.refresh_certs().await,
-                _ = origins.tick() => self.refresh_origins(&mut refreshing),
+                _ = origins.tick() => self.refresh_origins(&mut refreshing, false),
                 _ = retry.tick(), if unresolved => {
                     unresolved = self.admin.live().unresolved_origins();
                     if unresolved {
-                        self.refresh_origins(&mut refreshing);
+                        self.refresh_origins(&mut refreshing, true);
                     }
                 }
                 _ = shutdown.changed() => break,
