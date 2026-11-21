@@ -312,6 +312,12 @@ impl Origin {
         )
     }
 
+    /// Logouts answered.
+    pub fn logouts(&self) -> usize {
+        let seqs = self.state.seqs.lock().unwrap();
+        seqs.get("logout").copied().unwrap_or(0)
+    }
+
     /// Redirects answered for scripted media `key`.
     pub fn redirects(&self, key: &str) -> usize {
         let seqs = self.state.seqs.lock().unwrap();
@@ -358,7 +364,7 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
     if req.uri().path().eq_ignore_ascii_case("/embywebsocket") {
         return Ok(websocket(&mut req, state.closed.clone()));
     }
-    if let Some(response) = emby(&mut req).await {
+    if let Some(response) = emby(&mut req, &state).await {
         return Ok(response);
     }
     if let Some(key) = media_key(req.uri().path()) {
@@ -498,7 +504,7 @@ async fn handle(mut req: Request<Incoming>, state: State) -> Result<Response<Res
 }
 
 /// The Emby API routes for `piano probe`; `None` for other paths.
-async fn emby(req: &mut Request<Incoming>) -> Option<Response<ResBody>> {
+async fn emby(req: &mut Request<Incoming>, state: &State) -> Option<Response<ResBody>> {
     let path = req.uri().path().to_owned();
     let lower = path.to_ascii_lowercase();
     let users = format!("/emby/users/{PROBE_USER_ID}/");
@@ -559,6 +565,12 @@ async fn emby(req: &mut Request<Incoming>) -> Option<Response<ResBody>> {
         );
     }
     if lower == "/emby/sessions/logout" {
+        *state
+            .seqs
+            .lock()
+            .unwrap()
+            .entry("logout".into())
+            .or_default() += 1;
         return Some(
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
