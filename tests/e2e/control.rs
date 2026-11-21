@@ -246,3 +246,38 @@ async fn live_lists_a_stalled_stream_and_times_first_bytes() {
         s.sites[0].traffic.total.bytes_sent
     );
 }
+
+#[tokio::test]
+async fn a_stream_whose_client_stops_reading_is_held_by_the_client() {
+    for proto in [Proto::H1, Proto::H2] {
+        let w = world().await;
+        // More than the socket buffers on both sides take.
+        let url = format!(
+            "https://{SITE_HOST}:{}/videos/held/stream.mkv?len=67108864",
+            w.relay.addr.port()
+        );
+        let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto);
+        let res = tokio::time::timeout(Duration::from_secs(10), c.get(url).send())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        // Past the 3 s without progress at which a stalled upstream gets a second
+        // request; a client that holds the stream must not cause one.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stream = loop {
+            let l: Live = ask(w.relay.control_socket(), "live").await;
+            if let Some(s) = l.streams.first()
+                && s.idle_ms >= 4000
+            {
+                break s.clone();
+            }
+            assert!(Instant::now() < deadline, "{proto:?} {l:#?}");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        assert!(stream.client_holds, "{proto:?} {stream:#?}");
+        assert!(stream.sent > 0, "{proto:?} {stream:#?}");
+        assert_eq!((stream.hedges, stream.in_flight), (0, 1), "{proto:?}");
+        drop(res);
+    }
+}

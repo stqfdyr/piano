@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, Wrap};
 
 const DIM: Color = Color::Indexed(244);
 const FAINT: Color = Color::Indexed(238);
@@ -33,6 +33,8 @@ pub struct Screen<'a> {
     pub view: Option<&'a View>,
     pub series: &'a [u64],
     pub problems: &'a [Problem],
+    /// Why the access log cannot be read.
+    pub log_error: Option<&'a str>,
     /// Local time of the last reply.
     pub clock: String,
     pub full_addresses: bool,
@@ -209,7 +211,7 @@ pub fn draw(f: &mut Frame<'_>, s: &Screen<'_>) {
         ])
         .areas(bottom);
         upstreams(f, l, &v.budgets, &v.images);
-        problems(f, r, s.problems, v.access_log.is_some());
+        problems(f, r, s, v.access_log.is_some());
     } else {
         let budgets = (v.budgets.len().max(1) + 3) as u16;
         let [l, _, r] = Layout::vertical([
@@ -219,7 +221,7 @@ pub fn draw(f: &mut Frame<'_>, s: &Screen<'_>) {
         ])
         .areas(bottom);
         upstreams(f, l, &v.budgets, &v.images);
-        problems(f, r, s.problems, v.access_log.is_some());
+        problems(f, r, s, v.access_log.is_some());
     }
     footer(f, foot, s);
 }
@@ -625,11 +627,20 @@ fn folded(list: &[Problem]) -> Vec<(&Problem, usize)> {
     out
 }
 
-fn problems(f: &mut Frame<'_>, area: Rect, list: &[Problem], log_on: bool) {
+fn problems(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>, log_on: bool) {
+    let list = s.problems;
     let [title, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     section(f, title, "Problems", "from the access log");
     if !log_on {
         f.render_widget(Paragraph::new(dim("  the access log is off")), body);
+        return;
+    }
+    if let Some(e) = s.log_error {
+        // Wrapped: the reason comes last.
+        f.render_widget(
+            Paragraph::new(colored(format!("  {e}"), WARN)).wrap(Wrap { trim: false }),
+            body,
+        );
         return;
     }
     if list.is_empty() {

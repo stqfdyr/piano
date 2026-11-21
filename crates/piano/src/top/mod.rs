@@ -31,7 +31,10 @@ struct State {
     history: History,
     view: Option<View>,
     problems: Problems,
-    log: Option<(String, Follower)>,
+    /// The access log the daemon writes, and the reader, or why it cannot be read.
+    log: Option<(String, Result<Follower, String>)>,
+    /// Why the last read of an open log failed; cleared by the next good one.
+    log_read: Option<String>,
     clock: String,
     error: Option<String>,
     paused: bool,
@@ -39,6 +42,29 @@ struct State {
 }
 
 impl State {
+    fn new() -> Self {
+        Self {
+            history: History::default(),
+            view: None,
+            problems: Problems::default(),
+            log: None,
+            log_read: None,
+            clock: String::new(),
+            error: None,
+            paused: false,
+            full: false,
+        }
+    }
+
+    fn log_error(&self) -> Option<String> {
+        match (&self.log, &self.log_read) {
+            (Some((path, Err(e))), _) | (Some((path, Ok(_))), Some(e)) => {
+                Some(format!("cannot read {path}: {e}"))
+            }
+            _ => None,
+        }
+    }
+
     fn refresh(&mut self, opts: &Options) {
         match ask(&opts.socket, opts.interval.max(Duration::from_secs(2))) {
             Ok(live) => {
@@ -50,35 +76,44 @@ impl State {
             }
             Err(e) => self.error = Some(e),
         }
-        if let Some((_, log)) = &mut self.log {
+        if let Some((_, Ok(log))) = &mut self.log {
             let problems = &mut self.problems;
-            // A log that cannot be read leaves the list as it is.
-            let _ = log.poll(|l| {
+            let read = log.poll(|l| {
                 problems.add(l);
                 Ok(())
             });
+            self.log_read = read.err().map(|e| e.to_string());
         }
     }
 
-    /// Opens the access log the daemon writes, again when that changes.
+    /// Opens the access log the daemon writes, again when that changes, and tries
+    /// again at each refresh while it cannot be read.
     fn follow(&mut self, path: Option<&str>) {
-        if self.log.as_ref().map(|(p, _)| p.as_str()) == path {
+        let Some(path) = path else {
+            self.log = None;
+            self.log_read = None;
             return;
+        };
+        match &self.log {
+            Some((p, Ok(_))) if p == path => return,
+            Some((p, _)) if p == path => {}
+            // Problems of another file are not this one's.
+            _ => self.problems = Problems::default(),
         }
-        self.log = path.and_then(|p| {
-            Follower::open(Path::new(p), Some(BACKLOG))
-                .ok()
-                .map(|f| (p.to_owned(), f))
-        });
+        self.log_read = None;
+        let log = Follower::open(Path::new(path), Some(BACKLOG)).map_err(|e| e.to_string());
+        self.log = Some((path.to_owned(), log));
     }
 
     fn draw(&self, terminal: &mut DefaultTerminal, opts: &Options) -> io::Result<()> {
         let series = self.history.sent_series();
         let problems: Vec<_> = self.problems.list.iter().cloned().collect();
+        let log_error = self.log_error();
         let screen = view::Screen {
             view: self.view.as_ref(),
             series: &series,
             problems: &problems,
+            log_error: log_error.as_deref(),
             clock: self.clock.clone(),
             full_addresses: self.full,
             paused: self.paused,
@@ -99,16 +134,7 @@ pub fn run(opts: &Options) -> io::Result<()> {
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, opts: &Options) -> io::Result<()> {
-    let mut s = State {
-        history: History::default(),
-        view: None,
-        problems: Problems::default(),
-        log: None,
-        clock: String::new(),
-        error: None,
-        paused: false,
-        full: false,
-    };
+    let mut s = State::new();
     s.draw(terminal, opts)?;
     loop {
         let due = Instant::now() + opts.interval;
@@ -141,6 +167,7 @@ fn event_loop(terminal: &mut DefaultTerminal, opts: &Options) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use super::State;
     use super::model::{History, Problems, View};
     use super::view::{Screen, draw};
     use piano_ctl::proto::Live;
@@ -171,6 +198,10 @@ mod tests {
     }
 
     fn render(width: u16, height: u16, full: bool) -> String {
+        render_with(width, height, full, None)
+    }
+
+    fn render_with(width: u16, height: u16, full: bool, log_error: Option<&str>) -> String {
         let mut h = History::default();
         h.push(live());
         let v = View::of(&h).unwrap();
@@ -181,6 +212,7 @@ mod tests {
             view: Some(&v),
             series: &[1, 5, 3],
             problems: &list,
+            log_error,
             clock: "12:03:11".into(),
             full_addresses: full,
             paused: false,
@@ -228,6 +260,46 @@ mod tests {
     }
 
     #[test]
+    fn an_access_log_that_cannot_be_read_is_said_so() {
+        let mut s = State::new();
+        let dir = std::env::temp_dir().join(format!("piano-top-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("access.log");
+        let path = path.to_str().unwrap();
+        s.follow(Some(path));
+        let e = s.log_error().unwrap();
+        assert!(e.starts_with(&format!("cannot read {path}: ")), "{e}");
+        // Tried again at the next refresh, and gone once the file is there.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(path, "").unwrap();
+        s.follow(Some(path));
+        assert_eq!(s.log_error(), None);
+        s.log_read = Some("Input/output error".into());
+        assert_eq!(
+            s.log_error().as_deref(),
+            Some(format!("cannot read {path}: Input/output error").as_str())
+        );
+        s.problems.add(
+            r#"{"ts":"2026-11-20T08:01:02.345Z","site":"a","status":502,"path":"/x","end":"ok"}"#,
+        );
+        s.follow(Some(path));
+        assert_eq!(s.problems.list.len(), 1);
+        s.follow(Some("/elsewhere/access.log"));
+        assert!(s.problems.list.is_empty());
+        assert!(
+            s.log_error()
+                .unwrap()
+                .starts_with("cannot read /elsewhere/")
+        );
+        s.follow(None);
+        assert!(s.log.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+        let out = render_with(160, 30, false, Some("cannot read /x: denied"));
+        assert!(out.contains("cannot read /x: denied"), "{out}");
+        assert!(!out.contains("upstream_timeout"), "{out}");
+    }
+
+    #[test]
     fn a_narrow_terminal_still_draws() {
         let out = render(80, 24, false);
         assert!(out.contains("Streams"), "{out}");
@@ -243,6 +315,7 @@ mod tests {
             view: None,
             series: &[],
             problems: &[],
+            log_error: None,
             clock: String::new(),
             full_addresses: false,
             paused: false,
