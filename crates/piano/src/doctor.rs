@@ -79,15 +79,17 @@ pub struct Input<'a> {
     pub socket: Option<&'a Path>,
     /// The service user when no daemon runs.
     pub user: &'a str,
-    /// The binary on disk to compare with the running one.
-    pub installed: Option<Installed>,
+    /// Binaries on disk to compare with the running one: the file at the daemon's path,
+    /// and this command's when it is another file.
+    pub installed: Vec<Installed>,
     pub resolver: Resolver,
 }
 
 /// A binary on disk.
 pub struct Installed {
     pub path: PathBuf,
-    pub sha256: String,
+    /// Its sha256, or why it cannot be read.
+    pub sha256: Result<String, String>,
     /// `path` is where the daemon was started from, which `piano upgrade` runs again.
     pub started_from: bool,
 }
@@ -128,6 +130,7 @@ pub async fn run(input: &Input<'_>) -> Report {
     daemon(&mut out, &config, input);
     listening(&mut out, &config, input.status);
     upstreams(&mut out, &config, &input.resolver).await;
+    wildcards(&mut out, &config);
     out.report()
 }
 
@@ -373,22 +376,62 @@ fn access(out: &mut Checks, config: &Config, input: &Input<'_>) {
             }
         });
         match result {
-            Ok(()) if systemd && outside_service_dirs(dir) => out.push(
-                group,
-                Level::Ok,
-                what,
-                "under systemd the service unit must also list it in ReadWritePaths=".into(),
-            ),
-            Ok(()) => out.push(group, Level::Ok, what, String::new()),
+            Ok(()) => {
+                let hint = sandbox_hint(dir).filter(|_| systemd).unwrap_or_default();
+                out.push(group, Level::Ok, what, hint.into());
+            }
             Err(e) => out.push(group, Level::Error, what, e),
         }
     }
 }
 
-/// Whether `dir` is outside the directories the service unit makes writable, where its
-/// `ProtectSystem=strict` leaves everything read-only.
-fn outside_service_dirs(dir: &Path) -> bool {
-    !CREATED_AT_START.iter().any(|d| dir.starts_with(d))
+/// What the shipped service unit needs to let the daemon write in `dir`: nothing in its
+/// own directories or the private /tmp, `ReadWritePaths=` elsewhere under
+/// `ProtectSystem=strict`, and also `ProtectHome=no` under home directories.
+fn sandbox_hint(dir: &Path) -> Option<&'static str> {
+    let under = |dirs: &[&str]| dirs.iter().any(|d| dir.starts_with(d));
+    if under(&CREATED_AT_START) || under(&["/tmp", "/var/tmp"]) {
+        None
+    } else if under(&["/home", "/root", "/run/user"]) {
+        Some(
+            "under systemd the service unit must also set ProtectHome=no and list it in ReadWritePaths=",
+        )
+    } else {
+        Some("under systemd the service unit must also list it in ReadWritePaths=")
+    }
+}
+
+/// Compares the binaries on disk with the running one (`running`, its sha256).
+fn binaries(out: &mut Checks, installed: &[Installed], running: Option<&str>) {
+    let group = "daemon";
+    let Some(running) = running else {
+        if !installed.is_empty() {
+            out.push(
+                group,
+                Level::Skip,
+                "binary".into(),
+                "the running binary is too old to report its checksum".into(),
+            );
+        }
+        return;
+    };
+    for i in installed {
+        let path = i.path.display();
+        let detail = match (&i.sha256, i.started_from) {
+            (Ok(sha), _) if sha == running => continue,
+            (Ok(_), true) => format!(
+                "{path} is not the binary running; piano upgrade switches to it without \
+                 dropping streams"
+            ),
+            (Ok(_), false) => format!(
+                "{path}, which runs this command, is not the binary running; piano upgrade \
+                 {path} switches to it without dropping streams"
+            ),
+            (Err(e), true) => format!("{path}, which piano upgrade runs, cannot be read: {e}"),
+            (Err(_), false) => continue,
+        };
+        out.push(group, Level::Warn, "binary".into(), detail);
+    }
 }
 
 fn daemon(out: &mut Checks, config: &Config, input: &Input<'_>) {
@@ -434,32 +477,7 @@ fn daemon(out: &mut Checks, config: &Config, input: &Input<'_>) {
             );
         }
     }
-    match (&input.installed, &s.process.binary_sha256) {
-        (Some(installed), Some(running)) if &installed.sha256 != running => {
-            let path = installed.path.display();
-            let upgrade = if installed.started_from {
-                "piano upgrade".to_owned()
-            } else {
-                format!("piano upgrade {path}")
-            };
-            out.push(
-                group,
-                Level::Warn,
-                "binary".into(),
-                format!(
-                    "{path} is not the binary running; {upgrade} switches to it without \
-                     dropping streams"
-                ),
-            );
-        }
-        (Some(_), None) => out.push(
-            group,
-            Level::Skip,
-            "binary".into(),
-            "the running binary is too old to report its checksum".into(),
-        ),
-        _ => {}
-    }
+    binaries(out, &input.installed, s.process.binary_sha256.as_deref());
     for f in &s.findings {
         let level = match f.level {
             FindingLevel::Warn => Level::Warn,
@@ -620,7 +638,11 @@ async fn upstreams(out: &mut Checks, config: &Config, resolver: &Resolver) {
             Err(e) => out.push("upstreams", Level::Error, what, e),
         }
     }
-    // The hosts these stand for are known only when a redirect names one.
+}
+
+/// Wildcard follow names, which are not checked: the hosts they stand for are known only
+/// when a redirect names one.
+fn wildcards(out: &mut Checks, config: &Config) {
     for site in &config.sites {
         for name in site.follow.iter().filter(|h| h.starts_with("*.")) {
             out.push(
@@ -828,6 +850,51 @@ mod tests {
     }
 
     #[test]
+    fn binary_differences() {
+        let installed = |path: &str, sha256: Result<&str, &str>, started_from| Installed {
+            path: path.into(),
+            sha256: sha256.map(str::to_owned).map_err(str::to_owned),
+            started_from,
+        };
+        let warnings = |list: &[Installed], running| {
+            let mut out = Checks::default();
+            binaries(&mut out, list, running);
+            out.0
+                .into_iter()
+                .map(|c| (c.level, c.detail))
+                .collect::<Vec<_>>()
+        };
+        let daemon = installed("/usr/local/bin/piano", Ok("a"), true);
+        assert!(warnings(&[daemon], Some("a")).is_empty());
+        let daemon = installed("/usr/local/bin/piano", Ok("b"), true);
+        assert_eq!(
+            warnings(&[daemon], Some("a")),
+            [(
+                Level::Warn,
+                "/usr/local/bin/piano is not the binary running; piano upgrade switches to it \
+                 without dropping streams"
+                    .into()
+            )]
+        );
+        // Upgraded from another path: the service manager's binary still differs.
+        let list = [
+            installed("/opt/piano-new", Ok("a"), true),
+            installed("/usr/local/bin/piano", Ok("b"), false),
+        ];
+        let w = warnings(&list, Some("a"));
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].1.contains("piano upgrade /usr/local/bin/piano"),
+            "{w:?}"
+        );
+        // The daemon's file is gone: piano upgrade would fail.
+        let list = [installed("/tmp/piano-x", Err("not found"), true)];
+        assert!(warnings(&list, Some("a"))[0].1.contains("cannot be read"));
+        let list = [installed("/x", Ok("b"), true)];
+        assert_eq!(warnings(&list, None)[0].0, Level::Skip);
+    }
+
+    #[test]
     fn uptimes() {
         assert_eq!(uptime(40), "40s");
         assert_eq!(uptime(5 * 60 + 7), "5m");
@@ -846,8 +913,12 @@ mod tests {
             started_from(std::process::id()),
             Some(std::env::current_exe().unwrap())
         );
-        assert!(!outside_service_dirs(Path::new("/var/log/piano")));
-        assert!(!outside_service_dirs(Path::new("/var/lib/piano/sub")));
-        assert!(outside_service_dirs(Path::new("/srv/logs")));
+        let hint = |d: &str| sandbox_hint(Path::new(d));
+        assert_eq!(hint("/var/log/piano"), None);
+        assert_eq!(hint("/var/lib/piano/sub"), None);
+        assert_eq!(hint("/tmp/piano"), None);
+        assert!(hint("/srv/logs").is_some_and(|h| h.contains("ReadWritePaths=")));
+        assert!(hint("/home/u/logs").is_some_and(|h| h.contains("ProtectHome=no")));
+        assert!(hint("/var/log/pianola").is_some());
     }
 }

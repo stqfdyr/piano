@@ -339,20 +339,27 @@ fn doctor(cli: &Cli, user: &str) -> ExitCode {
         let value = piano_ctl::call(socket, "status", STATUS_TIMEOUT).ok()?;
         serde_json::from_value(value).ok()
     });
-    // What `piano upgrade` would run: the file at the daemon's path, else this command's.
-    let installed = status
+    // What `piano upgrade` would run (the file at the daemon's path), and this command's
+    // binary, which is usually what the service manager starts.
+    let mut paths: Vec<(PathBuf, bool)> = status
         .as_ref()
         .and_then(|s| piano::doctor::started_from(s.pid))
         .map(|path| (path, true))
-        .or_else(|| std::env::current_exe().ok().map(|path| (path, false)))
-        .and_then(|(path, started_from)| {
-            let sha256 = piano::doctor::file_sha256(&path).ok()?;
-            Some(piano::doctor::Installed {
-                path,
-                sha256,
-                started_from,
-            })
-        });
+        .into_iter()
+        .collect();
+    if let Ok(exe) = std::env::current_exe()
+        && !paths.iter().any(|(p, _)| *p == exe)
+    {
+        paths.push((exe, false));
+    }
+    let installed = paths
+        .into_iter()
+        .map(|(path, started_from)| piano::doctor::Installed {
+            sha256: piano::doctor::file_sha256(&path).map_err(|e| e.to_string()),
+            path,
+            started_from,
+        })
+        .collect();
     let input = piano::doctor::Input {
         config: &cli.config,
         status: status.as_ref(),

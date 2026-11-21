@@ -155,8 +155,9 @@ configuration, certificate and key and write the log, state and socket directori
 who holds the listening ports, whether the configuration, certificate files or
 binary on disk changed after the daemon loaded them, and whether every upstream host
 (aliases, mounts and exact `follow` names included) completes a TLS handshake. The
-binary compared is the file now at the path the daemon started from, which `piano
-upgrade` runs. Access is judged by permission bits alone: ACLs, SELinux and AppArmor
+binaries compared with the running one are the file now at the path the daemon
+started from, which `piano upgrade` runs, and the one running `piano doctor` when it
+is another file (or the daemon's path cannot be read). Access is judged by permission bits alone: ACLs, SELinux and AppArmor
 are not consulted. Exit code 0, 3 with warnings, 1 with errors, 2 when the
 configuration does not load.
 

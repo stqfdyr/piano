@@ -16,11 +16,14 @@ async fn doctor(relay: &Relay, status: Option<&Status>, installed: Option<&str>)
         status,
         socket: Some(&relay.control_socket()),
         user: "nobody",
-        installed: installed.map(|sha256| Installed {
-            path: "/usr/local/bin/piano".into(),
-            sha256: sha256.to_owned(),
-            started_from: true,
-        }),
+        installed: installed
+            .map(|sha256| Installed {
+                path: "/usr/local/bin/piano".into(),
+                sha256: Ok(sha256.to_owned()),
+                started_from: true,
+            })
+            .into_iter()
+            .collect(),
         resolver: Resolver::system().with_override(ORIGIN_HOST, &[IpAddr::from([127, 0, 0, 1])]),
     };
     tokio::time::timeout(Duration::from_secs(60), run(&input))
