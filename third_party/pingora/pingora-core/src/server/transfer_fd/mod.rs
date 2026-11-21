@@ -331,7 +331,9 @@ where
                 /* If the new process hasn't created the upgrade sock we'll get an ENOENT.
                 ECONNREFUSED may happen if the sock wasn't cleaned up
                 and the old process tries sending before the new one is listening.
-                EACCES may happen if connect() happen before the correct permission is set */
+                EACCES may happen if connect() happen before the correct permission is set, and
+                happens on every attempt when the receiver runs as another user: its socket is
+                0600 (P11) */
                 Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
                     /*the server is not ready yet*/
                     retried += 1;

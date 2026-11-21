@@ -58,10 +58,10 @@ pub struct ServerConf {
     /// In order to perform zero downtime restart, both the new and old process need to agree on the
     /// path to this sock in order to coordinate the upgrade.
     pub upgrade_sock: String,
-    /// If configured, after daemonization, this process will switch to the given user before
-    /// starting to serve traffic.
+    /// Ignored: the process does not daemonize, so it never switches to this user (P9). The
+    /// upgrade socket is 0600, so both processes of an upgrade must run as the same user.
     pub user: Option<String>,
-    /// Similar to `user`, the group this process should switch to.
+    /// Ignored, as `user` is.
     pub group: Option<String>,
     /// Working directory for the daemonized process.
     ///
