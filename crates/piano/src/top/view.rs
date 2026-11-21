@@ -5,7 +5,7 @@
 use super::model::{
     BudgetRow, Images, Percentiles, Problem, SiteRow, State, StreamRow, View, mask,
 };
-use crate::render::{duration, millis as ms, size};
+use crate::render::{duration, local_time, millis as ms, size};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -605,18 +605,6 @@ fn upstreams(f: &mut Frame<'_>, area: Rect, budgets: &[BudgetRow], img: &Images)
     f.render_widget(Paragraph::new(line), images);
 }
 
-/// `HH:MM:SS` in local time from a logged UTC timestamp.
-fn local_time(ts: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(ts).map_or_else(
-        |_| ts.get(11..19).unwrap_or(ts).to_owned(),
-        |t| {
-            t.with_timezone(&chrono::Local)
-                .format("%H:%M:%S")
-                .to_string()
-        },
-    )
-}
-
 /// Problems newest first, a run of the same failure folded into its newest line and
 /// a count.
 fn folded(list: &[Problem]) -> Vec<(&Problem, usize)> {
@@ -659,7 +647,8 @@ fn problems(f: &mut Frame<'_>, area: Rect, list: &[Problem], log_on: bool) {
                 WARN
             };
             let mut spans = vec![
-                dim(local_time(&p.ts)),
+                dim(local_time(&p.ts, "%H:%M:%S")
+                    .unwrap_or_else(|| p.ts.get(11..19).unwrap_or(&p.ts).to_owned())),
                 Span::raw("  "),
                 Span::raw(format!("{:<6}", p.site)),
                 colored(status, sc),

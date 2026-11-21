@@ -720,6 +720,9 @@ fn log(cli: &Cli, command: &LogCommand) -> ExitCode {
         class,
         file,
     } = command;
+    if let Some(w) = class.as_deref().and_then(logtail::unknown_class) {
+        eprintln!("{w}");
+    }
     let filter = match logtail::Filter::new(site.clone(), status.as_deref(), class.clone()) {
         Ok(f) => f,
         Err(e) => {
@@ -731,7 +734,21 @@ fn log(cli: &Cli, command: &LogCommand) -> ExitCode {
         Some(f) => f.clone(),
         None => match piano_config::load(&cli.config) {
             Ok(c) => match c.log.access_path() {
-                Some(p) => p.to_owned(),
+                Some(p) => {
+                    // A warning only: the log keeps lines of sites renamed or removed
+                    // since. Another file may come from another configuration.
+                    if let Some(s) = site
+                        && !c.sites.iter().any(|x| &x.name == s)
+                    {
+                        let names: Vec<&str> = c.sites.iter().map(|x| x.name.as_str()).collect();
+                        eprintln!(
+                            "warning: --site {s:?} is no site in {} (sites: {})",
+                            cli.config.display(),
+                            names.join(", ")
+                        );
+                    }
+                    p.to_owned()
+                }
                 None => {
                     eprintln!(
                         "the access log is off (log.access = \"\" in {})",

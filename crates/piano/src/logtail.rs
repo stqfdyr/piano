@@ -3,8 +3,10 @@
 //! Reads the file rather than asking the daemon: the file holds the whole history and
 //! stays readable when the daemon is down.
 
-use crate::render::Color;
+use crate::render::{Color, local_time};
+use piano_proxy::route::RouteClass;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
@@ -88,11 +90,59 @@ pub struct Output {
 impl Output {
     fn line(&self, raw: &str, v: &Value) -> String {
         if self.json {
-            raw.to_owned()
+            escaped(raw)
         } else {
             human(v, self.color)
         }
     }
+}
+
+/// A warning when `class` is no route class this version logs; lines of another
+/// version may still carry it.
+pub fn unknown_class(class: &str) -> Option<String> {
+    if RouteClass::ALL.iter().any(|k| k.as_str() == class) {
+        return None;
+    }
+    let all: Vec<&str> = RouteClass::ALL.iter().map(|k| k.as_str()).collect();
+    Some(format!(
+        "warning: --class {class:?} is none of {}",
+        all.join(", ")
+    ))
+}
+
+/// Characters a terminal acts on or that reorder the text around them; logged fields
+/// come from clients and upstreams.
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `s` with [`unsafe_char`]s replaced, for text output.
+fn printable(s: &str) -> Cow<'_, str> {
+    if s.contains(unsafe_char) {
+        Cow::Owned(
+            s.chars()
+                .map(|c| if unsafe_char(c) { '\u{fffd}' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// A logged JSON line with [`unsafe_char`]s written as escapes: the same JSON value, as
+/// the log writer puts such characters only inside strings, and nothing a terminal
+/// acts on.
+fn escaped(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if unsafe_char(c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -102,12 +152,15 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// One request as a line of text: time, site, status, method, path, duration, client,
-/// and how it ended unless normally.
+/// One request as a line of text: local time, site, status, method, path, duration,
+/// client, and how it ended unless normally.
 fn human(v: &Value, color: Color) -> String {
-    let s = |k: &str| v.get(k).and_then(Value::as_str);
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(printable);
     let ts = s("ts")
-        .map(|t| t.get(5..19).unwrap_or(t).replacen('T', " ", 1))
+        .map(|t| {
+            local_time(&t, "%m-%d %H:%M:%S")
+                .unwrap_or_else(|| t.get(5..19).unwrap_or(&t).replacen('T', " ", 1))
+        })
         .unwrap_or_default();
     let status = v.get("status").and_then(Value::as_u64);
     let status_text = status.map_or_else(|| "-".to_owned(), |n| n.to_string());
@@ -122,12 +175,12 @@ fn human(v: &Value, color: Color) -> String {
         .map_or_else(String::new, |d| format!(" {d}ms"));
     let mut line = format!(
         "{ts} {:<6} {status_text:>3} {} {}{dur} {}",
-        s("site").unwrap_or("-"),
-        s("method").unwrap_or("-"),
-        clip(s("path").unwrap_or("-"), MAX_PATH_CHARS),
-        s("client").unwrap_or("-"),
+        s("site").as_deref().unwrap_or("-"),
+        s("method").as_deref().unwrap_or("-"),
+        clip(s("path").as_deref().unwrap_or("-"), MAX_PATH_CHARS),
+        s("client").as_deref().unwrap_or("-"),
     );
-    if let Some(end) = s("end").filter(|e| *e != "ok") {
+    if let Some(end) = s("end").filter(|e| e != "ok") {
         line.push(' ');
         line.push_str(&color.yellow(&format!("end={end}")));
     }
@@ -138,18 +191,23 @@ fn human(v: &Value, color: Color) -> String {
 }
 
 /// Reads complete lines from `reader`, passing each to `each`. A line still being
-/// written stays in `pending` for the next call.
+/// written stays in `pending` for the next call. Lines are read as bytes and a line
+/// that is not UTF-8 is skipped like any other line that is no log line: a write cut
+/// short by a full disk leaves one, and a read can catch a write half-way through a
+/// character.
 fn drain(
     reader: &mut impl BufRead,
-    pending: &mut String,
+    pending: &mut Vec<u8>,
     mut each: impl FnMut(&str) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
-        if reader.read_line(pending)? == 0 {
+        if reader.read_until(b'\n', pending)? == 0 {
             return Ok(());
         }
-        if pending.ends_with('\n') {
-            each(pending.trim_end())?;
+        if pending.ends_with(b"\n") {
+            if let Ok(line) = std::str::from_utf8(pending) {
+                each(line.trim_end())?;
+            }
             pending.clear();
         }
     }
@@ -161,7 +219,7 @@ pub struct Follower {
     path: PathBuf,
     file: File,
     reader: BufReader<File>,
-    pending: String,
+    pending: Vec<u8>,
 }
 
 impl Follower {
@@ -170,13 +228,14 @@ impl Follower {
     pub fn open(path: &Path, last: Option<u64>) -> io::Result<Self> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file.try_clone()?);
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         if let Some(n) = last {
             let len = file.metadata()?.len();
             if len > n {
-                reader.seek(SeekFrom::Start(len - n))?;
-                // The partial line before the next newline.
-                reader.read_line(&mut pending)?;
+                // From the byte before, so that a line starting right at `len - n`
+                // is kept: what is read up to the next newline ends the line before.
+                reader.seek(SeekFrom::Start(len - n - 1))?;
+                reader.read_until(b'\n', &mut pending)?;
                 pending.clear();
             }
         }
@@ -213,13 +272,18 @@ impl Follower {
     }
 }
 
-/// Prints the last `n` lines of `path` that pass `filter`, then, with `follow`,
-/// every new one until interrupted, across log rotation.
-pub fn tail(path: &Path, n: usize, follow: bool, filter: &Filter, out: &Output) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut w = stdout.lock();
-    let mut log = Follower::open(path, None)?;
-    let mut last: VecDeque<String> = VecDeque::with_capacity(n.min(4096));
+/// The last `n` lines `log` has now that pass `filter`, as `out` writes them.
+fn last(
+    log: &mut Follower,
+    n: usize,
+    filter: &Filter,
+    out: &Output,
+) -> io::Result<VecDeque<String>> {
+    let mut last = VecDeque::with_capacity(n.min(4096));
+    if n == 0 {
+        log.read(|_| Ok(()))?;
+        return Ok(last);
+    }
     log.read(|raw| {
         if let Ok(v) = serde_json::from_str::<Value>(raw)
             && filter.matches(&v)
@@ -227,13 +291,20 @@ pub fn tail(path: &Path, n: usize, follow: bool, filter: &Filter, out: &Output) 
             if last.len() == n {
                 last.pop_front();
             }
-            if n > 0 {
-                last.push_back(out.line(raw, &v));
-            }
+            last.push_back(out.line(raw, &v));
         }
         Ok(())
     })?;
-    for l in &last {
+    Ok(last)
+}
+
+/// Prints the last `n` lines of `path` that pass `filter`, then, with `follow`,
+/// every new one until interrupted, across log rotation.
+pub fn tail(path: &Path, n: usize, follow: bool, filter: &Filter, out: &Output) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut w = stdout.lock();
+    let mut log = Follower::open(path, None)?;
+    for l in &last(&mut log, n, filter, out)? {
         writeln!(w, "{l}")?;
     }
     w.flush()?;
@@ -275,6 +346,11 @@ mod tests {
         assert!(!f.matches(&line("x", Some(404), "media")));
         assert!(Filter::new(None, Some("6xx"), None).is_err());
         assert!(Filter::new(None, Some("bad"), None).is_err());
+        for class in RouteClass::ALL {
+            assert_eq!(unknown_class(class.as_str()), None);
+        }
+        let e = unknown_class("vidoe").unwrap();
+        assert!(e.contains("media, subtitle"), "{e}");
     }
 
     #[test]
@@ -284,11 +360,35 @@ mod tests {
             "method": "GET", "path": "/emby/Videos/1/stream", "dur_ms": 12,
             "client": "192.0.2.7", "end": "redirect_refused", "err": "no"
         });
+        let ts = local_time("2026-11-20T08:01:02.345Z", "%m-%d %H:%M:%S").unwrap();
         assert_eq!(
             human(&v, crate::render::color(true)),
-            "11-20 08:01:02 uhd    502 GET /emby/Videos/1/stream 12ms 192.0.2.7 end=redirect_refused err=no"
+            format!(
+                "{ts} uhd    502 GET /emby/Videos/1/stream 12ms 192.0.2.7 end=redirect_refused err=no"
+            )
         );
         assert_eq!(clip("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn control_characters_do_not_reach_the_terminal() {
+        let v = serde_json::json!({
+            "path": "/a\u{9b}31m\u{1b}[2J", "err": "x\u{1b}]0;t\u{7}", "end": "upstream_timeout"
+        });
+        let line = human(&v, crate::render::color(true));
+        assert!(!line.contains(char::is_control), "{line:?}");
+        assert!(line.contains("/a\u{fffd}31m\u{fffd}[2J"), "{line:?}");
+        assert_eq!(printable("ok é"), "ok é");
+        assert_eq!(printable("/x\u{202e}gnp.exe"), "/x\u{fffd}gnp.exe");
+        let raw = "{\"path\":\"/a\u{9b}2J\u{7f}\u{202e}\"}";
+        let json = escaped(raw);
+        let bs = "\\";
+        assert_eq!(
+            json,
+            format!("{{\"path\":\"/a{bs}u009b2J{bs}u007f{bs}u202e\"}}")
+        );
+        let back: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, serde_json::from_str::<Value>(raw).unwrap());
     }
 
     #[test]
@@ -331,9 +431,110 @@ third
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("piano-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_last_lines_that_pass_the_filter() {
+        let dir = temp_dir("last");
+        let path = dir.join("access.log");
+        let line = |i: u32, site: &str| format!("{{\"site\":\"{site}\",\"status\":{i}}}\n");
+        let text = [
+            line(1, "a"),
+            "not json\n".into(),
+            line(2, "b"),
+            line(3, "a"),
+            line(4, "a"),
+        ]
+        .concat();
+        std::fs::write(&path, text).unwrap();
+        let out = Output {
+            json: true,
+            color: crate::render::color(true),
+        };
+        let a = Filter::new(Some("a".into()), None, None).unwrap();
+        let tail = |n, filter: &Filter| {
+            let mut log = Follower::open(&path, None).unwrap();
+            let got: Vec<String> = last(&mut log, n, filter, &out).unwrap().into();
+            // What follows starts after everything read.
+            let mut rest = Vec::new();
+            log.read(|l| {
+                rest.push(l.to_owned());
+                Ok(())
+            })
+            .unwrap();
+            assert!(rest.is_empty(), "{rest:?}");
+            got
+        };
+        assert_eq!(
+            tail(2, &a),
+            [line(3, "a").trim_end(), line(4, "a").trim_end()]
+        );
+        assert_eq!(tail(10, &a).len(), 3);
+        assert_eq!(tail(10, &Filter::default()).len(), 4);
+        assert!(tail(0, &a).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_follower_starts_over_when_the_file_is_truncated() {
+        let dir = temp_dir("truncate");
+        let path = dir.join("access.log");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        // Asked for as much as the file holds, it reads the first line too.
+        let mut f = Follower::open(&path, Some(8)).unwrap();
+        let mut seen = Vec::new();
+        let mut each = |l: &str| {
+            seen.push(l.to_owned());
+            Ok(())
+        };
+        f.poll(&mut each).unwrap();
+        std::fs::write(&path, "new\n").unwrap();
+        f.poll(&mut each).unwrap();
+        f.poll(&mut each).unwrap();
+        assert_eq!(seen, ["one", "two", "new"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_follower_keeps_a_line_that_starts_where_it_starts() {
+        let dir = temp_dir("boundary");
+        let path = dir.join("access.log");
+        std::fs::write(&path, "aa\nbb\ncc\n").unwrap();
+        for (last, want) in [(6, &["bb", "cc"][..]), (5, &["cc"]), (2, &[])] {
+            let mut f = Follower::open(&path, Some(last)).unwrap();
+            let mut seen = Vec::new();
+            f.read(|l| {
+                seen.push(l.to_owned());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, want, "{last}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lines_that_are_not_utf8_are_skipped() {
+        let mut pending = Vec::new();
+        let mut seen = Vec::new();
+        let mut each = |l: &str| {
+            seen.push(l.to_owned());
+            Ok(())
+        };
+        drain(&mut &b"a\n\xe4\xb8\nb\n"[..], &mut pending, &mut each).unwrap();
+        // Half of a character at the end is a line still being written.
+        drain(&mut &"c\u{4e2d}".as_bytes()[..2], &mut pending, &mut each).unwrap();
+        drain(&mut &"c\u{4e2d}\n".as_bytes()[2..], &mut pending, &mut each).unwrap();
+        assert_eq!(seen, ["a", "b", "c\u{4e2d}"]);
+    }
+
     #[test]
     fn drain_keeps_a_partial_line() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let mut seen = Vec::new();
         drain(&mut "a\nb".as_bytes(), &mut pending, |l| {
             seen.push(l.to_owned());
@@ -341,7 +542,7 @@ third
         })
         .unwrap();
         assert_eq!(seen, ["a"]);
-        assert_eq!(pending, "b");
+        assert_eq!(pending, b"b");
         drain(&mut "c\n".as_bytes(), &mut pending, |l| {
             seen.push(l.to_owned());
             Ok(())
