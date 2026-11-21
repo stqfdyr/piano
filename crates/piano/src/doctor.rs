@@ -598,10 +598,7 @@ async fn handshake(
     let stream = connector
         .new_stream(&peer)
         .await
-        .map_err(|e| match &e.cause {
-            Some(c) => format!("{}: {c}", e.etype().as_str()),
-            None => e.etype().as_str().to_owned(),
-        })?;
+        .map_err(|e| crate::probe::describe(&e))?;
     drop(stream);
     Ok(format!(
         "{} in {} ms",

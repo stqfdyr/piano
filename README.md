@@ -134,10 +134,14 @@ piano probe media.example.com --direct --ua EmbyMini/0.1.0 --ua Mozilla/5.0
 
 `--login` takes the account from `PIANO_PROBE_USER` and `PIANO_PROBE_PASSWORD`, or
 from two lines on standard input; it is never printed, and the probe logs out at the
-end. `--direct` goes to the upstream itself, without the site's rules, to see what the
-upstream does with each `--ua`; upstreams may refuse User-Agents they do not know,
-including the default `piano/<version>`. Through the relay a step also fails when an
-answer names the upstream. Exit code 0 when every step passed, 1 otherwise.
+end. It logs in with the first `--ua`, and with the next one when the upstream refuses
+a User-Agent (403) rather than the account. `--direct` goes to the upstream itself,
+without the site's rules, to see what the upstream does with each `--ua`: redirects
+pass as a client follows them, and a stream URL on another host is read from that
+host. Upstreams may refuse User-Agents they do not know, including the default
+`piano/<version>`. Through the relay a step also fails when an answer names the
+upstream or the stream is on another host. Exit code 0 when every step passed, 1
+otherwise, 2 when the configuration or the site name is wrong.
 
 ## Check the setup
 

@@ -1,7 +1,10 @@
 //! `piano probe` through the relay and directly to the origin.
 
 use piano::probe::{Args, Credentials, Report, run};
-use piano_e2e::origin::{BLOCKED_UA, Origin, PROBE_MEDIA_LEN, PROBE_PASSWORD, PROBE_USER};
+use piano_e2e::origin::{
+    BLOCKED_UA, ELSEWHERE_UA, Origin, PROBE_ITEM, PROBE_MEDIA_LEN, PROBE_PASSWORD, PROBE_USER,
+    STREAM_HOST,
+};
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
@@ -16,7 +19,10 @@ set = "EmbyMini/0.1.0"
 "#;
 
 async fn probe(relay: &Relay, args: &Args) -> Report {
-    let resolver = Resolver::system().with_override(ORIGIN_HOST, &[IpAddr::from([127, 0, 0, 1])]);
+    let loopback = [IpAddr::from([127, 0, 0, 1])];
+    let resolver = Resolver::system()
+        .with_override(ORIGIN_HOST, &loopback)
+        .with_override(STREAM_HOST, &loopback);
     tokio::time::timeout(
         Duration::from_secs(60),
         run(&relay.config(), &resolver, args),
@@ -94,11 +100,86 @@ async fn a_refused_login_stops_after_the_public_step() {
         &roots,
         origin.addr.port(),
     ));
-    let r = probe(&relay, &args(Some("wrong"), false, &[])).await;
+    // Wrong credentials are not tried again with the next User-Agent.
+    let r = probe(&relay, &args(Some("wrong"), false, &["A/1", "B/1"])).await;
     assert!(!r.ok());
-    assert_eq!(names(&r), ["login", "public"]);
+    assert_eq!(names(&r), ["login", "public", "public"]);
     assert_eq!(r.steps[0].status, Some(401));
     assert!(r.steps[1].ok, "{r:#?}");
+}
+
+#[tokio::test]
+async fn a_user_agent_refused_at_login_hands_over_to_the_next() {
+    let ca = Ca::new("piano e2e");
+    let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;
+    let roots = [ca.cert_pem()];
+    let relay = Relay::start(&RelaySetup::new(
+        &ca.leaf(&[SITE_HOST]),
+        &roots,
+        origin.addr.port(),
+    ));
+    let blocked = format!("{BLOCKED_UA}1.0");
+    let r = probe(
+        &relay,
+        &args(Some(PROBE_PASSWORD), true, &[&blocked, "Fine/1.0"]),
+    )
+    .await;
+    let logins: Vec<_> = r
+        .steps
+        .iter()
+        .filter(|s| s.name == "login")
+        .map(|s| (s.user_agent.as_str(), s.status))
+        .collect();
+    assert_eq!(
+        logins,
+        [(blocked.as_str(), Some(403)), ("Fine/1.0", Some(200))]
+    );
+    assert!(
+        r.steps
+            .iter()
+            .filter(|s| s.user_agent == "Fine/1.0")
+            .all(|s| s.ok),
+        "{r:#?}"
+    );
+    assert!(names(&r).contains(&"media"), "{r:#?}");
+}
+
+#[tokio::test]
+async fn direct_goes_where_the_upstream_sends_a_client() {
+    let ca = Ca::new("piano e2e");
+    let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST, STREAM_HOST])).await;
+    let roots = [ca.cert_pem()];
+    let relay = Relay::start(&RelaySetup::new(
+        &ca.leaf(&[SITE_HOST]),
+        &roots,
+        origin.addr.port(),
+    ));
+    let ua = format!("{ELSEWHERE_UA}1.0");
+    let r = probe(&relay, &args(Some(PROBE_PASSWORD), true, &[&ua])).await;
+    assert!(r.ok(), "{r:#?}");
+    let step = |name: &str| r.steps.iter().find(|s| s.name == name).unwrap();
+    assert_eq!(
+        (step("image").status, step("image").note.as_str()),
+        (Some(301), "redirects on the same host")
+    );
+    assert!(
+        step("playback")
+            .note
+            .starts_with(&format!("direct stream: {STREAM_HOST}:")),
+        "{r:#?}"
+    );
+    assert_eq!(
+        (step("media").status, step("media").bytes),
+        (Some(206), 1 << 20)
+    );
+    // The stream was read from its own host, not asked of the upstream.
+    assert_eq!(origin.media_requests_to(PROBE_ITEM, STREAM_HOST), 1);
+    assert_eq!(origin.media_requests_to(PROBE_ITEM, ORIGIN_HOST), 0);
+    // Through the relay the relay follows the redirect itself, and a stream URL on
+    // another host fails.
+    let r = probe(&relay, &args(Some(PROBE_PASSWORD), false, &[&ua])).await;
+    let failed: Vec<_> = r.steps.iter().filter(|s| !s.ok).map(|s| s.name).collect();
+    assert_eq!(failed, ["playback"], "{r:#?}");
 }
 
 #[tokio::test]
