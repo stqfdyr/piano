@@ -430,7 +430,11 @@ fn probe(cli: &Cli, site: &str, login: bool, direct: bool, user_agents: &[String
     });
     let report = match ran {
         Ok(Ok(r)) => r,
-        Ok(Err(e @ piano::probe::Error::UnknownSite(_))) => {
+        Ok(Err(
+            e @ (piano::probe::Error::UnknownSite(_)
+            | piano::probe::Error::Listen(_)
+            | piano::probe::Error::Tls(_)),
+        )) => {
             eprintln!("{e}");
             return ExitCode::from(exit::CONFIG);
         }

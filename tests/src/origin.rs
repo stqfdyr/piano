@@ -40,8 +40,10 @@
 //!   accepts [`PROBE_USER`] / [`PROBE_PASSWORD`]), `Users/{PROBE_USER_ID}/Views` and `…/Items`,
 //!   `Items/{PROBE_ITEM}/PlaybackInfo` (a direct stream URL to `/videos/{PROBE_ITEM}/…`),
 //!   `Sessions/Logout`. Without the token they answer 401; a User-Agent starting with
-//!   [`BLOCKED_UA`] gets 403 on all but `System/Info/Public`, as an upstream's UA policy.
-//!   `/videos/` media paths are also served under `/emby`.
+//!   [`BLOCKED_UA`] gets 403 on all but `System/Info/Public`, as an upstream's UA policy;
+//!   one starting with [`ELSEWHERE_UA`] gets the stream URL on [`STREAM_HOST`] and images
+//!   moved, as some upstreams answer some players. `/videos/` media paths are also served
+//!   under `/emby`.
 //! - anything else: 404.
 
 use crate::pki::Leaf;
@@ -106,6 +108,11 @@ pub const PROBE_ITEM: &str = "probe1";
 pub const PROBE_MEDIA_LEN: u64 = 3_000_000;
 /// User-Agent prefix the fake Emby API refuses with 403.
 pub const BLOCKED_UA: &str = "Blocked/";
+/// User-Agent prefix that gets an absolute stream URL on [`STREAM_HOST`] and `/Items`
+/// images as 301.
+pub const ELSEWHERE_UA: &str = "Elsewhere/";
+/// The host of the stream URL [`ELSEWHERE_UA`] gets; this origin serves it too.
+pub const STREAM_HOST: &str = "vod.example.net";
 
 pub const INFO_PUBLIC: &str = r#"{"LocalAddress":"https://origin.example.net","ServerName":"fake","Version":"4.8.10.0","Id":"0123456789abcdef"}"#;
 
@@ -292,6 +299,17 @@ impl Origin {
     pub fn hits(&self, path: &str) -> usize {
         let seqs = self.state.seqs.lock().unwrap();
         seqs.get(&format!("img:{path}")).copied().unwrap_or(0)
+    }
+
+    /// Requests for scripted media `key` naming `host` (without port) in `Host`: all
+    /// of them, and those carrying an `X-Emby-Token`.
+    pub fn media_requests_to(&self, key: &str, host: &str) -> (usize, usize) {
+        let seqs = self.state.seqs.lock().unwrap();
+        let count = |k: String| seqs.get(&k).copied().unwrap_or(0);
+        (
+            count(format!("{key}@{host}")),
+            count(format!("{key}@{host}#token")),
+        )
     }
 
     /// Redirects answered for scripted media `key`.
@@ -554,10 +572,22 @@ async fn emby(req: &mut Request<Incoming>) -> Option<Response<ResBody>> {
             format!(
                 concat!(
                     r#"{{"MediaSources":[{{"Path":"https://{origin}/media/{item}.mkv","#,
-                    r#""DirectStreamUrl":"/videos/{item}/stream.mkv?len={len}&api_key={token}"}}],"#,
+                    r#""DirectStreamUrl":"{base}/videos/{item}/stream.mkv?len={len}&api_key={token}"}}],"#,
                     r#""PlaySessionId":"s1"}}"#
                 ),
                 origin = crate::ORIGIN_HOST,
+                // The port is this origin's, which the request names in Host.
+                base = if ua.starts_with(ELSEWHERE_UA) {
+                    let port = req
+                        .headers()
+                        .get("host")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|h| h.rsplit_once(':'))
+                        .map_or_else(String::new, |(_, p)| format!(":{p}"));
+                    format!("https://{STREAM_HOST}{port}")
+                } else {
+                    String::new()
+                },
                 item = PROBE_ITEM,
                 len = PROBE_MEDIA_LEN,
                 token = PROBE_TOKEN,
@@ -615,9 +645,14 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         }
         None => 200,
     };
+    let elsewhere = req
+        .headers()
+        .get("user-agent")
+        .is_some_and(|v| v.as_bytes().starts_with(ELSEWHERE_UA.as_bytes()));
     let moved = match param("moved") {
         Some("1") => Some(StatusCode::MOVED_PERMANENTLY),
         Some("302") => Some(StatusCode::FOUND),
+        None if elsewhere => Some(StatusCode::MOVED_PERMANENTLY),
         _ => None,
     };
     if let Some(status) = moved.filter(|_| !target && code == 200) {
@@ -817,6 +852,26 @@ impl Plan {
 }
 
 async fn media(req: &Request<Incoming>, key: String, state: &State) -> Response<ResBody> {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.split(':').next())
+        .unwrap_or_default();
+    *state
+        .seqs
+        .lock()
+        .unwrap()
+        .entry(format!("{key}@{host}"))
+        .or_default() += 1;
+    if req.headers().contains_key("x-emby-token") {
+        *state
+            .seqs
+            .lock()
+            .unwrap()
+            .entry(format!("{key}@{host}#token"))
+            .or_default() += 1;
+    }
     let query = req.uri().query().unwrap_or_default();
     let param = |name: &str| {
         query

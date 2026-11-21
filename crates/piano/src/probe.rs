@@ -4,10 +4,15 @@
 //! is reached on loopback, which `access.loopback` lets in) with the site's name as SNI
 //! and `Host`. With `direct` they go to the upstream itself and bypass the site's rules, to
 //! see what the upstream does with a given User-Agent. Every request opens its own
-//! connection, so the times include connecting and the TLS handshake.
+//! connection, so the times include connecting and the TLS handshake. Directly, a stream
+//! URL on another host is fetched from that host and redirects pass, as a client goes
+//! there itself; through the relay both must stay on the site.
 
 use piano_config::{Config, Site};
+use piano_proxy::follow;
+use piano_telemetry::redact;
 use piano_upstream::Resolver;
+use piano_upstream::resolve::is_public;
 use piano_upstream::tls::client_config;
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::connectors::http::v1::Connector;
@@ -23,7 +28,7 @@ pub const PROBE_SCHEMA: u32 = 1;
 /// Longest a step may take, connecting included.
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Largest JSON answer read.
+/// Largest JSON answer read; a longer one is reported, not parsed.
 const MAX_JSON: usize = 4 << 20;
 /// Largest image read.
 const MAX_IMAGE: usize = 16 << 20;
@@ -112,41 +117,48 @@ pub async fn run(config: &Config, resolver: &Resolver, args: &Args) -> Result<Re
             .resolve_blocking(&url.host, url.port)?
             .current()
             .ok_or_else(|| piano_upstream::resolve::Error::NoAddress(url.host.clone()))?;
-        Target::new(addr, &url.host)
+        Target::new(addr, &url.host, true)
     } else {
-        Target::new(relay_address(&config.server.listen)?, &site.host)
+        Target::new(relay_address(&config.server.listen)?, &site.host, true)
     };
     let client = Client {
         connector: Connector::new(Some(options)),
-        target,
     };
+    let own_agent = args.user_agents.is_empty();
     let mut probe = Probe {
         client: &client,
+        target: &target,
+        resolver,
         site,
         direct: args.direct,
+        own_agent,
         session: None,
         steps: Vec::new(),
     };
-    let agents = if args.user_agents.is_empty() {
+    let agents = if own_agent {
         vec![format!("piano/{}", env!("CARGO_PKG_VERSION"))]
     } else {
         args.user_agents.clone()
     };
     if let Some(credentials) = &args.login {
-        probe.login(&agents[0], credentials).await;
+        for ua in &agents {
+            if !probe.login(ua, credentials).await {
+                break;
+            }
+        }
     }
     for ua in &agents {
         probe.round(ua).await;
     }
-    if probe.session.is_some() {
-        probe.logout(&agents[0]).await;
+    if let Some(session) = probe.session.take() {
+        probe.logout(&session).await;
     }
     Ok(Report {
         schema: PROBE_SCHEMA,
         site: site.name.clone(),
         via: if args.direct { "direct" } else { "relay" },
-        address: client.target.addr.to_string(),
-        server_name: client.target.name.clone(),
+        address: target.addr.to_string(),
+        server_name: target.name.clone(),
         steps: probe.steps,
     })
 }
@@ -174,36 +186,46 @@ struct Target {
     /// SNI, and with the port the `Host`.
     name: String,
     authority: String,
+    tls: bool,
 }
 
 impl Target {
-    fn new(addr: SocketAddr, name: &str) -> Self {
+    fn new(addr: SocketAddr, name: &str, tls: bool) -> Self {
         let name = name.to_ascii_lowercase();
-        let authority = if addr.port() == 443 {
-            name.clone()
+        let host = if name.contains(':') {
+            format!("[{name}]")
         } else {
-            format!("{name}:{}", addr.port())
+            name.clone()
+        };
+        let authority = if addr.port() == if tls { 443 } else { 80 } {
+            host
+        } else {
+            format!("{host}:{}", addr.port())
         };
         Self {
             addr,
             name,
             authority,
+            tls,
         }
     }
 }
 
 struct Client {
     connector: Connector,
-    target: Target,
 }
 
 /// One answer, its body read up to a limit.
 struct Answer {
     status: u16,
+    /// The status code's standard phrase.
+    reason: &'static str,
     content_type: String,
     location: Option<String>,
     content_range: Option<String>,
     body: Vec<u8>,
+    /// The body was longer than the limit.
+    cut: bool,
     first_byte: Duration,
     total: Duration,
 }
@@ -211,6 +233,7 @@ struct Answer {
 impl Client {
     async fn send(
         &self,
+        target: &Target,
         method: &str,
         path: &str,
         headers: &[(&'static str, String)],
@@ -219,7 +242,7 @@ impl Client {
     ) -> Result<Answer, String> {
         tokio::time::timeout(
             STEP_TIMEOUT,
-            self.exchange(method, path, headers, body, max_body),
+            self.exchange(target, method, path, headers, body, max_body),
         )
         .await
         .map_err(|_| format!("no answer within {}s", STEP_TIMEOUT.as_secs()))?
@@ -227,6 +250,7 @@ impl Client {
 
     async fn exchange(
         &self,
+        target: &Target,
         method: &str,
         path: &str,
         headers: &[(&'static str, String)],
@@ -234,7 +258,7 @@ impl Client {
         max_body: usize,
     ) -> Result<Answer, String> {
         let start = Instant::now();
-        let mut peer = HttpPeer::new(self.target.addr, true, self.target.name.clone())
+        let mut peer = HttpPeer::new(target.addr, target.tls, target.name.clone())
             .map_err(|e| e.to_string())?;
         let o = &mut peer.options;
         o.alpn = ALPN::H1;
@@ -252,7 +276,7 @@ impl Client {
         let mut req =
             RequestHeader::build(method, path.as_bytes(), None).map_err(|e| e.to_string())?;
         let fixed = [
-            ("host", self.target.authority.clone()),
+            ("host", target.authority.clone()),
             ("accept", "application/json, */*".to_owned()),
             ("accept-encoding", "identity".to_owned()),
         ];
@@ -285,24 +309,28 @@ impl Client {
                 .map(str::to_owned)
         };
         let status = resp.status.as_u16();
+        let reason = resp.status.canonical_reason().unwrap_or_default();
         let content_type = header("content-type").unwrap_or_default();
         let location = header("location");
         let content_range = header("content-range");
         let mut data = Vec::new();
-        while data.len() < max_body {
+        while data.len() <= max_body {
             match http.read_body_bytes().await.map_err(|e| describe(&e))? {
                 Some(chunk) => data.extend_from_slice(&chunk),
                 None => break,
             }
         }
+        let cut = data.len() > max_body;
         data.truncate(max_body);
         http.shutdown().await;
         Ok(Answer {
             status,
+            reason,
             content_type,
             location,
             content_range,
             body: data,
+            cut,
             first_byte,
             total: start.elapsed(),
         })
@@ -310,7 +338,7 @@ impl Client {
 }
 
 /// A pingora error without its context chain.
-fn describe(e: &pingora_core::Error) -> String {
+pub(crate) fn describe(e: &pingora_core::Error) -> String {
     match &e.cause {
         Some(cause) => format!("{}: {cause}", e.etype().as_str()),
         None => e.etype().as_str().to_owned(),
@@ -321,12 +349,18 @@ fn describe(e: &pingora_core::Error) -> String {
 struct Session {
     token: String,
     user_id: String,
+    /// The User-Agent that logged in, which also logs out.
+    user_agent: String,
 }
 
 struct Probe<'a> {
     client: &'a Client,
+    target: &'a Target,
+    resolver: &'a Resolver,
     site: &'a Site,
     direct: bool,
+    /// No `--ua` was given, so piano's own User-Agent is sent.
+    own_agent: bool,
     session: Option<Session>,
     steps: Vec<Step>,
 }
@@ -356,7 +390,7 @@ impl Probe<'_> {
         h
     }
 
-    /// Runs one request as step `name`; `judge` decides on the answer and writes the note.
+    /// Runs one request as step `name` on the probe's target.
     async fn step<T>(
         &mut self,
         ua: &str,
@@ -365,13 +399,42 @@ impl Probe<'_> {
         extra: &[(&'static str, String)],
         judge: impl FnOnce(&Answer) -> (bool, String, T),
     ) -> Option<T> {
+        self.step_at(None, ua, name, request, extra, judge).await
+    }
+
+    /// Runs one request as step `name` on `elsewhere`, else the probe's target;
+    /// `judge` decides on the answer and writes the note. Another host gets no session
+    /// or client identity, as a player fetching a stream URL there sends none.
+    async fn step_at<T>(
+        &mut self,
+        elsewhere: Option<&Target>,
+        ua: &str,
+        name: &'static str,
+        request: (&str, &str, Option<&[u8]>, usize),
+        extra: &[(&'static str, String)],
+        judge: impl FnOnce(&Answer) -> (bool, String, T),
+    ) -> Option<T> {
         let (method, path, body, max) = request;
-        let mut headers = self.headers(ua);
+        let (target, mut headers) = match elsewhere {
+            Some(t) => (t, vec![("user-agent", ua.to_owned())]),
+            None => (self.target, self.headers(ua)),
+        };
         headers.extend_from_slice(extra);
         let start = Instant::now();
-        let step = match self.client.send(method, path, &headers, body, max).await {
+        let step = match self
+            .client
+            .send(target, method, path, &headers, body, max)
+            .await
+        {
             Ok(a) => {
-                let (ok, note, found) = judge(&a);
+                let (ok, mut note, found) = judge(&a);
+                // Upstreams that let in only the clients they know refuse piano's name.
+                if !ok && a.status == 403 && self.own_agent && elsewhere.is_none() {
+                    if !note.is_empty() {
+                        note.push_str(" · ");
+                    }
+                    note.push_str("the upstream may refuse piano's User-Agent; try --ua");
+                }
                 let step = Step {
                     user_agent: ua.to_owned(),
                     name,
@@ -400,6 +463,54 @@ impl Probe<'_> {
         None
     }
 
+    /// Where a client fetches the stream at `url`: `None` for the probe's target, with
+    /// the request path. Relative URLs are under `/emby`; directly, a URL on another
+    /// host is fetched from that host, resolved as the relay resolves redirect targets.
+    async fn stream_at(&self, url: &str) -> Result<(Option<Target>, String), String> {
+        if absolute_host(url).is_none() {
+            return Ok((None, stream_path(url)));
+        }
+        let s = StreamUrl::parse(url)?;
+        let own = s.host.eq_ignore_ascii_case(&self.target.name);
+        // Through the relay the playback step has refused other hosts already, and the
+        // site is reached on the relay's address whatever port the URL names.
+        if !self.direct || (own && s.tls && s.port == self.target.addr.port()) {
+            return Ok((None, s.path));
+        }
+        let ip = if own {
+            self.target.addr.ip()
+        } else if let Ok(ip) = s.host.parse::<IpAddr>() {
+            if !is_public(ip) {
+                return Err(format!("stream on a non-public address {ip}"));
+            }
+            ip
+        } else {
+            self.resolver
+                .resolve_public(s.host, s.port)
+                .await
+                .map_err(|e| e.to_string())?
+                .current()
+                .ok_or_else(|| format!("{} has no address", s.host))?
+                .ip()
+        };
+        let target = Target::new(SocketAddr::new(ip, s.port), s.host, s.tls);
+        Ok((Some(target), s.path))
+    }
+
+    /// A step that failed before its request was sent.
+    fn failed(&mut self, ua: &str, name: &'static str, why: String) {
+        self.steps.push(Step {
+            user_agent: ua.to_owned(),
+            name,
+            ok: false,
+            status: None,
+            bytes: 0,
+            first_byte_ms: None,
+            total_ms: 0,
+            note: why,
+        });
+    }
+
     /// A step that could not run; whatever stopped it was reported by an earlier step.
     fn skipped(&mut self, ua: &str, name: &'static str, why: &str) {
         self.steps.push(Step {
@@ -414,7 +525,10 @@ impl Probe<'_> {
         });
     }
 
-    async fn login(&mut self, ua: &str, c: &Credentials) {
+    /// Logs in with `ua`. Returns whether another User-Agent is worth trying: the upstream
+    /// refused this one by its policy (403), not the credentials (401), which repeated
+    /// attempts could get locked.
+    async fn login(&mut self, ua: &str, c: &Credentials) -> bool {
         let body = serde_json::json!({ "Username": c.user, "Pw": c.password }).to_string();
         let session = self
             .step(
@@ -431,7 +545,10 @@ impl Probe<'_> {
                     if a.status != 200 {
                         return (false, refused(a), None);
                     }
-                    let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or_default();
+                    let v = match json(a) {
+                        Ok(v) => v,
+                        Err(e) => return (false, e, None),
+                    };
                     match (v["AccessToken"].as_str(), v["User"]["Id"].as_str()) {
                         (Some(t), Some(u)) => (
                             true,
@@ -439,6 +556,7 @@ impl Probe<'_> {
                             Some(Session {
                                 token: t.to_owned(),
                                 user_id: u.to_owned(),
+                                user_agent: ua.to_owned(),
                             }),
                         ),
                         _ => (false, "no access token in the answer".into(), None),
@@ -448,15 +566,24 @@ impl Probe<'_> {
             .await
             .flatten();
         self.session = session;
+        self.session.is_none() && self.steps.last().and_then(|s| s.status) == Some(403)
     }
 
-    async fn logout(&mut self, ua: &str) {
-        let headers = self.headers(ua);
+    /// Ends `session`, whose token `headers` no longer adds.
+    async fn logout(&self, session: &Session) {
+        let mut headers = self.headers(&session.user_agent);
+        headers.push(("x-emby-token", session.token.clone()));
         let _ = self
             .client
-            .send("POST", "/emby/Sessions/Logout", &headers, Some(b""), 0)
+            .send(
+                self.target,
+                "POST",
+                "/emby/Sessions/Logout",
+                &headers,
+                Some(b""),
+                0,
+            )
             .await;
-        self.session = None;
     }
 
     /// The steps for one User-Agent.
@@ -473,7 +600,10 @@ impl Probe<'_> {
                 if a.status != 200 {
                     return (false, refused(a), ());
                 }
-                let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or_default();
+                let v = match json(a) {
+                    Ok(v) => v,
+                    Err(e) => return (false, e, ()),
+                };
                 let mut note = match v["Version"].as_str() {
                     Some(version) => format!("Emby {version}"),
                     None => "not an Emby answer".to_owned(),
@@ -508,7 +638,10 @@ impl Probe<'_> {
                 if a.status != 200 {
                     return (false, refused(a), ());
                 }
-                let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or_default();
+                let v = match json(a) {
+                    Ok(v) => v,
+                    Err(e) => return (false, e, ()),
+                };
                 match v["Items"].as_array() {
                     Some(items) => (true, format!("{} libraries", items.len()), ()),
                     None => (false, "no Items in the answer".into(), ()),
@@ -535,7 +668,10 @@ impl Probe<'_> {
                     if a.status != 200 {
                         return (false, refused(a), Latest::default());
                     }
-                    let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or_default();
+                    let v = match json(a) {
+                        Ok(v) => v,
+                        Err(e) => return (false, e, Latest::default()),
+                    };
                     let items = v["Items"].as_array().cloned().unwrap_or_default();
                     let id = |i: &serde_json::Value| i["Id"].as_str().map(str::to_owned);
                     let found = Latest {
@@ -563,6 +699,9 @@ impl Probe<'_> {
                     ),
                     &[],
                     |a| {
+                        if let Some(to) = followed(direct, a) {
+                            return (true, to, ());
+                        }
                         let image = a.content_type.starts_with("image/");
                         let ok = a.status == 200 && image;
                         let note = if ok {
@@ -601,14 +740,19 @@ impl Probe<'_> {
                     if a.status != 200 {
                         return (false, refused(a), None);
                     }
-                    let v: serde_json::Value = serde_json::from_slice(&a.body).unwrap_or_default();
+                    let v = match json(a) {
+                        Ok(v) => v,
+                        Err(e) => return (false, e, None),
+                    };
                     let url = v["MediaSources"][0]["DirectStreamUrl"]
                         .as_str()
                         .map(str::to_owned);
                     let leaked = leaked(&a.body, &leaks);
                     let (ok, mut note) = match url.as_deref() {
                         None => (false, "no direct stream URL".to_owned()),
-                        Some(u) if !u.contains("://") => (true, "direct stream: relative".into()),
+                        Some(u) if absolute_host(u).is_none() => {
+                            (true, "direct stream: relative".into())
+                        }
                         Some(u) => {
                             let host = url_host(u);
                             if host.eq_ignore_ascii_case(&site_host)
@@ -635,9 +779,16 @@ impl Probe<'_> {
             self.skipped(ua, "media", "no stream to read");
             return;
         };
-        let path = stream_path(&url);
+        let (elsewhere, path) = match self.stream_at(&url).await {
+            Ok(at) => at,
+            Err(e) => {
+                self.failed(ua, "media", e);
+                return;
+            }
+        };
         let range = [("range", format!("bytes=0-{}", RANGE_BYTES - 1))];
-        self.step(
+        self.step_at(
+            elsewhere.as_ref(),
             ua,
             "media",
             ("GET", &path, None, RANGE_BYTES as usize),
@@ -654,15 +805,15 @@ impl Probe<'_> {
                         total.map_or_else(String::new, |t| format!("of {t} bytes")),
                         (),
                     ),
-                    301 | 302 | 307 | 308 if direct => (
-                        true,
-                        format!(
-                            "redirects to {}",
-                            url_host(a.location.as_deref().unwrap_or_default())
-                        ),
+                    200 => (
+                        false,
+                        "the range was ignored: 200 with the whole file".into(),
                         (),
                     ),
-                    _ => (false, refused(a), ()),
+                    _ => match followed(direct, a) {
+                        Some(to) => (true, to, ()),
+                        None => (false, refused(a), ()),
+                    },
                 }
             },
         )
@@ -676,7 +827,7 @@ impl Probe<'_> {
             .iter()
             .map(|u| u.host.clone())
             .chain(site.aliases.iter().cloned())
-            .chain(site.mounts.values().map(|m| url_host(m).to_owned()))
+            .chain(site.mounts.values().cloned())
             .map(|h| h.to_ascii_lowercase())
             .filter(|h| !h.is_empty())
             .collect()
@@ -700,19 +851,111 @@ fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The note for an unexpected status: the status line's meaning and a short body.
+/// An absolute stream URL, as a client reaches it.
+struct StreamUrl<'u> {
+    tls: bool,
+    /// Without brackets around an IPv6 address.
+    host: &'u str,
+    port: u16,
+    /// Path and query.
+    path: String,
+}
+
+impl<'u> StreamUrl<'u> {
+    /// Parses an `http`, `https` or scheme-relative (https, as the probe's own requests)
+    /// URL; user information is dropped.
+    fn parse(url: &'u str) -> Result<Self, String> {
+        let (tls, rest) = match url.strip_prefix("//") {
+            Some(rest) => (true, rest),
+            None => {
+                let (scheme, rest) = url
+                    .split_once("://")
+                    .ok_or_else(|| "the stream URL is not absolute".to_owned())?;
+                match scheme.to_ascii_lowercase().as_str() {
+                    "https" => (true, rest),
+                    "http" => (false, rest),
+                    other => return Err(format!("stream URL scheme {other}")),
+                }
+            }
+        };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(end);
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !port.contains(']') => (
+                host,
+                port.parse::<u16>()
+                    .ok()
+                    .filter(|&p| p != 0)
+                    .ok_or_else(|| format!("stream URL port {port}"))?,
+            ),
+            _ => (authority, if tls { 443 } else { 80 }),
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.is_empty() {
+            return Err("the stream URL has no host".into());
+        }
+        let tail = tail.split('#').next().unwrap_or_default();
+        let path = if tail.starts_with('/') {
+            tail.to_owned()
+        } else {
+            format!("/{tail}")
+        };
+        Ok(Self {
+            tls,
+            host,
+            port,
+            path,
+        })
+    }
+}
+
+/// The answer as JSON, or why it is not.
+fn json(a: &Answer) -> Result<serde_json::Value, String> {
+    if a.cut {
+        return Err(format!("answer over {} MiB, not read", MAX_JSON >> 20));
+    }
+    serde_json::from_slice(&a.body).map_err(|_| "not JSON".to_owned())
+}
+
+/// Directly, a redirect passes as a client follows it: the note naming where it goes.
+/// Through the relay the relay follows, so a redirect reaching the probe is a failure.
+fn followed(direct: bool, a: &Answer) -> Option<String> {
+    let location = a
+        .location
+        .as_deref()
+        .filter(|_| direct && follow::is_redirect(a.status))?;
+    Some(match absolute_host(location) {
+        Some(host) => format!("redirects to {host}"),
+        None => "redirects on the same host".to_owned(),
+    })
+}
+
+/// The note for an unexpected status: a short text of the answer, else the status's
+/// standard phrase.
 fn refused(a: &Answer) -> String {
-    let text: String = String::from_utf8_lossy(&a.body)
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(60)
-        .collect();
-    if a.content_type.starts_with("text/html") {
-        html_title(&String::from_utf8_lossy(&a.body)).unwrap_or_default()
+    let body = String::from_utf8_lossy(&a.body);
+    let text = if a.content_type.starts_with("text/html") {
+        html_title(&body)
     } else if a.content_type.starts_with("text/") || a.content_type.contains("json") {
-        text.trim().to_owned()
+        Some(body.into_owned())
     } else {
-        String::new()
+        None
+    };
+    // Redacted whole, then shortened.
+    let text = text.map_or_else(String::new, |t| {
+        redact(&t)
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(60)
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    });
+    if text.is_empty() {
+        a.reason.to_owned()
+    } else {
+        text
     }
 }
 
@@ -724,10 +967,24 @@ fn html_title(page: &str) -> Option<String> {
     Some(page.get(start..end)?.trim().to_owned())
 }
 
+/// The host (and port) of an absolute or scheme-relative URL, without any user
+/// information; `None` for a path.
+fn absolute_host(url: &str) -> Option<&str> {
+    let rest = match url.find("://") {
+        Some(i) if !url[..i].contains(['/', '?', '#']) => &url[i + 3..],
+        _ => url.strip_prefix("//")?,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    Some(
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host),
+    )
+}
+
 /// The host (and port) of an absolute URL, or the text itself.
 fn url_host(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+    absolute_host(url).unwrap_or(url)
 }
 
 /// Which of `names` appear in `body`, ignoring ASCII case.
@@ -740,14 +997,9 @@ fn leaked(body: &[u8], names: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The request path for a direct stream URL: relative ones are under `/emby` like
-/// every API path; absolute ones on the site keep their path.
+/// The request path for a relative direct stream URL: under `/emby` like every API
+/// path.
 fn stream_path(url: &str) -> String {
-    if let Some((_, rest)) = url.split_once("://") {
-        return rest
-            .find('/')
-            .map_or_else(|| "/".to_owned(), |i| rest[i..].to_owned());
-    }
     let url = if url.starts_with('/') {
         url.to_owned()
     } else {
@@ -780,20 +1032,126 @@ mod tests {
             "/emby/videos/1/stream?x=1"
         );
         assert_eq!(stream_path("/emby/videos/1"), "/emby/videos/1");
-        assert_eq!(
-            stream_path("https://a.example.com:8443/__m/v/1?x"),
-            "/__m/v/1?x"
-        );
+        assert_eq!(stream_path("videos/1"), "/emby/videos/1");
         assert_eq!(
             url_host("https://a.example.com:8443/x"),
             "a.example.com:8443"
         );
         assert_eq!(url_host("http://172.17.0.1:8096"), "172.17.0.1:8096");
+        assert_eq!(url_host("https://u:p@cdn.example.net/x"), "cdn.example.net");
+        assert_eq!(
+            absolute_host("//cdn.example.net/x?a"),
+            Some("cdn.example.net")
+        );
+        assert_eq!(absolute_host("/videos/1?next=https://x.example.net/"), None);
+        assert_eq!(absolute_host("relative/x"), None);
         assert_eq!(
             html_title("<html><head><TITLE>403 Forbidden</TITLE></head>").as_deref(),
             Some("403 Forbidden")
         );
         assert_eq!(html_title("<p>no title</p>"), None);
+    }
+
+    fn answer(status: u16, content_type: &str, body: &str) -> Answer {
+        Answer {
+            status,
+            reason: pingora_http::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|s| s.canonical_reason())
+                .unwrap_or_default(),
+            content_type: content_type.to_owned(),
+            location: None,
+            content_range: None,
+            body: body.as_bytes().to_vec(),
+            cut: false,
+            first_byte: Duration::ZERO,
+            total: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn notes_for_refusals_are_short_and_carry_no_credentials() {
+        assert_eq!(refused(&answer(403, "video/mp4", "")), "Forbidden");
+        assert_eq!(refused(&answer(404, "application/json", "")), "Not Found");
+        let note = refused(&answer(
+            500,
+            "text/plain",
+            "cannot open /videos/1/stream?api_key=0123456789abcdef&x=1 gone",
+        ));
+        assert_eq!(
+            note,
+            "cannot open /videos/1/stream?api_key=REDACTED&x=1 gone"
+        );
+        // Kept to 60 characters.
+        let long = "y".repeat(100);
+        assert_eq!(refused(&answer(500, "text/plain", &long)).len(), 60);
+        assert_eq!(
+            refused(&answer(502, "text/html", "<title>502 Bad Gateway</title>")),
+            "502 Bad Gateway"
+        );
+    }
+
+    #[test]
+    fn cut_answers_are_not_parsed() {
+        let mut a = answer(200, "application/json", "{\"Items\":[");
+        assert_eq!(json(&a).unwrap_err(), "not JSON");
+        a.cut = true;
+        assert_eq!(json(&a).unwrap_err(), "answer over 4 MiB, not read");
+    }
+
+    #[test]
+    fn only_direct_probes_follow_redirects() {
+        let mut a = answer(301, "text/html", "");
+        a.location = Some("https://img.example.net/i/1".into());
+        assert_eq!(
+            followed(true, &a).as_deref(),
+            Some("redirects to img.example.net")
+        );
+        assert_eq!(followed(false, &a), None);
+        a.location = Some("/img/1".into());
+        assert_eq!(
+            followed(true, &a).as_deref(),
+            Some("redirects on the same host")
+        );
+        a.status = 200;
+        assert_eq!(followed(true, &a), None);
+    }
+
+    #[test]
+    fn stream_urls_as_a_client_reaches_them() {
+        let p = |u: &str| StreamUrl::parse(u).map(|s| (s.tls, s.host.to_owned(), s.port, s.path));
+        assert_eq!(
+            p("http://192.0.2.5:8096/videos/1/stream.mkv?api_key=k"),
+            Ok((
+                false,
+                "192.0.2.5".into(),
+                8096,
+                "/videos/1/stream.mkv?api_key=k".into()
+            ))
+        );
+        assert_eq!(
+            p("HTTP://cdn.example.net/v/1"),
+            Ok((false, "cdn.example.net".into(), 80, "/v/1".into()))
+        );
+        assert_eq!(
+            p("https://u:p@cdn.example.net?x=1#f"),
+            Ok((true, "cdn.example.net".into(), 443, "/?x=1".into()))
+        );
+        assert_eq!(
+            p("//[2001:db8::1]:8920/v"),
+            Ok((true, "2001:db8::1".into(), 8920, "/v".into()))
+        );
+        assert!(p("ftp://cdn.example.net/v").is_err());
+        assert!(p("https://cdn.example.net:0/v").is_err());
+        assert!(p("https:///v").is_err());
+        assert_eq!(
+            Target::new("[2001:db8::1]:8920".parse().unwrap(), "2001:db8::1", true).authority,
+            "[2001:db8::1]:8920"
+        );
+        assert_eq!(
+            Target::new("192.0.2.5:80".parse().unwrap(), "cdn.example.net", false).authority,
+            "cdn.example.net"
+        );
     }
 
     #[test]
