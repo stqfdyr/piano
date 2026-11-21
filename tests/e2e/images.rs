@@ -323,3 +323,38 @@ async fn an_expired_image_stands_in_only_for_failures() {
     assert_eq!((limited.status, limited.body.as_str()), (200, "image h2"));
     assert_eq!(w.cache_fields(4), ["miss", "miss", "miss", "stale"]);
 }
+
+#[tokio::test]
+async fn a_remembered_target_that_is_gone_is_asked_for_again() {
+    let w = world_with("[cache]\nimage_memory_mib = 0\n", false).await;
+    let query = "moved=1&codes=200,200,404,200";
+    // Requests for the target itself are relayed as they are and count with it.
+    assert_eq!(w.get(&format!("/img/t1?{query}")).await.status, 200);
+    let path = format!("/Items/t1/Images/Primary?{query}");
+    assert_eq!(w.get(&path).await.status, 200);
+    // The remembered target answers 404: the upstream is asked where the image is now.
+    let got = w.get(&path).await;
+    assert_eq!((got.status, got.body.as_str()), (200, "image t1"));
+    assert_eq!(w.origin.hits("/Items/t1/Images/Primary"), 2);
+    assert_eq!(w.origin.hits("/img/t1"), 4);
+}
+
+#[tokio::test]
+async fn temporary_redirects_are_not_remembered() {
+    let w = world_with("[cache]\nimage_memory_mib = 0\n", false).await;
+    for _ in 0..2 {
+        let got = w.get("/Items/r2/Images/Primary?moved=302").await;
+        assert_eq!((got.status, got.body.as_str()), (200, "image r2"));
+    }
+    assert_eq!(w.origin.hits("/Items/r2/Images/Primary"), 2);
+}
+
+#[tokio::test]
+async fn images_of_many_chunks_are_stored() {
+    let w = world().await;
+    for _ in 0..2 {
+        let got = w.get("/Items/b1/Images/Primary?size=1000000").await;
+        assert_eq!((got.status, got.body.len()), (200, 1_000_000));
+    }
+    assert_eq!(w.cache_fields(2), ["miss", "hit"]);
+}

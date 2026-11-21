@@ -122,6 +122,18 @@ async fn an_address_that_failed_is_not_tried_again_for_the_same_request() {
 }
 
 #[tokio::test]
+async fn image_fetches_move_to_the_next_address() {
+    let w = world(&[ip(2), ip(3), ip(1)]).await;
+    assert_eq!(
+        w.send(Proto::H1, "GET", "/Items/n1/Images/Primary").await,
+        (200, "image n1".into())
+    );
+    let l = &w.relay.access_lines(ACCESS_LOG, 1)[0];
+    assert_eq!(l["cache"], "miss");
+    assert_eq!(l["up"].as_array().unwrap().len(), 3, "{l}");
+}
+
+#[tokio::test]
 async fn post_is_retried_after_a_refused_connection() {
     let w = world(&[ip(2), ip(1)]).await;
     assert_eq!(

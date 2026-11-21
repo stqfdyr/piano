@@ -319,7 +319,8 @@ pub struct Site {
     pub server_domains: ServerDomains,
     /// The upstream's request limit. Image requests then queue so that a quarter of it
     /// stays free for browsing and playback. Without it, image requests only hold back
-    /// while the upstream asks for a pause with 429.
+    /// while the upstream asks for a pause with 429. Sites with the same upstream share
+    /// its budget and must give the same limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_limit: Option<UpstreamLimit>,
     /// Overrides `[upstream] h2` for this site's upstream and the hosts it redirects to.

@@ -1,4 +1,4 @@
-use crate::Config;
+use crate::{Config, UpstreamLimit};
 use std::collections::HashSet;
 
 /// One problem found while validating a configuration.
@@ -61,6 +61,15 @@ pub enum ValidationError {
     RelativeTrafficFile(std::path::PathBuf),
     #[error("site {site:?}: upstream_limit {reason}")]
     BadUpstreamLimit { site: String, reason: &'static str },
+    #[error(
+        "site {site:?}: upstream_limit differs from site {other:?}, which has the same \
+         upstream {upstream}; the limit is the upstream's and both sites share it"
+    )]
+    UpstreamLimitDiffers {
+        site: String,
+        other: String,
+        upstream: String,
+    },
     #[error("site {site:?}: upstream {url:?}: {reason}")]
     BadUpstream {
         site: String,
@@ -340,6 +349,24 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
             }),
         }
     }
+    // Sites with one upstream share its request budget, so they must agree on its limit.
+    let mut limits: Vec<(&UpstreamUrl, &str, Option<UpstreamLimit>)> = Vec::new();
+    for site in &config.sites {
+        let Some(url) = &site.upstream_url else {
+            continue;
+        };
+        match limits.iter().find(|(u, ..)| *u == url) {
+            Some((_, other, limit)) if *limit != site.upstream_limit => {
+                errors.push(ValidationError::UpstreamLimitDiffers {
+                    site: site.name.clone(),
+                    other: (*other).to_owned(),
+                    upstream: url.authority(),
+                });
+            }
+            Some(_) => {}
+            None => limits.push((url, &site.name, site.upstream_limit)),
+        }
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -576,6 +603,32 @@ max_connections = 0
             assert!(
                 matches!(errs[..], [ValidationError::BadUpstreamLimit { .. }]),
                 "{bad}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sites_with_one_upstream_share_its_limit() {
+        let site = |host: &str, upstream: &str, limit: &str| {
+            format!("\n[[site]]\nhost = {host:?}\nupstream = {upstream:?}\n{limit}\n")
+        };
+        let limit = "upstream_limit = { burst = 150, per_sec = 2.5 }";
+        let same = "https://emby.example.net";
+        let ok = format!(
+            "{MINIMAL}{limit}\n{}{}",
+            site("b.example.com", same, limit),
+            site("c.example.com", "https://emby.example.net:8443", "")
+        );
+        parse(&ok).unwrap();
+        for other in ["", "upstream_limit = { burst = 150, per_sec = 3 }"] {
+            let errs = errors(&format!(
+                "{MINIMAL}{limit}\n{}",
+                site("b.example.com", "https://EMBY.example.net/", other)
+            ));
+            assert!(
+                matches!(&errs[..], [ValidationError::UpstreamLimitDiffers { site, other, upstream }]
+                    if site == "b" && other == "media" && upstream == "emby.example.net"),
+                "{errs:?}"
             );
         }
     }
