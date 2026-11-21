@@ -227,6 +227,13 @@ mod tests {
             ("/emby/Users/u1/Items", Api),
             ("/emby/Videos/1/AdditionalParts", Api),
             ("/System/Info/Other", Api),
+            ("/Users/Public", Api),
+            ("//a/Images", Api),
+            ("/emby/Items/5/Similar", Api),
+            ("/Play/x", Api),
+            ("/x/subtitle/y", Api),
+            ("/Users/Info", Api),
+            ("/System/Ext/Other", Api),
             ("/emby", Api),
             ("/", Api),
             ("", Api),
@@ -255,6 +262,7 @@ mod tests {
         assert!(b.blocks("/system/ext/serverdomains"));
         assert!(!b.blocks("/api/danmu"));
         assert!(!b.blocks("/embyapi/danmu/1"));
+        assert!(!b.blocks("/embz/api/danmu/1"));
         assert!(!b.blocks("/emby/System/Info"));
         assert!(!BlockList::default().blocks("/anything"));
     }
