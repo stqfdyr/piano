@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Why a chain with [`CertInfo::incomplete_chain`] is a problem.
-pub const INCOMPLETE_CHAIN: &str = "the certificate file holds only the leaf, without its \
-     intermediate certificates; clients that do not fetch them refuse the connection";
+pub const INCOMPLETE_CHAIN: &str = "the certificate file lacks the certificate that issued the \
+     leaf (an intermediate, or a private root); clients that do not fetch it refuse the \
+     connection";
 
 /// ALPN identifiers offered to clients, most preferred first.
 pub const ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
@@ -94,8 +95,8 @@ pub struct CertInfo {
     pub not_after: Option<i64>,
     /// When the files were loaded.
     pub loaded: SystemTime,
-    /// The chain holds only a leaf that another certificate issued: the intermediate
-    /// certificates are missing, and clients that do not fetch them refuse it.
+    /// Another certificate issued the leaf, and the chain does not hold it: clients that
+    /// do not fetch it refuse the chain.
     pub incomplete_chain: bool,
 }
 
@@ -104,10 +105,13 @@ impl CertInfo {
     fn of(chain: &[CertificateDer<'_>]) -> Option<Self> {
         let leaf = chain.first()?;
         let parsed = x509_parser::parse_x509_certificate(leaf.as_ref()).ok();
-        let incomplete_chain = chain.len() == 1
-            && parsed
-                .as_ref()
-                .is_some_and(|(_, c)| c.issuer() != c.subject());
+        let incomplete_chain = parsed.as_ref().is_some_and(|(_, leaf)| {
+            leaf.issuer() != leaf.subject()
+                && !chain[1..].iter().any(|c| {
+                    x509_parser::parse_x509_certificate(c.as_ref())
+                        .is_ok_and(|(_, c)| c.subject() == leaf.issuer())
+                })
+        });
         let names = parsed
             .as_ref()
             .and_then(|(_, c)| c.subject_alternative_name().ok().flatten())
@@ -256,7 +260,12 @@ mod tests {
             .unwrap();
         let leaf = leaf.der().clone();
         let full = [leaf.clone(), ca.der().clone()];
+        let unrelated = params(&[])
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap();
+        let wrong = [leaf.clone(), unrelated.der().clone()];
         assert!(CertInfo::of(&[leaf]).unwrap().incomplete_chain);
+        assert!(CertInfo::of(&wrong).unwrap().incomplete_chain);
         assert!(!CertInfo::of(&full).unwrap().incomplete_chain);
         assert_eq!(CertInfo::of(&full).unwrap().names, ["media.example.com"]);
     }

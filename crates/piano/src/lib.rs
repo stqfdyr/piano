@@ -96,8 +96,6 @@ struct CertSource {
     key: PathBuf,
     hosts: Vec<String>,
     stamp: [Option<(SystemTime, u64)>; 2],
-    /// Why the files, changed since they were loaded, cannot be loaded now.
-    error: Option<String>,
 }
 
 impl CertSource {
@@ -107,7 +105,6 @@ impl CertSource {
             key: config.tls.key.clone(),
             hosts: config.sites.iter().map(|s| s.host.clone()).collect(),
             stamp: [None, None],
-            error: None,
         };
         s.stamp = s.current_stamp();
         s
@@ -139,6 +136,9 @@ pub struct Live {
     access_log: Arc<AccessLog>,
     certs: Arc<CertStore>,
     cert_source: Mutex<CertSource>,
+    /// Set while changed certificate files cannot be loaded; apart from `cert_source`,
+    /// whose lock is held while files are read.
+    cert_error: Mutex<Option<String>>,
     sites: Arc<ArcSwap<Sites>>,
     resolver: Resolver,
     fixed: Fixed,
@@ -430,6 +430,7 @@ pub fn build_with(
         access_log,
         certs,
         cert_source: Mutex::new(CertSource::of(config)),
+        cert_error: Mutex::new(None),
         sites,
         resolver,
         fixed: Fixed::of(config),
@@ -528,15 +529,24 @@ impl Live {
         self.access_log
             .set_path(config.log.access_path())
             .map_err(Error::AccessLog)?;
-        // Under the lock, so an hourly check of the old files cannot swap their table
-        // back in after this one.
+        // Under the lock the hourly check holds, so neither undoes the other: files that
+        // changed since they were read above are read again.
         let mut cert_source = self
             .cert_source
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut source, mut table) = (source, table);
+        let stamp = source.current_stamp();
+        if stamp != source.stamp
+            && let Ok(t) = source.load()
+        {
+            table = t;
+            source.stamp = stamp;
+        }
         self.certs.replace(table);
         *cert_source = source;
         drop(cert_source);
+        self.set_cert_error(None);
         self.access.replace(acl);
         self.sites.store(Arc::new(sites));
         self.images.set_capacity(image_memory(config));
@@ -553,25 +563,33 @@ impl Live {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stamp = source.current_stamp();
         if stamp == source.stamp {
+            // The files are those being served, whatever failed in between.
+            self.set_cert_error(None);
             return Ok(false);
         }
         let table = source
             .load()
-            .inspect_err(|e| source.error = Some(e.to_string()))?;
+            .inspect_err(|e| self.set_cert_error(Some(e.to_string())))?;
         self.certs.replace(table);
         source.stamp = stamp;
-        source.error = None;
+        self.set_cert_error(None);
         Ok(true)
     }
 
     /// Why renewed certificate files could not be loaded at the last check, while the
     /// previous certificate is still served.
     pub fn cert_reload_error(&self) -> Option<String> {
-        self.cert_source
+        self.cert_error
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .error
             .clone()
+    }
+
+    fn set_cert_error(&self, error: Option<String>) {
+        *self
+            .cert_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = error;
     }
 
     /// Starts a new access log file at the same path, after logrotate moved the old one.

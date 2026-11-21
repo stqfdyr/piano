@@ -206,3 +206,28 @@ async fn half_written_certificate_files_keep_the_current_one() {
     assert!(w.relay.refresh_certs().unwrap());
     assert_eq!(w.relay.cert_reload_error(), None);
 }
+
+#[tokio::test]
+async fn restored_certificate_files_clear_the_reload_error() {
+    let w = world("", "").await;
+    let paths = ["site0.crt", "site0.key"].map(|f| w.relay.log_path(f));
+    let saved = paths.clone().map(|p| {
+        let modified = std::fs::metadata(&p).unwrap().modified().unwrap();
+        (std::fs::read(&p).unwrap(), modified)
+    });
+    std::fs::write(&paths[1], "not a key").unwrap();
+    assert!(w.relay.refresh_certs().is_err());
+    assert!(w.relay.cert_reload_error().is_some());
+    // Put back as `mv` from a backup would: same bytes, same modification time.
+    for (p, (bytes, modified)) in paths.iter().zip(saved) {
+        std::fs::write(p, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+    assert!(!w.relay.refresh_certs().unwrap());
+    assert_eq!(w.relay.cert_reload_error(), None);
+}
