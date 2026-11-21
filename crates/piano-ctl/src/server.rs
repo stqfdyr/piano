@@ -314,6 +314,31 @@ mod tests {
         assert!(matches!(bind(&path), Err(BindError::NotSocket(_))));
     }
 
+    #[test]
+    fn only_root_and_the_daemons_own_user_may_connect() {
+        let me = nix::unistd::geteuid().as_raw();
+        assert!(allowed(0));
+        assert!(allowed(me));
+        assert!(!allowed(if me == 65534 { 65533 } else { 65534 }));
+    }
+
+    #[test]
+    fn a_connection_closed_without_a_reply_is_reported_as_such() {
+        let dir = Dir::new();
+        let path = dir.0.join("ctl.sock");
+        let bound = bind(&path).unwrap();
+        bound.listener.set_nonblocking(false).unwrap();
+        let closer = std::thread::spawn(move || {
+            // Read the request, as a daemon does, then close without answering.
+            let (mut s, _) = bound.listener.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = frame::read_blocking(&mut s, MAX_REQUEST);
+        });
+        let r = call(&path, "status", Duration::from_secs(5));
+        closer.join().unwrap();
+        assert!(matches!(r, Err(ClientError::Closed)), "{r:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serves_commands_and_removes_the_socket_at_shutdown() {
         let dir = Dir::new();
