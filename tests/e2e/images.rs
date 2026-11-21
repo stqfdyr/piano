@@ -266,13 +266,13 @@ async fn cache_stats_and_purge() {
 }
 
 #[tokio::test]
-async fn an_image_purged_while_revalidated_is_fetched_anew() {
+async fn an_image_purged_while_revalidated_is_stored_again() {
     let w = world_with("", true).await;
-    let path = "/Items/e1/Images/Primary?ttl=1&delay_ms=600";
+    let path = "/Items/e1/Images/Primary?ttl=1&delay_ms=1000";
     w.get(path).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     // The stored copy goes while the upstream is asked to confirm it; a request that
-    // arrives then has no copy of its own.
+    // arrives then has no copy of its own and waits for the same confirmation.
     let late = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let socket = w.relay.control_socket();
@@ -286,7 +286,13 @@ async fn an_image_purged_while_revalidated_is_fetched_anew() {
     let (first, late) = tokio::join!(w.get(path), late);
     assert_eq!((first.status, first.body.as_str()), (200, "image e1"));
     assert_eq!((late.status, late.body.as_str()), (200, "image e1"));
-    assert_eq!(w.origin.hits("/Items/e1/Images/Primary"), 3);
+    assert_eq!(w.origin.hits("/Items/e1/Images/Primary"), 2);
+    // The confirmed copy is stored again.
+    assert_eq!(w.get(path).await.status, 200);
+    assert_eq!(
+        w.cache_fields(4),
+        ["miss", "revalidated", "revalidated", "hit"]
+    );
 }
 
 #[tokio::test]

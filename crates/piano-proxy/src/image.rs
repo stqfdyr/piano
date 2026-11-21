@@ -24,7 +24,7 @@ use http::header::{
     VARY,
 };
 use http::{HeaderName, HeaderValue, Method};
-use piano_cache::{Budget, BudgetState, Lru, Wait, Weigh, image_key, shared_ttl};
+use piano_cache::{Budget, BudgetState, Freshness, Lru, Wait, Weigh, image_key, shared_ttl};
 use piano_telemetry::Kind;
 use pingora_core::protocols::http::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -366,14 +366,19 @@ impl Images {
         );
     }
 
-    /// Marks the stored image fresh again for `ttl` (by default its previous lifetime),
-    /// after the upstream confirmed it. An image evicted or purged meanwhile stays gone.
-    fn refresh(&self, key: &str, ttl: Option<Duration>, now: Instant) {
+    /// Stores `old` again after the upstream confirmed it, fresh for what the
+    /// confirmation allows (its previous lifetime when it says nothing). It is stored
+    /// even if it was evicted or purged meanwhile: the confirmation makes it current.
+    fn refresh(&self, key: &str, old: &Stored, fresh: Freshness, now: Instant) {
         let mut s = lock(&self.state);
-        let Some(old) = s.bodies.get(key).cloned() else {
-            return;
+        let ttl = match fresh {
+            Freshness::For(ttl) => ttl,
+            Freshness::Unstated => old.fresh_until.saturating_duration_since(old.stored_at),
+            Freshness::Never => {
+                s.bodies.remove(key);
+                return;
+            }
         };
-        let ttl = ttl.unwrap_or_else(|| old.fresh_until.saturating_duration_since(old.stored_at));
         s.bodies.insert(
             key.to_owned(),
             Arc::new(Stored {
@@ -438,6 +443,7 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
                     site: ctx.site,
                     budget: images.budget(site),
                     req: fetch_request(session.req_header(), stale.as_deref())?,
+                    held: stale.clone(),
                     client_path: session.req_header().raw_path().to_vec(),
                     start: ctx.hop.clone(),
                     key: key.clone(),
@@ -550,6 +556,8 @@ struct Spec {
     /// A mounted host, or the site's upstream when `None`.
     start: Option<Hop>,
     key: String,
+    /// The stored copy whose validators `req` carries.
+    held: Option<Arc<Stored>>,
     log: Mutex<Vec<AttemptLog>>,
 }
 
@@ -617,7 +625,7 @@ async fn admit(budget: &Budget, free: bool) -> std::result::Result<(), Duration>
 
 enum Got {
     Response(Arc<Stored>),
-    NotModified(Option<Duration>),
+    NotModified(Freshness),
     TooLarge,
 }
 
@@ -633,11 +641,16 @@ fn conclude(spec: &Spec, got: Result<Got>) -> Fetched {
             }
             Fetched::Response(r)
         }
-        Ok(Got::NotModified(ttl)) => {
-            // Waiters without the stored copy hand the request to the plain proxy.
-            spec.images.refresh(&spec.key, ttl, now);
-            Fetched::NotModified
-        }
+        Ok(Got::NotModified(fresh)) => match &spec.held {
+            Some(old) => {
+                spec.images.refresh(&spec.key, old, fresh, now);
+                Fetched::NotModified
+            }
+            None => Fetched::Failed(
+                ErrorType::InvalidHTTPHeader,
+                "304 to an unconditional request".into(),
+            ),
+        },
         Ok(Got::TooLarge) => Fetched::TooLarge,
         Err(e) => Fetched::Failed(e.etype().clone(), e.to_string()),
     }
@@ -778,9 +791,12 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
         if announced.is_some_and(|n| n > MAX_IMAGE as u64) {
             return Ok(Got::TooLarge);
         }
-        // Within MAX_IMAGE by the check above.
-        let announced = announced.and_then(|n| usize::try_from(n).ok());
-        let mut body = BytesMut::with_capacity(announced.unwrap_or(0));
+        // Within MAX_IMAGE by the check above; only an image that may be stored is
+        // worth allocating for before it arrives.
+        let presize = announced
+            .filter(|_| status == 200)
+            .and_then(|n| usize::try_from(n).ok());
+        let mut body = BytesMut::with_capacity(presize.unwrap_or(0));
         loop {
             match http.read_response_body().await {
                 Ok(Some(data)) => {
@@ -802,16 +818,19 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             .images
             .release_http_session(http, &peer, idle)
             .await;
-        return Ok(Got::Response(Arc::new(stored(
-            site,
-            &host,
-            resp,
-            exact(body),
-        )?)));
+        return Ok(Got::Response(Arc::new(stored(site, &host, resp, body)?)));
     }
     Err(last
         .unwrap_or_else(|| Error::explain(ErrorType::InternalError, "no upstream attempt"))
         .into_up())
+}
+
+/// A header field in allocations of its own. Parsed fields can be slices of the
+/// connection's read buffer, which a stored copy would keep alive uncounted.
+fn owned(name: &HeaderName, value: &HeaderValue) -> (HeaderName, HeaderValue) {
+    let name = HeaderName::from_bytes(name.as_str().as_bytes()).unwrap_or_else(|_| name.clone());
+    let value = HeaderValue::from_bytes(value.as_bytes()).unwrap_or_else(|_| value.clone());
+    (name, value)
 }
 
 /// `body` without spare capacity. A stored image keeps its whole allocation, and a
@@ -826,7 +845,7 @@ fn exact(body: BytesMut) -> Bytes {
 }
 
 /// How long `resp` may be served from the store.
-fn ttl_of(resp: &ResponseHeader) -> Option<Duration> {
+fn ttl_of(resp: &ResponseHeader) -> Freshness {
     let lines = resp.headers.get_all(CACHE_CONTROL).into_iter();
     shared_ttl(lines.map(HeaderValue::as_bytes), MAX_TTL)
 }
@@ -868,18 +887,26 @@ async fn drain(reach: Arc<Reach>, mut http: HttpSession, peer: HttpPeer) {
 }
 
 /// The upstream's answer as kept and replayed; fresh for as long as it may be cached.
-fn stored(site: &Site, host: &str, mut resp: ResponseHeader, body: Bytes) -> Result<Stored> {
+fn stored(site: &Site, host: &str, mut resp: ResponseHeader, body: BytesMut) -> Result<Stored> {
     headers::scrub_response(&mut resp, host, &site.host)?;
     let now = Instant::now();
     let ttl = cacheable(&resp, body.len())
-        .then(|| ttl_of(&resp))
+        .then(|| ttl_of(&resp).ttl())
         .flatten();
+    let kept = ttl.is_some();
     let headers = resp
         .headers
         .iter()
         .filter(|(k, _)| !NOT_STORED.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| {
+            if kept {
+                owned(k, v)
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
         .collect();
+    let body = if kept { exact(body) } else { body.freeze() };
     Ok(Stored {
         status: resp.status.as_u16(),
         headers,
@@ -1129,8 +1156,8 @@ mod tests {
     fn a_refreshed_image_is_fresh_then_stale_then_gone() {
         let images = Images::new(1 << 20);
         let t = Instant::now();
-        images.store("a", image(10));
-        images.refresh("a", Some(Duration::from_secs(60)), t);
+        let old = image(10);
+        images.refresh("a", &old, Freshness::For(Duration::from_secs(60)), t);
         let at = |d: u64| images.look("a", t + Duration::from_secs(d));
         assert!(matches!(at(59), Look::Fresh(_)));
         assert!(matches!(at(61), Look::Stale(_)));
@@ -1143,6 +1170,29 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmation_keeps_or_ends_the_lifetime() {
+        let images = Images::new(1 << 20);
+        let base = stored(&[]);
+        let start = base.stored_at;
+        let old = Stored {
+            fresh_until: start + Duration::from_secs(30),
+            ..base
+        };
+        let at = |d: u64| start + Duration::from_secs(d);
+        images.refresh("a", &old, Freshness::Unstated, at(100));
+        assert!(
+            matches!(images.look("a", at(129)), Look::Fresh(_)),
+            "its previous lifetime again"
+        );
+        assert!(matches!(images.look("a", at(131)), Look::Stale(_)));
+        images.refresh("a", &old, Freshness::Never, at(100));
+        assert!(
+            matches!(images.look("a", at(100)), Look::None),
+            "a confirmation that forbids storing"
+        );
+    }
+
+    #[test]
     fn every_cache_control_line_counts() {
         let two = |second| {
             resp(
@@ -1150,9 +1200,12 @@ mod tests {
                 &[("cache-control", "max-age=60"), ("cache-control", second)],
             )
         };
-        assert_eq!(ttl_of(&two("private")), None);
-        assert_eq!(ttl_of(&two("s-maxage=600")), Some(Duration::from_secs(600)));
-        assert_eq!(ttl_of(&resp(200, &[])), None);
+        assert_eq!(ttl_of(&two("private")), Freshness::Never);
+        assert_eq!(
+            ttl_of(&two("s-maxage=600")),
+            Freshness::For(Duration::from_secs(600))
+        );
+        assert_eq!(ttl_of(&resp(200, &[])), Freshness::Unstated);
     }
 
     #[test]
