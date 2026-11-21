@@ -295,10 +295,13 @@ mod tests {
 
     #[test]
     fn skips_anchors_inside_a_replaced_authority() {
-        // A name ending in "http" holds the start of an "http://" anchor.
-        let r = Rewriter::new(vec!["cdn.myhttp".into()], Vec::new()).unwrap();
-        let (out, n) = r.rewrite(b"https://cdn.myhttp://x", HOST, PUBLIC).unwrap();
-        assert_eq!(out, b"https://media.example.com:8443://x");
+        // Only a name ending in "http" can hold the start of an "http://" anchor; no name
+        // under a reserved example domain does, so this is a single-label one.
+        let r = Rewriter::new(vec!["emby-http".into()], Vec::new()).unwrap();
+        let (out, n) = r
+            .rewrite(b"https://emby-http://emby-http/x", HOST, PUBLIC)
+            .unwrap();
+        assert_eq!(out, b"https://media.example.com:8443://emby-http/x");
         assert_eq!(n, 1);
     }
 

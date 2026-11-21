@@ -1,10 +1,11 @@
 //! Upstream addresses in JSON bodies replaced by the relay's.
 
-use piano_e2e::client::{Proto, client};
+use piano_e2e::client::{Proto, client, connect, read_head, read_response};
 use piano_e2e::origin::{INFO_PUBLIC, Origin, SERVER_DOMAINS, gunzip, json_doc, unbrotli};
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
+use tokio::io::AsyncWriteExt;
 
 const ALIAS: &str = "alias.example.net";
 const PLAYBACK_INFO: &str = "/emby/Items/1/PlaybackInfo";
@@ -187,21 +188,42 @@ async fn compressed_upstream_bodies_pass_unchanged() {
 }
 
 #[tokio::test]
-async fn head_requests_carry_the_upstream_headers_unchanged() {
+async fn head_requests_describe_what_get_would_send() {
     let w = world("").await;
     let length = json_doc(&w.origin_host(), 0).len().to_string();
     for proto in [Proto::H1, Proto::H2] {
-        for path in [PLAYBACK_INFO, "/__json"] {
-            let r = w.send(proto, "HEAD", path, Some("gzip")).await;
-            assert_eq!(r.status, 200, "{proto:?} {path}");
-            assert!(r.body.is_empty(), "{proto:?} {path}");
-            assert_eq!(r.header("content-length"), length, "{proto:?} {path}");
-            assert_eq!(r.header("content-encoding"), "", "{proto:?} {path}");
-            assert_eq!(r.header("etag"), "\"v1\"", "{proto:?} {path}");
-        }
+        // Rewritten: the headers of the rewritten GET.
+        let r = w.send(proto, "HEAD", PLAYBACK_INFO, None).await;
+        assert_eq!(r.status, 200, "{proto:?}");
+        assert!(r.body.is_empty(), "{proto:?}");
+        assert_eq!(r.header("content-length"), "", "{proto:?}");
+        assert_eq!(r.header("etag"), "W/\"v1\"", "{proto:?}");
+        // Passed through: the upstream's headers.
+        let r = w.send(proto, "HEAD", "/__json", Some("gzip")).await;
+        assert_eq!(r.status, 200, "{proto:?}");
+        assert!(r.body.is_empty(), "{proto:?}");
+        assert_eq!(r.header("content-length"), length, "{proto:?}");
+        assert_eq!(r.header("etag"), "\"v1\"", "{proto:?}");
     }
     let lines = w.relay.access_lines(ACCESS_LOG, 4);
     assert!(lines.iter().all(|l| l["end"] == "ok"), "{lines:?}");
+}
+
+#[tokio::test]
+async fn a_head_request_leaves_the_connection_usable() {
+    let w = world("").await;
+    let mut io = connect(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1).await;
+    let host = w.public();
+    let head = format!("HEAD {PLAYBACK_INFO} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    io.write_all(head.as_bytes()).await.unwrap();
+    let head = read_head(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // A body or a missing terminator after the HEAD response would corrupt this one.
+    let get = format!("GET /__info HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    io.write_all(get.as_bytes()).await.unwrap();
+    let (head, body) = read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, INFO_PUBLIC.as_bytes());
 }
 
 #[tokio::test]

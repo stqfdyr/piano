@@ -223,6 +223,7 @@ impl Origin {
                             if head {
                                 if let Some(n) = response.body().size_hint().exact()
                                     && !response.headers().contains_key(CONTENT_LENGTH)
+                                    && !matches!(response.status().as_u16(), 100..=199 | 204 | 304)
                                 {
                                     response.headers_mut().insert(CONTENT_LENGTH, n.into());
                                 }
