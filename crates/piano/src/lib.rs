@@ -519,6 +519,32 @@ fn server_options(config: &Config) -> HttpServerOptions {
 }
 
 impl Live {
+    /// Looks up the upstreams again and moves each to its new addresses if they
+    /// changed; an upstream whose lookup fails keeps the addresses it has. Blocks on
+    /// the lookups.
+    pub fn refresh_origins(&self) {
+        let sites = self.sites.load();
+        let mut done: Vec<(&str, u16)> = Vec::new();
+        for origin in sites.iter().map(|s| &s.origin) {
+            if done.contains(&(origin.host.as_str(), origin.port)) {
+                continue;
+            }
+            done.push((&origin.host, origin.port));
+            match self.resolver.resolve_blocking(&origin.host, origin.port) {
+                Ok(fresh) => {
+                    if let Some((old, new)) = origin.addrs.update(fresh) {
+                        log::info!(
+                            "upstream {}:{} now resolves to {new:?} (was {old:?})",
+                            origin.host,
+                            origin.port
+                        );
+                    }
+                }
+                Err(e) => log::warn!("keeping the current addresses of the upstream: {e}"),
+            }
+        }
+    }
+
     /// Replaces certificates, the allow list and the site table with those of `config`.
     ///
     /// Everything is built before anything is swapped, so on error the running

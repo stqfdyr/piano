@@ -1,14 +1,15 @@
 //! Host name resolution.
 //!
-//! Configured upstreams are resolved once when the site table is built. Redirect
-//! targets are resolved when first followed, must resolve to public addresses, and keep
-//! their addresses for a while. A host keeps using one address, so its pooled
-//! connections stay in one bucket, until connecting to that address fails.
+//! Configured upstreams are resolved when the site table is built and looked up again
+//! from time to time ([`Addrs::update`]). Redirect targets are resolved when first
+//! followed, must resolve to public addresses, and keep their addresses for a while. A
+//! host keeps using one address, so its pooled connections stay in one bucket, until
+//! connecting to that address fails or a new lookup no longer lists it.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
@@ -118,7 +119,8 @@ fn ipv4_first(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// every request to the host, so a failed address is skipped by later requests too.
 #[derive(Debug)]
 pub struct Addrs {
-    list: Box<[SocketAddr]>,
+    /// Never empty. Replaced only by [`Addrs::update`].
+    list: RwLock<Box<[SocketAddr]>>,
     current: AtomicUsize,
 }
 
@@ -129,37 +131,68 @@ impl Addrs {
             return None;
         }
         Some(Self {
-            list: list.into_boxed_slice(),
+            list: RwLock::new(list.into_boxed_slice()),
             current: AtomicUsize::new(0),
         })
     }
 
+    fn list(&self) -> std::sync::RwLockReadGuard<'_, Box<[SocketAddr]>> {
+        // The list is replaced whole, so a panic elsewhere cannot leave it inconsistent.
+        self.list.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The address to connect to.
     pub fn current(&self) -> SocketAddr {
-        let i = self.current.load(Ordering::Relaxed);
-        self.list[i % self.list.len()]
+        let list = self.list();
+        list[self.current.load(Ordering::Relaxed) % list.len()]
     }
 
     /// Number of distinct addresses.
     pub fn len(&self) -> usize {
-        self.list.len()
+        self.list().len()
     }
 
     /// Never true: an empty list is not an `Addrs`.
     pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
+        self.list().is_empty()
     }
 
     /// Moves on to the next address after connecting to `failed` did not work. When
     /// several requests fail on the same address at once, only the first moves on.
     pub fn failed(&self, failed: SocketAddr) {
+        let list = self.list();
         let i = self.current.load(Ordering::Relaxed);
-        if self.list[i % self.list.len()] == failed {
-            let next = (i + 1) % self.list.len();
+        if list[i % list.len()] == failed {
+            let next = (i + 1) % list.len();
             let _ = self
                 .current
                 .compare_exchange(i, next, Ordering::Relaxed, Ordering::Relaxed);
         }
+    }
+
+    /// Takes the addresses of `fresh`, a new lookup of the same host, if they differ
+    /// from the current ones as a set. The address in use stays in use while it is
+    /// still listed, so its pooled connections are kept. Returns the old and new lists
+    /// when they differed.
+    pub fn update(&self, fresh: Addrs) -> Option<(Vec<SocketAddr>, Vec<SocketAddr>)> {
+        let fresh = fresh
+            .list
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut list = self.list.write().unwrap_or_else(PoisonError::into_inner);
+        let sorted = |l: &[SocketAddr]| {
+            let mut l = l.to_vec();
+            l.sort_unstable();
+            l
+        };
+        if sorted(&list) == sorted(&fresh) {
+            return None;
+        }
+        let in_use = list[self.current.load(Ordering::Relaxed) % list.len()];
+        let next = fresh.iter().position(|&a| a == in_use).unwrap_or(0);
+        let old = std::mem::replace(&mut *list, fresh);
+        self.current.store(next, Ordering::Relaxed);
+        Some((old.into_vec(), list.to_vec()))
     }
 }
 
@@ -312,6 +345,30 @@ mod tests {
             keep_public("a.example.net", vec![]),
             Err(Error::NoAddress(_))
         ));
+    }
+
+    #[test]
+    fn updates_keep_the_address_in_use_while_it_is_listed() {
+        let (a, b, c) = (
+            sa("192.0.2.1:443"),
+            sa("192.0.2.2:443"),
+            sa("192.0.2.3:443"),
+        );
+        let addrs = Addrs::new(vec![a, b]).unwrap();
+        addrs.failed(a);
+        assert_eq!(addrs.current(), b);
+        // The same set in another order is no change.
+        assert!(addrs.update(Addrs::new(vec![b, a]).unwrap()).is_none());
+        assert_eq!(addrs.current(), b);
+        // `b` is still listed: it stays in use at its new position.
+        let (old, new) = addrs.update(Addrs::new(vec![c, b]).unwrap()).unwrap();
+        assert_eq!((old, new), (vec![a, b], vec![c, b]));
+        assert_eq!((addrs.current(), addrs.len()), (b, 2));
+        addrs.failed(b);
+        assert_eq!(addrs.current(), c);
+        // The address in use is gone: the first of the new list takes over.
+        addrs.update(Addrs::new(vec![a]).unwrap()).unwrap();
+        assert_eq!((addrs.current(), addrs.len()), (a, 1));
     }
 
     #[test]

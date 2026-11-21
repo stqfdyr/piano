@@ -1,5 +1,5 @@
 //! Signals: SIGHUP rereads the configuration, SIGUSR1 reopens the access log. Also
-//! picks up renewed certificate files.
+//! picks up renewed certificate files and moved upstream addresses.
 
 use crate::{Admin, RUNTIME_GROUP};
 use async_trait::async_trait;
@@ -15,6 +15,11 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 /// weeks before they expire, so an hour's delay costs nothing, and checking needs no
 /// hook in the renewal tool.
 const CERT_CHECK_EVERY: Duration = Duration::from_secs(3600);
+
+/// How often the upstreams are looked up again. The upstreams seen so far sit behind a
+/// CDN whose DNS answers live 300 s; an address that stops working is skipped anyway
+/// (the next listed one is tried), so this only has to catch moves within minutes.
+const ORIGIN_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
 /// Applies configuration reloads and log reopening to the running daemon, picks up
 /// renewed certificates, snapshots the request counters, writes the traffic record and
@@ -37,6 +42,13 @@ impl Reloader {
                 "certificate files changed but cannot be loaded, keeping the current certificate: {e}"
             ),
             Err(e) => error!("certificate check task failed: {e}"),
+        }
+    }
+
+    async fn refresh_origins(&self) {
+        let live = Arc::clone(self.admin.live());
+        if let Err(e) = tokio::task::spawn_blocking(move || live.refresh_origins()).await {
+            error!("upstream lookup task failed: {e}");
         }
     }
 
@@ -93,6 +105,11 @@ impl ServiceWithDependents for Reloader {
         );
         let mut tick = tokio::time::interval(logger::WINDOW);
         let mut certs = tokio::time::interval(CERT_CHECK_EVERY);
+        // The upstreams were just looked up at startup.
+        let mut origins = tokio::time::interval_at(
+            tokio::time::Instant::now() + ORIGIN_REFRESH_EVERY,
+            ORIGIN_REFRESH_EVERY,
+        );
         loop {
             tokio::select! {
                 _ = recv(&mut hup) => {
@@ -105,6 +122,7 @@ impl ServiceWithDependents for Reloader {
                     self.record_traffic().await;
                 }
                 _ = certs.tick() => self.refresh_certs().await,
+                _ = origins.tick() => self.refresh_origins().await,
                 _ = shutdown.changed() => break,
             }
         }

@@ -121,7 +121,10 @@ impl Admin {
                 ));
             }
             let level = config.log.level;
-            live.apply(&config).map(|fixed| (fixed, warnings, level))
+            let fixed = live.apply(&config)?;
+            // Upstreams kept from the running configuration are looked up again too.
+            live.refresh_origins();
+            Ok::<_, crate::Error>((fixed, warnings, level))
         })
         .await;
         let now = SystemTime::now();
