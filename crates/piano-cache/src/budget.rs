@@ -7,8 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Share of the bucket that image requests leave to other requests. Browsing issues up
-/// to about 90 API requests in 10 s (99th percentile at both relays); with the upstream
-/// refilling 2–3 a second, a quarter of a 200-request bucket covers that.
+/// to 72–88 API requests in 10 s (99th percentile at two relays). A quarter of the burst
+/// plus 10 s of refill covers that only together with the slack between the configured
+/// burst and the upstream's real one, so the configured burst belongs below the
+/// measured limit.
 const RESERVE: f64 = 0.25;
 
 /// An upstream's request limit: `burst` requests at once, refilled at `per_sec`.

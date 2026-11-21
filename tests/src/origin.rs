@@ -33,7 +33,8 @@
 //!   Query: `ttl=N` sets `max-age` (default 60, 0 omits Cache-Control; `/img/` always
 //!   86400), `codes=…` answers the n-th request of the path with the n-th status (the
 //!   last repeats; 429 carries `Retry-After` from `retry=N`, default 1), `moved=1` answers
-//!   301 to `/img/{key}`, `delay_ms=N` waits first. [`Origin::hits`] counts requests per
+//!   301 to `/img/{key}` with the same query (`moved=302`: 302), `size=N` pads the body
+//!   with dots to N bytes, `delay_ms=N` waits first. [`Origin::hits`] counts requests per
 //!   path.
 //! - A small Emby API for `piano probe` under `/emby`: `Users/AuthenticateByName` (POST,
 //!   accepts [`PROBE_USER`] / [`PROBE_PASSWORD`]), `Users/{PROBE_USER_ID}/Views` and `…/Items`,
@@ -614,11 +615,16 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         }
         None => 200,
     };
-    if !target && code == 200 && param("moved") == Some("1") {
+    let moved = match param("moved") {
+        Some("1") => Some(StatusCode::MOVED_PERMANENTLY),
+        Some("302") => Some(StatusCode::FOUND),
+        _ => None,
+    };
+    if let Some(status) = moved.filter(|_| !target && code == 200) {
         return Some(
             Response::builder()
-                .status(StatusCode::MOVED_PERMANENTLY)
-                .header("location", format!("/img/{key}"))
+                .status(status)
+                .header("location", format!("/img/{key}?{query}"))
                 .body(full("moved"))
                 .unwrap(),
         );
@@ -629,6 +635,12 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         param("ttl").and_then(|v| v.parse().ok()).unwrap_or(60)
     };
     let etag = format!("\"{key}\"");
+    let mut body = format!("image {key}");
+    let size = param("size").and_then(|v| v.parse::<usize>().ok());
+    body.extend(std::iter::repeat_n(
+        '.',
+        size.unwrap_or(0).saturating_sub(body.len()),
+    ));
     let mut builder = Response::builder().status(code);
     if ttl > 0 {
         builder = builder.header("cache-control", format!("public, max-age={ttl}"));
@@ -656,7 +668,7 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         builder
             .header(CONTENT_TYPE, "image/jpeg")
             .header("last-modified", "Sun, 23 Nov 2025 02:39:49 GMT")
-            .body(full(format!("image {key}")))
+            .body(full(body))
             .unwrap(),
     )
 }

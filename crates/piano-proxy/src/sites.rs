@@ -207,6 +207,26 @@ mod tests {
     }
 
     #[test]
+    fn only_the_upstream_itself_spends_its_budget() {
+        use crate::follow::{Target, TargetKind};
+        use crate::image::at_origin;
+        use crate::reach::Hop;
+        let s = site("media.example.com");
+        let hop = |host: &str, port| Hop {
+            target: Target {
+                host: host.into(),
+                port,
+                path: b"/".to_vec(),
+            },
+            kind: TargetKind::Upstream,
+        };
+        assert!(at_origin(&s, None));
+        assert!(at_origin(&s, Some(&hop("emby.example.net", 443))));
+        assert!(!at_origin(&s, Some(&hop("emby.example.net", 8443))));
+        assert!(!at_origin(&s, Some(&hop("cdn.example.net", 443))));
+    }
+
+    #[test]
     fn mounts_match_whole_segments_longest_first() {
         let m = Mounts::new(
             &[
