@@ -161,6 +161,22 @@ async fn without_a_follow_list_any_host_is_followed_but_not_back_into_the_relay(
 }
 
 #[tokio::test]
+async fn a_location_outside_a_redirect_is_not_followed() {
+    let w = world().await;
+    for status in [201, 304] {
+        let res = w
+            .get(Proto::H1, &redirect("/__echo", status))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status);
+    }
+    for l in w.relay.access_lines(ACCESS_LOG, 2) {
+        assert_eq!(l["up"].as_array().unwrap().len(), 1, "{l}");
+    }
+}
+
+#[tokio::test]
 async fn redirect_chains_are_capped() {
     let w = world().await;
     assert_eq!(
@@ -223,10 +239,11 @@ async fn access_log_shows_each_hop_and_why_a_redirect_was_refused() {
     for to in [
         format!("https://{EVIL}:{port}/__echo?api_key=s3cret"),
         "ftp://vod.example.net/x?api_key=s3cret".to_owned(),
+        "https://user:pw0rd@192.0.2.1/x?sign=s3cret".to_owned(),
     ] {
         assert_eq!(text(w.get(Proto::H1, &redirect(&to, 302))).await.0, 502);
     }
-    let lines = w.relay.access_lines(ACCESS_LOG, 3);
+    let lines = w.relay.access_lines(ACCESS_LOG, 4);
 
     let l = &lines[0];
     assert_eq!(l["end"], "ok", "{l}");
@@ -238,14 +255,21 @@ async fn access_log_shows_each_hop_and_why_a_redirect_was_refused() {
         .collect();
     assert_eq!(hops, [(ORIGIN_HOST, 302), (VOD, 200)], "{l}");
 
-    for (l, reason) in lines[1..].iter().zip([EVIL, "scheme"]) {
+    for (l, reason) in lines[1..]
+        .iter()
+        .zip([EVIL, "scheme", "credentials: \"https://192.0.2.1\""])
+    {
         assert_eq!(l["end"], "redirect_refused", "{l}");
         assert_eq!(l["status"], 502, "{l}");
         assert!(l["err"].as_str().unwrap().contains(reason), "{l}");
         assert_eq!(l["up"].as_array().unwrap().len(), 1, "{l}");
     }
-    // The client's own path carries the Location percent-encoded; the decoded
-    // credential must appear nowhere.
+    // The client's own path carries the Location percent-encoded, so the decoded forms
+    // must appear nowhere: a refused Location shows its scheme and host only, since its
+    // path, query and user info can carry signatures and passwords that redaction does
+    // not recognise.
     let text = w.relay.access_text(ACCESS_LOG);
-    assert!(!text.contains("api_key=s3cret"), "{text}");
+    for secret in ["api_key=s3cret", "sign=s3cret", "user:pw0rd"] {
+        assert!(!text.contains(secret), "{secret}: {text}");
+    }
 }

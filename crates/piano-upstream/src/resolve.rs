@@ -199,13 +199,13 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     let bits = u128::from(ip);
     let in_net =
         |net: u128, prefix: u32| bits & u128::MAX.checked_shl(128 - prefix).unwrap_or(0) == net;
-    // Global unicast is 2000::/3; within it, exclude documentation, Teredo, 6to4 and
-    // NAT64, which can embed private IPv4 addresses.
+    // Global unicast is 2000::/3, which leaves out NAT64 (64:ff9b::/96); within it,
+    // exclude documentation, and Teredo and 6to4, which can embed private IPv4 addresses.
     in_net(0x2000 << 112, 3)
         && !in_net(0x2001_0db8 << 96, 32)
+        && !in_net(0x3fff << 112, 20)
         && !in_net(0x2001_0000 << 96, 32)
         && !in_net(0x2002 << 112, 16)
-        && !in_net(0x0064_ff9b << 96, 32)
 }
 
 type Entries = HashMap<(String, u16), (Arc<Addrs>, Instant)>;
@@ -293,6 +293,15 @@ mod tests {
         assert_eq!(addrs.current(), a);
     }
 
+    #[tokio::test]
+    async fn lookups_keep_only_public_addresses() {
+        let e = Resolver::system()
+            .resolve_public("localhost", 443)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::NotPublic { .. }), "{e}");
+    }
+
     #[test]
     fn public_addresses() {
         for ip in [
@@ -300,6 +309,8 @@ mod tests {
             "104.16.0.1",
             "2606:4700::1",
             "2a01:4f8::1",
+            "3ffe::1",
+            "3fff:1000::1",
             "::ffff:8.8.8.8",
         ] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
@@ -328,6 +339,8 @@ mod tests {
             "2002:7f00:1::",
             "64:ff9b::7f00:1",
             "2001::1",
+            "3fff::1",
+            "3fff:fff::1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }

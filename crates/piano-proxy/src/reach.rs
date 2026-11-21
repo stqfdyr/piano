@@ -209,10 +209,8 @@ pub(crate) fn redirect(
             path: client_path.to_vec(),
         },
     };
-    let target = follow::resolve(location, &base).map_err(|e| {
-        let shown = String::from_utf8_lossy(location);
-        refuse_redirect(format!("{e}: {:?}", clip(&shown, 200)))
-    })?;
+    let target = follow::resolve(location, &base)
+        .map_err(|e| refuse_redirect(format!("{e}: {:?}", location_origin(location))))?;
     // A site of this relay would receive the request again and could loop.
     if sites.find(target.host.as_bytes()).is_some() {
         return Err(refuse_redirect(format!(
@@ -227,6 +225,27 @@ pub(crate) fn redirect(
         )));
     };
     Ok(Hop { target, kind })
+}
+
+/// The scheme and host of a `Location`, as a refusal reason may show it: the path and
+/// query can carry signatures and the user info a password.
+fn location_origin(location: &[u8]) -> String {
+    let s = String::from_utf8_lossy(location.trim_ascii());
+    let delims: &[char] = &['/', '?', '#', '\\'];
+    let shown = match s.find("//") {
+        Some(i) if !s[..i].contains(delims) => {
+            let rest = &s[i + 2..];
+            let authority = &rest[..rest.find(delims).unwrap_or(rest.len())];
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            format!("{}//{host}", &s[..i])
+        }
+        _ => {
+            let head = &s[..s.find(delims).unwrap_or(s.len())];
+            head.find(':')
+                .map_or(String::new(), |c| head[..=c].to_owned())
+        }
+    };
+    clip(&shown, 100).to_owned()
 }
 
 /// A redirect that will not be followed. The reason ends up in the access log and the
@@ -267,4 +286,34 @@ pub(crate) fn clip(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusals_show_only_scheme_and_host() {
+        for (location, shown) in [
+            (
+                "https://u:pw@cdn.example.net/f?md5=abc",
+                "https://cdn.example.net",
+            ),
+            (
+                "http://192.0.2.1:5244/d/a.mkv?sign=x",
+                "http://192.0.2.1:5244",
+            ),
+            (
+                "https://cdn.example.net\\@evil.example.org/x",
+                "https://cdn.example.net",
+            ),
+            ("//a.example.net:0?expires=1", "//a.example.net:0"),
+            ("ftp://a.example.net/x?api_key=k", "ftp://a.example.net"),
+            ("javascript:alert(1)", "javascript:"),
+            ("https:a.example.net/p?sign=x", "https:"),
+            ("/relative/path?sign=x", ""),
+        ] {
+            assert_eq!(location_origin(location.as_bytes()), shown, "{location}");
+        }
+    }
 }
