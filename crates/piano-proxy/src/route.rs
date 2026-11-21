@@ -245,6 +245,22 @@ mod tests {
     }
 
     #[test]
+    fn traffic_kinds() {
+        for (class, kind) in [
+            (Media, Kind::Media),
+            (Image, Kind::Image),
+            (Socket, Kind::Socket),
+            (Subtitle, Kind::Other),
+            (PlaybackInfo, Kind::Other),
+            (Info, Kind::Other),
+            (Api, Kind::Other),
+            (Local, Kind::Other),
+        ] {
+            assert_eq!(class.kind(), kind, "{class:?}");
+        }
+    }
+
+    #[test]
     fn times_what_a_client_waits_on() {
         let (get, post) = (Method::GET, Method::POST);
         for (class, get_ttfb, post_ttfb) in [

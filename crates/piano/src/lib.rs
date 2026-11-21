@@ -427,7 +427,7 @@ pub fn build_with(
         })
     });
 
-    let (ledger, warning) = traffic::Ledger::open(config.traffic.file_path());
+    let (ledger, warning) = traffic::Ledger::open(config.traffic.file_path(), unix_now());
     if let Some(w) = warning {
         log::warn!("traffic record {w}");
     }
@@ -716,6 +716,9 @@ impl Live {
             );
         }
         self.record_traffic();
+        if let Some(e) = self.ledger.error() {
+            log::warn!("traffic counted since the last write of the record is lost: {e}");
+        }
         self.flush_access_log();
     }
 
@@ -741,11 +744,8 @@ impl Live {
         let today = chrono::Local::now().date_naive();
         self.ledger.add(&self.metrics.totals(), today);
         let before = self.ledger.error();
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        match self.ledger.save(now) {
-            Ok(_) if before.is_some() => log::info!("traffic record written again"),
+        match self.ledger.save(unix_now()) {
+            Ok(_) if before.is_some() => log::info!("traffic record written; the problem is gone"),
             Ok(_) => {}
             Err(e) if before.is_none() => {
                 log::warn!("cannot write the traffic record, retrying every minute: {e}");
@@ -763,6 +763,12 @@ impl Live {
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Builds the site table. Sites with the same upstream share its addresses, so one

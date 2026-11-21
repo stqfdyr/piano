@@ -281,10 +281,14 @@ impl Relay {
         self.live.denied_connections()
     }
 
-    /// Writes the traffic record now, as the daemon does once a minute, and reads it
-    /// back.
-    pub fn traffic(&self) -> piano::traffic::Record {
+    /// Writes the traffic record now, as the daemon does once a minute.
+    pub fn record_traffic(&self) {
         self.live.record_traffic();
+    }
+
+    /// Writes the traffic record now and reads it back.
+    pub fn traffic(&self) -> piano::traffic::Record {
+        self.record_traffic();
         piano::traffic::read(&self.dir.path().join(TRAFFIC_FILE))
             .unwrap()
             .unwrap_or_default()
