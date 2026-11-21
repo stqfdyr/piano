@@ -12,6 +12,7 @@ use piano_config::{Config, Site};
 use piano_proxy::follow;
 use piano_telemetry::redact;
 use piano_upstream::Resolver;
+use piano_upstream::resolve::is_public;
 use piano_upstream::tls::client_config;
 use pingora_core::connectors::ConnectorOptions;
 use pingora_core::connectors::http::v1::Connector;
@@ -116,9 +117,9 @@ pub async fn run(config: &Config, resolver: &Resolver, args: &Args) -> Result<Re
             .resolve_blocking(&url.host, url.port)?
             .current()
             .ok_or_else(|| piano_upstream::resolve::Error::NoAddress(url.host.clone()))?;
-        Target::new(addr, &url.host)
+        Target::new(addr, &url.host, true)
     } else {
-        Target::new(relay_address(&config.server.listen)?, &site.host)
+        Target::new(relay_address(&config.server.listen)?, &site.host, true)
     };
     let client = Client {
         connector: Connector::new(Some(options)),
@@ -185,20 +186,27 @@ struct Target {
     /// SNI, and with the port the `Host`.
     name: String,
     authority: String,
+    tls: bool,
 }
 
 impl Target {
-    fn new(addr: SocketAddr, name: &str) -> Self {
+    fn new(addr: SocketAddr, name: &str, tls: bool) -> Self {
         let name = name.to_ascii_lowercase();
-        let authority = if addr.port() == 443 {
-            name.clone()
+        let host = if name.contains(':') {
+            format!("[{name}]")
         } else {
-            format!("{name}:{}", addr.port())
+            name.clone()
+        };
+        let authority = if addr.port() == if tls { 443 } else { 80 } {
+            host
+        } else {
+            format!("{host}:{}", addr.port())
         };
         Self {
             addr,
             name,
             authority,
+            tls,
         }
     }
 }
@@ -216,7 +224,7 @@ struct Answer {
     location: Option<String>,
     content_range: Option<String>,
     body: Vec<u8>,
-    /// Reading stopped at the limit; more may have followed.
+    /// The body was longer than the limit.
     cut: bool,
     first_byte: Duration,
     total: Duration,
@@ -250,8 +258,8 @@ impl Client {
         max_body: usize,
     ) -> Result<Answer, String> {
         let start = Instant::now();
-        let mut peer =
-            HttpPeer::new(target.addr, true, target.name.clone()).map_err(|e| e.to_string())?;
+        let mut peer = HttpPeer::new(target.addr, target.tls, target.name.clone())
+            .map_err(|e| e.to_string())?;
         let o = &mut peer.options;
         o.alpn = ALPN::H1;
         o.verify_cert = true;
@@ -306,15 +314,13 @@ impl Client {
         let location = header("location");
         let content_range = header("content-range");
         let mut data = Vec::new();
-        let cut = loop {
-            if data.len() >= max_body {
-                break true;
-            }
+        while data.len() <= max_body {
             match http.read_body_bytes().await.map_err(|e| describe(&e))? {
                 Some(chunk) => data.extend_from_slice(&chunk),
-                None => break false,
+                None => break,
             }
-        };
+        }
+        let cut = data.len() > max_body;
         data.truncate(max_body);
         http.shutdown().await;
         Ok(Answer {
@@ -393,15 +399,15 @@ impl Probe<'_> {
         extra: &[(&'static str, String)],
         judge: impl FnOnce(&Answer) -> (bool, String, T),
     ) -> Option<T> {
-        let target = self.target;
-        self.step_at(target, ua, name, request, extra, judge).await
+        self.step_at(None, ua, name, request, extra, judge).await
     }
 
-    /// Runs one request as step `name` on `target`; `judge` decides on the answer and
-    /// writes the note.
+    /// Runs one request as step `name` on `elsewhere`, else the probe's target;
+    /// `judge` decides on the answer and writes the note. Another host gets no session
+    /// or client identity, as a player fetching a stream URL there sends none.
     async fn step_at<T>(
         &mut self,
-        target: &Target,
+        elsewhere: Option<&Target>,
         ua: &str,
         name: &'static str,
         request: (&str, &str, Option<&[u8]>, usize),
@@ -409,7 +415,10 @@ impl Probe<'_> {
         judge: impl FnOnce(&Answer) -> (bool, String, T),
     ) -> Option<T> {
         let (method, path, body, max) = request;
-        let mut headers = self.headers(ua);
+        let (target, mut headers) = match elsewhere {
+            Some(t) => (t, vec![("user-agent", ua.to_owned())]),
+            None => (self.target, self.headers(ua)),
+        };
         headers.extend_from_slice(extra);
         let start = Instant::now();
         let step = match self
@@ -420,7 +429,7 @@ impl Probe<'_> {
             Ok(a) => {
                 let (ok, mut note, found) = judge(&a);
                 // Upstreams that let in only the clients they know refuse piano's name.
-                if !ok && a.status == 403 && self.own_agent {
+                if !ok && a.status == 403 && self.own_agent && elsewhere.is_none() {
                     if !note.is_empty() {
                         note.push_str(" · ");
                     }
@@ -461,24 +470,31 @@ impl Probe<'_> {
         if absolute_host(url).is_none() {
             return Ok((None, stream_path(url)));
         }
-        let base = follow::Target {
-            host: self.target.name.clone(),
-            port: self.target.addr.port(),
-            path: b"/".to_vec(),
-        };
-        let to = follow::resolve(url.as_bytes(), &base).map_err(|e| format!("stream URL: {e}"))?;
-        let path = String::from_utf8_lossy(&to.path).into_owned();
-        if !self.direct || to.host == self.target.name {
-            return Ok((None, path));
+        let s = StreamUrl::parse(url)?;
+        let own = s.host.eq_ignore_ascii_case(&self.target.name);
+        // Through the relay the playback step has refused other hosts already, and the
+        // site is reached on the relay's address whatever port the URL names.
+        if !self.direct || (own && s.tls && s.port == self.target.addr.port()) {
+            return Ok((None, s.path));
         }
-        let addr = self
-            .resolver
-            .resolve_public(&to.host, to.port)
-            .await
-            .map_err(|e| e.to_string())?
-            .current()
-            .ok_or_else(|| format!("{} has no address", to.host))?;
-        Ok((Some(Target::new(addr, &to.host)), path))
+        let ip = if own {
+            self.target.addr.ip()
+        } else if let Ok(ip) = s.host.parse::<IpAddr>() {
+            if !is_public(ip) {
+                return Err(format!("stream on a non-public address {ip}"));
+            }
+            ip
+        } else {
+            self.resolver
+                .resolve_public(s.host, s.port)
+                .await
+                .map_err(|e| e.to_string())?
+                .current()
+                .ok_or_else(|| format!("{} has no address", s.host))?
+                .ip()
+        };
+        let target = Target::new(SocketAddr::new(ip, s.port), s.host, s.tls);
+        Ok((Some(target), s.path))
     }
 
     /// A step that failed before its request was sent.
@@ -770,10 +786,9 @@ impl Probe<'_> {
                 return;
             }
         };
-        let target = elsewhere.as_ref().unwrap_or(self.target);
         let range = [("range", format!("bytes=0-{}", RANGE_BYTES - 1))];
         self.step_at(
-            target,
+            elsewhere.as_ref(),
             ua,
             "media",
             ("GET", &path, None, RANGE_BYTES as usize),
@@ -834,6 +849,65 @@ fn primary_image(item: &serde_json::Value) -> Option<(String, String)> {
 
 fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// An absolute stream URL, as a client reaches it.
+struct StreamUrl<'u> {
+    tls: bool,
+    /// Without brackets around an IPv6 address.
+    host: &'u str,
+    port: u16,
+    /// Path and query.
+    path: String,
+}
+
+impl<'u> StreamUrl<'u> {
+    /// Parses an `http`, `https` or scheme-relative (https, as the probe's own requests)
+    /// URL; user information is dropped.
+    fn parse(url: &'u str) -> Result<Self, String> {
+        let (tls, rest) = match url.strip_prefix("//") {
+            Some(rest) => (true, rest),
+            None => {
+                let (scheme, rest) = url
+                    .split_once("://")
+                    .ok_or_else(|| "the stream URL is not absolute".to_owned())?;
+                match scheme.to_ascii_lowercase().as_str() {
+                    "https" => (true, rest),
+                    "http" => (false, rest),
+                    other => return Err(format!("stream URL scheme {other}")),
+                }
+            }
+        };
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(end);
+        let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !port.contains(']') => (
+                host,
+                port.parse::<u16>()
+                    .ok()
+                    .filter(|&p| p != 0)
+                    .ok_or_else(|| format!("stream URL port {port}"))?,
+            ),
+            _ => (authority, if tls { 443 } else { 80 }),
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.is_empty() {
+            return Err("the stream URL has no host".into());
+        }
+        let tail = tail.split('#').next().unwrap_or_default();
+        let path = if tail.starts_with('/') {
+            tail.to_owned()
+        } else {
+            format!("/{tail}")
+        };
+        Ok(Self {
+            tls,
+            host,
+            port,
+            path,
+        })
+    }
 }
 
 /// The answer as JSON, or why it is not.
@@ -1041,6 +1115,43 @@ mod tests {
         );
         a.status = 200;
         assert_eq!(followed(true, &a), None);
+    }
+
+    #[test]
+    fn stream_urls_as_a_client_reaches_them() {
+        let p = |u: &str| StreamUrl::parse(u).map(|s| (s.tls, s.host.to_owned(), s.port, s.path));
+        assert_eq!(
+            p("http://192.0.2.5:8096/videos/1/stream.mkv?api_key=k"),
+            Ok((
+                false,
+                "192.0.2.5".into(),
+                8096,
+                "/videos/1/stream.mkv?api_key=k".into()
+            ))
+        );
+        assert_eq!(
+            p("HTTP://cdn.example.net/v/1"),
+            Ok((false, "cdn.example.net".into(), 80, "/v/1".into()))
+        );
+        assert_eq!(
+            p("https://u:p@cdn.example.net?x=1#f"),
+            Ok((true, "cdn.example.net".into(), 443, "/?x=1".into()))
+        );
+        assert_eq!(
+            p("//[2001:db8::1]:8920/v"),
+            Ok((true, "2001:db8::1".into(), 8920, "/v".into()))
+        );
+        assert!(p("ftp://cdn.example.net/v").is_err());
+        assert!(p("https://cdn.example.net:0/v").is_err());
+        assert!(p("https:///v").is_err());
+        assert_eq!(
+            Target::new("[2001:db8::1]:8920".parse().unwrap(), "2001:db8::1", true).authority,
+            "[2001:db8::1]:8920"
+        );
+        assert_eq!(
+            Target::new("192.0.2.5:80".parse().unwrap(), "cdn.example.net", false).authority,
+            "cdn.example.net"
+        );
     }
 
     #[test]

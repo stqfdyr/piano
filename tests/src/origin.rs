@@ -301,10 +301,15 @@ impl Origin {
         seqs.get(&format!("img:{path}")).copied().unwrap_or(0)
     }
 
-    /// Requests for scripted media `key` naming `host` (without port) in `Host`.
-    pub fn media_requests_to(&self, key: &str, host: &str) -> usize {
+    /// Requests for scripted media `key` naming `host` (without port) in `Host`: all
+    /// of them, and those carrying an `X-Emby-Token`.
+    pub fn media_requests_to(&self, key: &str, host: &str) -> (usize, usize) {
         let seqs = self.state.seqs.lock().unwrap();
-        seqs.get(&format!("{key}@{host}")).copied().unwrap_or(0)
+        let count = |k: String| seqs.get(&k).copied().unwrap_or(0);
+        (
+            count(format!("{key}@{host}")),
+            count(format!("{key}@{host}#token")),
+        )
     }
 
     /// Redirects answered for scripted media `key`.
@@ -646,8 +651,8 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         .is_some_and(|v| v.as_bytes().starts_with(ELSEWHERE_UA.as_bytes()));
     let moved = match param("moved") {
         Some("1") => Some(StatusCode::MOVED_PERMANENTLY),
-        _ if elsewhere => Some(StatusCode::MOVED_PERMANENTLY),
         Some("302") => Some(StatusCode::FOUND),
+        None if elsewhere => Some(StatusCode::MOVED_PERMANENTLY),
         _ => None,
     };
     if let Some(status) = moved.filter(|_| !target && code == 200) {
@@ -859,6 +864,14 @@ async fn media(req: &Request<Incoming>, key: String, state: &State) -> Response<
         .unwrap()
         .entry(format!("{key}@{host}"))
         .or_default() += 1;
+    if req.headers().contains_key("x-emby-token") {
+        *state
+            .seqs
+            .lock()
+            .unwrap()
+            .entry(format!("{key}@{host}#token"))
+            .or_default() += 1;
+    }
     let query = req.uri().query().unwrap_or_default();
     let param = |name: &str| {
         query

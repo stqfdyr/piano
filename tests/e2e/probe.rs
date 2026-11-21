@@ -173,8 +173,9 @@ async fn direct_goes_where_the_upstream_sends_a_client() {
         (Some(206), 1 << 20)
     );
     // The stream was read from its own host, not asked of the upstream.
-    assert_eq!(origin.media_requests_to(PROBE_ITEM, STREAM_HOST), 1);
-    assert_eq!(origin.media_requests_to(PROBE_ITEM, ORIGIN_HOST), 0);
+    // From its own host, without the session token.
+    assert_eq!(origin.media_requests_to(PROBE_ITEM, STREAM_HOST), (1, 0));
+    assert_eq!(origin.media_requests_to(PROBE_ITEM, ORIGIN_HOST), (0, 0));
     // Through the relay the relay follows the redirect itself, and a stream URL on
     // another host fails.
     let r = probe(&relay, &args(Some(PROBE_PASSWORD), false, &[&ua])).await;
