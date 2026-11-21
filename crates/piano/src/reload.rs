@@ -137,12 +137,12 @@ impl ServiceWithDependents for Reloader {
             }
         }
         // After an upgrade this process may serve streams for up to drain_timeout, so their
-        // traffic is still written each minute until the runtime ends; Live::stopped
+        // traffic is written now and each minute until the runtime ends; Live::stopped
         // writes the rest.
         loop {
-            tick.tick().await;
             logger::flush_aggregated(false);
             self.record_traffic().await;
+            tick.tick().await;
         }
     }
 
