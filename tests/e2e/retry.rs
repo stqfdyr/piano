@@ -1,7 +1,7 @@
 //! Upstream attempts repeated before the response starts: only when no upstream answered.
 
 use piano_e2e::client::{Proto, client};
-use piano_e2e::origin::Origin;
+use piano_e2e::origin::{Origin, PROBE_PASSWORD, PROBE_USER};
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
@@ -128,4 +128,21 @@ async fn post_is_retried_after_a_refused_connection() {
         w.send(Proto::H1, "POST", "/__seq/post-connect/200").await,
         (200, "1".into())
     );
+    // The body reaches the next address whole: the login only succeeds with it.
+    for proto in [Proto::H1, Proto::H2] {
+        let url = format!(
+            "https://{SITE_HOST}:{}/emby/Users/AuthenticateByName",
+            w.relay.addr.port()
+        );
+        let res = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, proto)
+            .post(url)
+            .header("content-type", "application/json")
+            .body(format!(
+                "{{\"Username\":\"{PROBE_USER}\",\"Pw\":\"{PROBE_PASSWORD}\"}}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "{proto:?}");
+    }
 }
