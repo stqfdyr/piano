@@ -173,6 +173,13 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
+/// Equal as written, so that two invalid limits (NaN) written alike are not reported
+/// as differing on top of being invalid.
+fn same_limit(a: Option<UpstreamLimit>, b: Option<UpstreamLimit>) -> bool {
+    let bits = |l: Option<UpstreamLimit>| l.map(|l| (l.burst.to_bits(), l.per_sec.to_bits()));
+    bits(a) == bits(b)
+}
+
 pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     if config.server.listen.is_empty() {
@@ -356,7 +363,7 @@ pub(crate) fn validate(config: &mut Config) -> Result<(), Vec<ValidationError>> 
             continue;
         };
         match limits.iter().find(|(u, ..)| *u == url) {
-            Some((_, other, limit)) if *limit != site.upstream_limit => {
+            Some((_, other, limit)) if !same_limit(*limit, site.upstream_limit) => {
                 errors.push(ValidationError::UpstreamLimitDiffers {
                     site: site.name.clone(),
                     other: (*other).to_owned(),
@@ -620,6 +627,16 @@ max_connections = 0
             site("c.example.com", "https://emby.example.net:8443", "")
         );
         parse(&ok).unwrap();
+        let nan = "upstream_limit = { burst = nan, per_sec = 1 }";
+        let errs = errors(&format!(
+            "{MINIMAL}{nan}\n{}",
+            site("b.example.com", same, nan)
+        ));
+        assert!(
+            errs.iter()
+                .all(|e| matches!(e, ValidationError::BadUpstreamLimit { .. })),
+            "{errs:?}"
+        );
         for other in ["", "upstream_limit = { burst = 150, per_sec = 3 }"] {
             let errs = errors(&format!(
                 "{MINIMAL}{limit}\n{}",
