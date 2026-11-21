@@ -853,7 +853,7 @@ fn run(
         Ok(d) => d,
         Err(e) => {
             log::error!("{e}");
-            // A failed lookup or log file may be gone at the next start; the service
+            // An upstream that does not resolve may at the next start; the service
             // manager restarts on any code but the configuration one.
             let code = if e.is_config() {
                 exit::CONFIG
