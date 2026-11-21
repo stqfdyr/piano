@@ -25,7 +25,8 @@ const ORIGIN_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
 /// Applies configuration reloads and log reopening to the running daemon, picks up
 /// renewed certificates, snapshots the request counters, writes the traffic record and
-/// writes out the summaries of rate-limited log records.
+/// writes out the summaries of rate-limited log records. Once the server stops, only the
+/// last two go on.
 pub struct Reloader {
     admin: Arc<Admin>,
 }
@@ -135,8 +136,14 @@ impl ServiceWithDependents for Reloader {
                 _ = shutdown.changed() => break,
             }
         }
-        logger::flush_aggregated(true);
-        self.record_traffic().await;
+        // After an upgrade this process may serve streams for up to drain_timeout, so their
+        // traffic is still written each minute until the runtime ends; Live::stopped
+        // writes the rest.
+        loop {
+            tick.tick().await;
+            logger::flush_aggregated(false);
+            self.record_traffic().await;
+        }
     }
 
     fn name(&self) -> &str {
