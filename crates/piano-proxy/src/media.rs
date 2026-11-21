@@ -158,16 +158,14 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
     result
 }
 
-/// The client's request made fit to send upstream: origin-form target, HTTP/1.1,
-/// without hop-by-hop fields and without `Range`, which each request sets itself.
+/// The client's request made fit to send upstream: HTTP/1.1, without hop-by-hop fields
+/// and without `Range`, which each request sets itself. The target is already in
+/// origin-form; setting it again drops the scheme and authority an HTTP/2 client's URI
+/// carries, which would otherwise name the site rather than the upstream.
 pub(crate) fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
     let mut up = req.clone();
     up.set_version(Version::HTTP_11);
-    let target = match req.uri.path_and_query() {
-        Some(pq) if !req.raw_path().starts_with(b"/") => pq.as_str().as_bytes().to_vec(),
-        _ => req.raw_path().to_vec(),
-    };
-    up.set_raw_path(&target)?;
+    up.set_raw_path(req.raw_path())?;
     let nominated: Vec<HeaderName> = req
         .headers
         .get_all(CONNECTION)
