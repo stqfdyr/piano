@@ -153,12 +153,8 @@ pub fn read(path: &Path) -> Result<Option<Record>, Error> {
 }
 
 /// Replaces the file at `path` with `record`: written next to it, synced, then renamed
-/// over it, so a crash leaves either the old or the new record.
+/// over it, so a crash leaves either the old or the new record. The directory exists.
 fn write_atomically(path: &Path, record: &Record) -> Result<(), Error> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-    if let Some(dir) = dir {
-        std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
-    }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -167,7 +163,7 @@ fn write_atomically(path: &Path, record: &Record) -> Result<(), Error> {
     f.write_all(&text).map_err(|e| io(&tmp, e))?;
     f.sync_all().map_err(|e| io(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| io(path, e))?;
-    if let Some(dir) = dir
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
         && let Ok(d) = std::fs::File::open(dir)
     {
         // Makes the rename itself durable; a failure leaves the old record at worst.
@@ -178,8 +174,6 @@ fn write_atomically(path: &Path, record: &Record) -> Result<(), Error> {
 
 #[derive(Debug)]
 struct State {
-    /// The record as last written, with the additions since.
-    record: Record,
     /// Additions not written yet; a write adds them to the file as it is then, which
     /// another process (one draining after an upgrade) may have written too.
     pending: BTreeMap<String, BTreeMap<String, SiteBytes>>,
@@ -187,8 +181,7 @@ struct State {
     cutoff: Option<NaiveDate>,
     /// Counter readings already added, by site.
     seen: BTreeMap<String, (ByKind, ByKind)>,
-    dirty: bool,
-    /// Why the last write failed, until one succeeds.
+    /// Why the file cannot be read or written, until a write succeeds.
     error: Option<String>,
 }
 
@@ -200,47 +193,46 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Takes up the record at `path`, or keeps none when it is `None`. A file that is not a
-    /// record is moved aside to `<path>.bad` and a new record started; one that cannot be
-    /// read is left alone and nothing is recorded, rather than overwriting it. Returns
-    /// what went wrong, to be logged.
+    /// Keeps the record at `path`, or none when it is `None`. A file that is not a record
+    /// is moved aside to `<path>.bad` so that a new record can start. A file that cannot be
+    /// read is left alone: writes add to the file as it is then, so they fail, and are
+    /// retried, until it can be read. Returns what went wrong, to be logged.
     pub fn open(path: Option<&Path>) -> (Self, Option<String>) {
-        let mut warning = None;
-        let mut keep = path.map(Path::to_owned);
-        let record = match path.map(read) {
-            None | Some(Ok(None)) => Record::default(),
-            Some(Ok(Some(r))) => r,
-            Some(Err(e @ (Error::Parse { .. } | Error::Schema { .. }))) => {
-                let mut bad = path.unwrap_or(Path::new("")).as_os_str().to_owned();
+        let problem = path.and_then(|path| match read(path) {
+            Ok(_) => None,
+            Err(e @ (Error::Parse { .. } | Error::Schema { .. })) => {
+                let mut bad = path.as_os_str().to_owned();
                 bad.push(".bad");
-                warning = Some(match path.map(|p| std::fs::rename(p, &bad)) {
-                    Some(Ok(())) => format!(
-                        "{e}; moved to {} and started a new record",
-                        Path::new(&bad).display()
+                Some(match std::fs::rename(path, &bad) {
+                    Ok(()) => (
+                        format!(
+                            "{e}; moved to {} and started a new record",
+                            Path::new(&bad).display()
+                        ),
+                        None,
                     ),
-                    Some(Err(m)) => {
-                        keep = None;
-                        format!("{e}; cannot move it aside ({m}), so traffic is not recorded")
+                    Err(m) => {
+                        let e = format!("{e}; cannot move it aside: {m}");
+                        (
+                            format!("{e}; nothing is written until it is moved or fixed"),
+                            Some(e),
+                        )
                     }
-                    None => e.to_string(),
-                });
-                Record::default()
+                })
             }
-            Some(Err(e)) => {
-                keep = None;
-                warning = Some(format!("{e}; traffic is not recorded"));
-                Record::default()
-            }
-        };
+            Err(e) => Some((
+                format!("{e}; nothing is written until it can be read"),
+                Some(e.to_string()),
+            )),
+        });
+        let (warning, error) = problem.unzip();
         let ledger = Self {
-            path: keep,
+            path: path.map(Path::to_owned),
             state: Mutex::new(State {
-                record,
                 pending: BTreeMap::new(),
                 cutoff: None,
                 seen: BTreeMap::new(),
-                dirty: false,
-                error: None,
+                error: error.flatten(),
             }),
         };
         (ledger, warning)
@@ -270,33 +262,29 @@ impl Ledger {
             if gained.sent.is_zero() && gained.fetched.is_zero() {
                 continue;
             }
-            for days in [&mut st.record.days, &mut st.pending] {
-                days.entry(day.clone())
-                    .or_default()
-                    .entry(site.clone())
-                    .or_default()
-                    .add(&gained);
-            }
-            st.dirty = true;
+            st.pending
+                .entry(day.clone())
+                .or_default()
+                .entry(site.clone())
+                .or_default()
+                .add(&gained);
         }
         st.cutoff = date.checked_sub_days(Days::new(KEEP_DAYS));
-        st.dirty |= prune(&mut st.record.days, st.cutoff);
     }
 
-    /// Writes the record if it changed since the last write. `now` is Unix seconds.
+    /// Writes the additions since the last write, if there are any or the last attempt
+    /// failed. `now` is Unix seconds.
     pub fn save(&self, now: u64) -> Result<bool, Error> {
         let Some(path) = &self.path else {
             return Ok(false);
         };
         let mut st = self.state();
-        if !st.dirty {
+        if st.pending.is_empty() && st.error.is_none() {
             return Ok(false);
         }
         match merge_into_file(path, &st.pending, st.cutoff, now) {
-            Ok(record) => {
-                st.record = record;
+            Ok(()) => {
                 st.pending.clear();
-                st.dirty = false;
                 st.error = None;
                 Ok(true)
             }
@@ -307,38 +295,27 @@ impl Ledger {
         }
     }
 
-    /// Why the last write failed, while writes keep failing.
+    /// Why the file cannot be read or written, until a write succeeds.
     pub fn error(&self) -> Option<String> {
         self.state().error.clone()
     }
-
-    /// The record as it stands, unsaved additions included.
-    pub fn record(&self) -> Record {
-        self.state().record.clone()
-    }
 }
 
-/// Drops the days before `cutoff`; returns whether any went.
-fn prune(
-    days: &mut BTreeMap<String, BTreeMap<String, SiteBytes>>,
-    cutoff: Option<NaiveDate>,
-) -> bool {
-    let before = days.len();
+/// Drops the days before `cutoff` and keys that are not dates.
+fn prune(days: &mut BTreeMap<String, BTreeMap<String, SiteBytes>>, cutoff: Option<NaiveDate>) {
     days.retain(|d, _| {
         NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok_and(|d| cutoff.is_none_or(|c| d > c))
     });
-    days.len() != before
 }
 
 /// Adds `pending` to the record in the file at `path` and writes it, holding a lock
-/// beside it so that two processes do not lose each other's additions. Returns the
-/// record written.
+/// beside it so that two processes do not lose each other's additions.
 fn merge_into_file(
     path: &Path,
     pending: &BTreeMap<String, BTreeMap<String, SiteBytes>>,
     cutoff: Option<NaiveDate>,
     now: u64,
-) -> Result<Record, Error> {
+) -> Result<(), Error> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
     }
@@ -360,8 +337,7 @@ fn merge_into_file(
     }
     prune(&mut record.days, cutoff);
     record.updated = now;
-    write_atomically(path, &record)?;
-    Ok(record)
+    write_atomically(path, &record)
 }
 
 fn delta(now: &ByKind, before: &ByKind) -> ByteKinds {
@@ -424,7 +400,9 @@ mod tests {
 
     #[test]
     fn adds_what_the_counters_gained_to_the_day() {
-        let (l, w) = Ledger::open(None);
+        let dir = Dir::new("gained");
+        let path = dir.0.join("traffic.json");
+        let (l, w) = Ledger::open(Some(&path));
         assert!(w.is_none());
         l.add(
             &totals(&[("a", [100, 5, 0, 1], [120, 5, 0, 1])]),
@@ -441,7 +419,8 @@ mod tests {
             ]),
             day("2026-11-21"),
         );
-        let r = l.record();
+        assert!(l.save(1).unwrap());
+        let r = read(&path).unwrap().unwrap();
         let d20 = &r.days["2026-11-20"]["a"];
         assert_eq!(
             (d20.sent.media, d20.sent.image, d20.sent.other),
@@ -460,12 +439,11 @@ mod tests {
     #[test]
     fn two_processes_writing_one_record_keep_both_additions() {
         let dir = Dir::new("two");
-        std::fs::create_dir_all(&dir.0).unwrap();
         let path = dir.0.join("traffic.json");
         let (old, _) = Ledger::open(Some(&path));
         old.add(&totals(&[("a", [100, 0, 0, 0], [0; 4])]), day("2026-11-20"));
         assert!(old.save(1).unwrap());
-        // The successor starts from the file, then both keep adding.
+        // The successor takes over the file, then both keep adding.
         let (new, _) = Ledger::open(Some(&path));
         new.add(&totals(&[("a", [50, 0, 0, 0], [0; 4])]), day("2026-11-20"));
         old.add(&totals(&[("a", [130, 0, 0, 0], [0; 4])]), day("2026-11-20"));
@@ -473,17 +451,20 @@ mod tests {
         assert!(old.save(3).unwrap());
         let r = read(&path).unwrap().unwrap();
         assert_eq!(r.days["2026-11-20"]["a"].sent.media, 180);
-        assert_eq!(old.record().days["2026-11-20"]["a"].sent.media, 180);
+        assert_eq!(r.updated, 3);
     }
 
     #[test]
     fn days_older_than_kept_are_dropped() {
-        let (l, _) = Ledger::open(None);
-        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-09-19"));
-        l.add(&totals(&[("a", [2, 0, 0, 0], [0; 4])]), day("2026-09-20"));
+        let dir = Dir::new("old");
+        let path = dir.0.join("traffic.json");
+        let (l, _) = Ledger::open(Some(&path));
+        for (n, d) in [(1, "2026-09-19"), (2, "2026-09-20"), (3, "2026-11-20")] {
+            l.add(&totals(&[("a", [n, 0, 0, 0], [0; 4])]), day(d));
+            assert!(l.save(n).unwrap());
+        }
         // 62 days kept, today included: 2026-11-20 back to 2026-09-20.
-        l.add(&totals(&[("a", [3, 0, 0, 0], [0; 4])]), day("2026-11-20"));
-        let days: Vec<String> = l.record().days.into_keys().collect();
+        let days: Vec<String> = read(&path).unwrap().unwrap().days.into_keys().collect();
         assert_eq!(days, ["2026-09-20", "2026-11-20"]);
     }
 
@@ -522,14 +503,28 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_file_is_left_alone() {
+    fn an_unreadable_file_is_left_alone_until_it_can_be_read() {
         let dir = Dir::new("unreadable");
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let blocker = dir.0.join("blocker");
-        std::fs::write(&blocker, "").unwrap();
-        let (l, w) = Ledger::open(Some(&blocker.join("traffic.json")));
-        assert!(w.unwrap().contains("not recorded"));
-        assert!(l.path().is_none());
+        let path = dir.0.join("traffic.json");
+        // A directory where the file should be: it cannot be read as a record.
+        std::fs::create_dir_all(&path).unwrap();
+        let (l, w) = Ledger::open(Some(&path));
+        assert!(w.unwrap().contains("until it can be read"));
+        assert!(l.error().is_some());
+        assert_eq!(l.path(), Some(path.as_path()));
+        l.add(&totals(&[("a", [7, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        assert!(l.save(1).is_err());
+        assert!(path.is_dir());
+        // Once it can be read, the additions made meanwhile are written.
+        std::fs::remove_dir(&path).unwrap();
+        assert!(l.save(2).unwrap());
+        assert!(l.error().is_none());
+        assert_eq!(
+            read(&path).unwrap().unwrap().days["2026-11-20"]["a"]
+                .sent
+                .media,
+            7
+        );
     }
 
     #[test]

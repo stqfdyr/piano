@@ -775,10 +775,17 @@ fn traffic(cli: &Cli, days: usize, file: Option<&Path>) -> ExitCode {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let today = chrono::Local::now().date_naive();
+    let local = chrono::Local::now();
     print!(
         "{}",
-        render::traffic(&record, &path.display().to_string(), today, now, days)
+        render::traffic(
+            &record,
+            &path.display().to_string(),
+            local.date_naive(),
+            local.fixed_offset().timezone(),
+            now,
+            days
+        )
     );
     ExitCode::SUCCESS
 }

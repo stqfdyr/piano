@@ -1,6 +1,6 @@
 //! Text output of the management commands.
 
-use chrono::{Days, NaiveDate};
+use chrono::{Days, FixedOffset, NaiveDate};
 use piano::traffic::{Record, SiteBytes, sum_since};
 use piano_ctl::proto::{CacheStats, Counts, Latency, Level, ReloadReply, Status, UpgradeReply};
 use piano_telemetry::Kind;
@@ -460,11 +460,18 @@ pub fn cache(c: &CacheStats) -> String {
 
 /// `piano traffic`: today, the last 7 and 30 days per site, the last 30 days by kind,
 /// and the last `days` days one by one. `now` is Unix seconds.
-pub fn traffic(record: &Record, path: &str, today: NaiveDate, now: u64, days: usize) -> String {
+pub fn traffic(
+    record: &Record,
+    path: &str,
+    today: NaiveDate,
+    offset: FixedOffset,
+    now: u64,
+    days: usize,
+) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "{path} · updated {} ago · local days",
+        "{path} · updated {} ago · local days (UTC{offset})",
         ago(now, record.updated)
     );
     o.push_str(
@@ -660,7 +667,8 @@ mod tests {
             );
         }
         let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
-        let out = traffic(&r, "/x/traffic.json", today, 1060, 2);
+        let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+        let out = traffic(&r, "/x/traffic.json", today, offset, 1060, 2);
         let line = |name: &str| {
             out.lines()
                 .find(|l| l.trim_start().starts_with(name))
@@ -669,7 +677,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        assert!(out.starts_with("/x/traffic.json · updated 1m ago"), "{out}");
+        assert!(
+            out.starts_with("/x/traffic.json · updated 1m ago · local days (UTC+08:00)"),
+            "{out}"
+        );
         // today / 7 days / 30 days; 2026-10-01 is outside all of them.
         assert_eq!(
             line("alpha"),

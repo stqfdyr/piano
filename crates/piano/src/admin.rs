@@ -372,7 +372,8 @@ impl Admin {
                 "traffic_unsaved",
                 format!("the traffic record cannot be written: {error}"),
                 Some(&format!(
-                    "the daemon retries every minute; {} must be writable",
+                    "the daemon retries every minute and keeps what it counts meanwhile; {} \
+                     must be a readable record, or absent, in a writable directory",
                     path.display()
                 )),
             ));

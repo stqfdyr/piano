@@ -4,7 +4,7 @@ use piano_ctl::proto::Status;
 use piano_e2e::client::{Proto, client};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
-use piano_e2e::relay::{Relay, RelaySetup};
+use piano_e2e::relay::{Relay, RelaySetup, TRAFFIC_FILE};
 use piano_e2e::{ORIGIN_HOST, SITE_HOST};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,11 @@ async fn get(ca: &Ca, relay: &Relay, proto: Proto, path: &str) -> usize {
         .unwrap();
     assert!(res.status().is_success(), "{path}: {}", res.status());
     res.bytes().await.unwrap().len()
+}
+
+fn status(relay: &Relay) -> Status {
+    let v = piano_ctl::call(&relay.control_socket(), "status", Duration::from_secs(10)).unwrap();
+    serde_json::from_value(v).unwrap()
 }
 
 async fn status_after(relay: &Relay, n: u64) -> Status {
@@ -92,4 +97,32 @@ async fn bytes_are_counted_by_kind_and_recorded_per_day() {
     let site = record.days.values().next().unwrap()["media"];
     assert_eq!(site.sent.other, 51_000);
     assert_eq!(site.fetched.other, 51_000);
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_written_is_reported_and_retried_without_losing_bytes() {
+    let ca = Ca::new("piano e2e");
+    let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;
+    let roots = [ca.cert_pem()];
+    let relay = Relay::start(&RelaySetup {
+        control: true,
+        ..RelaySetup::new(&ca.leaf(&[SITE_HOST]), &roots, origin.addr.port())
+    });
+    // A directory where the record should be: it can be neither read nor replaced.
+    let path = relay.log_path(TRAFFIC_FILE);
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(get(&ca, &relay, Proto::H1, "/__bytes/1000").await, 1000);
+    status_after(&relay, 1).await;
+    relay.record_traffic();
+    let unsaved = |s: &Status| s.findings.iter().any(|f| f.code == "traffic_unsaved");
+    assert!(unsaved(&status(&relay)), "{:#?}", status(&relay).findings);
+    assert!(path.is_dir());
+
+    std::fs::remove_dir(&path).unwrap();
+    let record = relay.traffic();
+    assert_eq!(
+        record.days.values().next().unwrap()["media"].sent.other,
+        1000
+    );
+    assert!(!unsaved(&status(&relay)));
 }
