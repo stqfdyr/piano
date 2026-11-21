@@ -719,7 +719,7 @@ impl Live {
     }
 
     /// Call once the server has stopped: reports connections cut at the drain limit,
-    /// then writes the traffic record and the access log.
+    /// then writes the pending log summaries, the traffic record and the access log.
     pub fn stopped(&self) {
         let cut = self.drain.left_open.swap(0, Ordering::Relaxed);
         if cut > 0 {
@@ -727,6 +727,7 @@ impl Live {
                 "stopped with {cut} client connections still open at the drain limit; they were cut"
             );
         }
+        piano_telemetry::logger::flush_aggregated(true);
         self.record_traffic();
         if let Some(e) = self.ledger.error() {
             log::warn!("traffic counted since the last write of the record is lost: {e}");
