@@ -36,6 +36,8 @@ pub struct RelaySetup<'a> {
     pub access_log: &'a str,
     /// Lines of the `[limits]` table.
     pub limits: &'a str,
+    /// `upstream.read_timeout`: short, so that stall tests end quickly.
+    pub read_timeout: Duration,
     /// Serve the control socket, with the configuration written to a file for reloads.
     pub control: bool,
 }
@@ -55,6 +57,7 @@ impl<'a> RelaySetup<'a> {
             origin_ips: &[],
             access_log: ACCESS_LOG,
             limits: "",
+            read_timeout: Duration::from_secs(5),
             control: false,
         }
     }
@@ -151,7 +154,7 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
 
         [upstream]
         connect_timeout = "2s"
-        read_timeout = "5s"
+        read_timeout = "{read_timeout}s"
         extra_roots = [{roots}]
 
         [log]
@@ -173,6 +176,7 @@ fn config_text(setup: &RelaySetup<'_>, dir: &TempDir, tag: u32, port: u16) -> St
         allow = allow.join(", "),
         roots = roots.join(", "),
         limits = setup.limits,
+        read_timeout = setup.read_timeout.as_secs(),
     )
 }
 

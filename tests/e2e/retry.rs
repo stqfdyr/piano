@@ -146,3 +146,32 @@ async fn post_is_retried_after_a_refused_connection() {
         assert_eq!(res.status(), 200, "{proto:?}");
     }
 }
+
+#[tokio::test]
+async fn a_media_stream_moves_to_the_next_address_a_bounded_number_of_times() {
+    // The media engine connects on its own; the same rules hold. Two retries reach
+    // 127.0.0.4 at most, and an address that failed is not tried again.
+    for (ips, want) in [
+        (&[ip(2), ip(1)][..], Some(200)),
+        (&[ip(2), ip(3), ip(4), ip(1)][..], None),
+        (&[ip(2), ip(3)][..], None),
+    ] {
+        let w = world(ips).await;
+        let (code, _) = w
+            .send(Proto::H1, "GET", "/videos/next/stream.mkv?len=1000")
+            .await;
+        let l = &w.relay.access_lines(ACCESS_LOG, 1)[0];
+        let up = l["up"].as_array().unwrap();
+        match want {
+            Some(status) => {
+                assert_eq!((code, &l["bytes_out"]), (200, &1000.into()), "{l}");
+                assert_eq!(up.len(), 2, "{l}");
+                assert_eq!(up[1]["status"], status, "{l}");
+            }
+            None => {
+                assert_eq!(code, 502, "{l}");
+                assert_eq!(up.len(), ips.len().min(3), "{l}");
+            }
+        }
+    }
+}

@@ -15,7 +15,7 @@ use crate::relay::Ctx;
 use crate::{Relay, Site, Sites, TERMINATED, headers};
 use bytes::Bytes;
 use http::header::{
-    ACCEPT_RANGES, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
+    ACCEPT_RANGES, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE,
     LAST_MODIFIED, LOCATION, RANGE, UPGRADE,
 };
 use http::{HeaderName, HeaderValue, Method, Version};
@@ -568,8 +568,16 @@ impl Engine {
     async fn write(&mut self, session: &mut Session, data: Bytes) -> Result<()> {
         let n = data.len() as u64;
         self.stream.set_writing(true);
-        let written = session.write_response_body(Some(data), false).await;
+        // A client that stopped reading holds the write for up to the downstream write
+        // timeout; the stream still ends at once when the process terminates.
+        let written = tokio::select! {
+            w = session.write_response_body(Some(data), false) => Some(w),
+            _ = self.stop.wait_for(|t| *t) => None,
+        };
         self.stream.set_writing(false);
+        let Some(written) = written else {
+            return Error::e_explain(TERMINATED, "media stream ended at shutdown");
+        };
         written.map_err(|e| e.into_down())?;
         self.pos += n;
         self.stream.add_sent(n);
@@ -653,6 +661,12 @@ async fn request(
         http.read_timeout = peer.options.read_timeout;
         http.write_timeout = peer.options.write_timeout;
         let mut req = spec.req.clone();
+        if id > 0 {
+            // Later requests are checked against the first response by `Resume::check`;
+            // a client's If-Range that did not match then would only turn them into
+            // full 200 responses that cannot continue the body.
+            req.remove_header(&IF_RANGE);
+        }
         reach::prepare_request(site, hop.as_ref(), &mut req)?;
         if let Some(r) = &range {
             req.insert_header(RANGE, r.clone())?;
