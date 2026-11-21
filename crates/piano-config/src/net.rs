@@ -36,6 +36,19 @@ impl IpNet {
     pub fn is_everything(&self) -> bool {
         self.prefix == 0
     }
+
+    /// Whether `ip` is in this network; an address of the other family never is.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(a)) => {
+                u32::from(a) & mask_v4(self.prefix) == u32::from(net)
+            }
+            (IpAddr::V6(net), IpAddr::V6(a)) => {
+                u128::from(a) & mask_v6(self.prefix) == u128::from(net)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Mask with the top `prefix` bits set.
@@ -162,7 +175,8 @@ mod tests {
             "example.com",
             "192.0.2.0/",
             "192.0.2.0/33",
-            "192.0.2.0/+8",
+            // A valid network but for the sign, which `u8` parsing would accept.
+            "192.0.0.0/+8",
             "192.0.2.0/ 8",
             "2001:db8::/129",
             "192.0.2.5/24",

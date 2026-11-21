@@ -281,8 +281,7 @@ pub fn raise_open_file_limit(config: &Config) {
             Err(e) => log::warn!("cannot raise the open file limit from {soft} to {hard}: {e}"),
         }
     }
-    let conns = config.limits.max_connections as u64 * config.server.listen.len() as u64;
-    let need = conns * 2 + UPSTREAM_POOLS * UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS;
+    let need = open_files_needed(config);
     if limit < need {
         log::warn!(
             "open file limit {limit} is below the {need} that limits.max_connections = {} \
@@ -290,6 +289,13 @@ pub fn raise_open_file_limit(config: &Config) {
             config.limits.max_connections
         );
     }
+}
+
+/// Open files a daemon serving `config` may need: every client connection the limits
+/// allow with one upstream connection each, the upstream pools, and the rest.
+fn open_files_needed(config: &Config) -> u64 {
+    let conns = config.limits.max_connections as u64 * config.server.listen.len() as u64;
+    conns * 2 + UPSTREAM_POOLS * UPSTREAM_POOL_SIZE as u64 + RESERVED_FDS
 }
 
 /// Builds a ready-to-run server: listeners, access control, TLS and the relay service.
@@ -789,6 +795,38 @@ fn build_sites(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn config(server: &str) -> Config {
+        piano_config::parse(&format!(
+            r#"
+            [server]
+            {server}
+
+            [tls]
+            cert = "/etc/piano/fullchain.pem"
+            key  = "/etc/piano/privkey.pem"
+
+            [access]
+            allow = ["192.0.2.7"]
+
+            [[site]]
+            host     = "media.example.com"
+            upstream = "https://emby.example.net"
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn open_files_cover_both_sides_of_every_allowed_connection() {
+        // 1024 connections on the default listener, an upstream connection each, three
+        // pools of 128 and the reserve.
+        assert_eq!(open_files_needed(&config("")), 1024 * 2 + 3 * 128 + 64);
+        let two = config(r#"listen = ["192.0.2.1:443", "198.51.100.1:443"]"#);
+        assert_eq!(open_files_needed(&two), 2 * 1024 * 2 + 3 * 128 + 64);
+    }
+
     #[test]
     fn handshake_target_matches_the_fork() {
         assert_eq!(
