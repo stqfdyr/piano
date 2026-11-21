@@ -268,6 +268,11 @@ impl Relay {
         self.live.refresh_certs()
     }
 
+    /// Why the last certificate check could not load the changed files.
+    pub fn cert_reload_error(&self) -> Option<String> {
+        self.live.cert_reload_error()
+    }
+
     pub fn denied_connections(&self) -> u64 {
         self.live.denied_connections()
     }

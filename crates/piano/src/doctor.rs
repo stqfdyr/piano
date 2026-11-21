@@ -161,6 +161,14 @@ fn certificate(out: &mut Checks, config: &Config) {
                 config.tls.cert.display().to_string(),
                 detail,
             );
+            if info.incomplete_chain {
+                out.push(
+                    "configuration",
+                    Level::Warn,
+                    config.tls.cert.display().to_string(),
+                    piano_edge::tls::INCOMPLETE_CHAIN.into(),
+                );
+            }
         }
         Err(e) => out.push(
             "configuration",

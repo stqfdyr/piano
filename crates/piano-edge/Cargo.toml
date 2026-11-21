@@ -19,6 +19,8 @@ thiserror.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
+# Certificates for the chain checks.
+rcgen.workspace = true
 tokio.workspace = true
 
 [lints]

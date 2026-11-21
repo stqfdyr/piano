@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Why a chain with [`CertInfo::incomplete_chain`] is a problem.
+pub const INCOMPLETE_CHAIN: &str = "the certificate file holds only the leaf, without its \
+     intermediate certificates; clients that do not fetch them refuse the connection";
+
 /// ALPN identifiers offered to clients, most preferred first.
 pub const ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
@@ -90,11 +94,20 @@ pub struct CertInfo {
     pub not_after: Option<i64>,
     /// When the files were loaded.
     pub loaded: SystemTime,
+    /// The chain holds only a leaf that another certificate issued: the intermediate
+    /// certificates are missing, and clients that do not fetch them refuse it.
+    pub incomplete_chain: bool,
 }
 
 impl CertInfo {
-    fn of(leaf: &CertificateDer<'_>) -> Self {
+    /// Describes `chain`, whose first certificate is the leaf.
+    fn of(chain: &[CertificateDer<'_>]) -> Option<Self> {
+        let leaf = chain.first()?;
         let parsed = x509_parser::parse_x509_certificate(leaf.as_ref()).ok();
+        let incomplete_chain = chain.len() == 1
+            && parsed
+                .as_ref()
+                .is_some_and(|(_, c)| c.issuer() != c.subject());
         let names = parsed
             .as_ref()
             .and_then(|(_, c)| c.subject_alternative_name().ok().flatten())
@@ -109,11 +122,12 @@ impl CertInfo {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
+        Some(Self {
             names,
             not_after: parsed.map(|(_, c)| c.validity().not_after.timestamp()),
             loaded: SystemTime::now(),
-        }
+            incomplete_chain,
+        })
     }
 }
 
@@ -137,11 +151,8 @@ impl SniTable {
     pub fn from_files(cert: &Path, key: &Path, hosts: &[&str]) -> Result<Self, Error> {
         let provider = default_provider();
         let certified = load_certified_key(cert, key, &provider)?;
-        let info = certified
-            .cert
-            .first()
-            .map(CertInfo::of)
-            .ok_or_else(|| Error::EmptyChain(cert.to_owned()))?;
+        let info =
+            CertInfo::of(&certified.cert).ok_or_else(|| Error::EmptyChain(cert.to_owned()))?;
         let mut resolver = ResolvesServerCertUsingSni::new();
         for host in hosts {
             resolver
@@ -222,4 +233,44 @@ fn load_certified_key(
         path: key.to_owned(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+
+    fn params(names: &[&str]) -> CertificateParams {
+        CertificateParams::new(names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn a_leaf_without_its_issuer_is_an_incomplete_chain() {
+        let mut ca = params(&[]);
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(rcgen::DnType::CommonName, "issuer");
+        let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().unwrap()).unwrap();
+        let leaf = params(&["media.example.com"])
+            .signed_by(&KeyPair::generate().unwrap(), &ca)
+            .unwrap();
+        let leaf = leaf.der().clone();
+        let full = [leaf.clone(), ca.der().clone()];
+        assert!(CertInfo::of(&[leaf]).unwrap().incomplete_chain);
+        assert!(!CertInfo::of(&full).unwrap().incomplete_chain);
+        assert_eq!(CertInfo::of(&full).unwrap().names, ["media.example.com"]);
+    }
+
+    #[test]
+    fn a_self_signed_leaf_is_complete() {
+        let leaf = params(&["media.example.com"])
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap();
+        assert!(
+            !CertInfo::of(&[leaf.der().clone()])
+                .unwrap()
+                .incomplete_chain
+        );
+        assert!(CertInfo::of(&[]).is_none());
+    }
 }

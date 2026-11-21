@@ -188,6 +188,11 @@ async fn half_written_certificate_files_keep_the_current_one() {
     let old_key = w.ca.leaf(&[SITE_HOST]);
     std::fs::write(w.relay.log_path("site0.key"), &old_key.key_pem).unwrap();
     assert!(w.relay.refresh_certs().is_err());
+    let error = w
+        .relay
+        .cert_reload_error()
+        .expect("the failure is kept for status");
+    assert!(error.contains("site0.key"), "{error}");
     let res = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1)
         .get(format!(
             "https://{SITE_HOST}:{}/__info",
@@ -199,4 +204,5 @@ async fn half_written_certificate_files_keep_the_current_one() {
     assert_eq!(res.status(), 200);
     std::fs::write(w.relay.log_path("site0.key"), &leaf.key_pem).unwrap();
     assert!(w.relay.refresh_certs().unwrap());
+    assert_eq!(w.relay.cert_reload_error(), None);
 }

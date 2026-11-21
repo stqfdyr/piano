@@ -121,6 +121,14 @@ async fn unknown_sni_fails_the_handshake() {
         .await
         .unwrap_err();
     assert!(err.is_connect(), "{err:?}");
+    // By address, as a scanner would: no SNI at all. The relay refuses it, rather than
+    // the client refusing a certificate without the address.
+    let err = c
+        .get(format!("https://{}/", w.relay.addr))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("AccessDenied"), "{err:?}");
     assert_eq!(w.origin.requests(), 0);
 }
 

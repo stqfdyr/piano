@@ -791,15 +791,25 @@ fn config_check(path: &Path) -> ExitCode {
             return ExitCode::from(exit::CONFIG);
         }
     };
-    if let Err(e) = piano_edge::tls::SniTable::load(&config) {
-        eprintln!("{e}");
-        return ExitCode::from(exit::CONFIG);
-    }
+    let table = match piano_edge::tls::SniTable::load(&config) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(exit::CONFIG);
+        }
+    };
     if let Err(e) = piano_upstream::tls::client_config(&config.upstream.extra_roots) {
         eprintln!("{e}");
         return ExitCode::from(exit::CONFIG);
     }
-    let warnings = config.warnings();
+    let mut warnings: Vec<String> = config.warnings().iter().map(ToString::to_string).collect();
+    if table.info().incomplete_chain {
+        warnings.push(format!(
+            "{}: {}",
+            config.tls.cert.display(),
+            piano_edge::tls::INCOMPLETE_CHAIN
+        ));
+    }
     for w in &warnings {
         eprintln!("warning: {w}");
     }

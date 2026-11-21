@@ -96,6 +96,8 @@ struct CertSource {
     key: PathBuf,
     hosts: Vec<String>,
     stamp: [Option<(SystemTime, u64)>; 2],
+    /// Why the files, changed since they were loaded, cannot be loaded now.
+    error: Option<String>,
 }
 
 impl CertSource {
@@ -105,6 +107,7 @@ impl CertSource {
             key: config.tls.key.clone(),
             hosts: config.sites.iter().map(|s| s.host.clone()).collect(),
             stamp: [None, None],
+            error: None,
         };
         s.stamp = s.current_stamp();
         s
@@ -525,11 +528,15 @@ impl Live {
         self.access_log
             .set_path(config.log.access_path())
             .map_err(Error::AccessLog)?;
-        self.certs.replace(table);
-        *self
+        // Under the lock, so an hourly check of the old files cannot swap their table
+        // back in after this one.
+        let mut cert_source = self
             .cert_source
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.certs.replace(table);
+        *cert_source = source;
+        drop(cert_source);
         self.access.replace(acl);
         self.sites.store(Arc::new(sites));
         self.images.set_capacity(image_memory(config));
@@ -548,10 +555,23 @@ impl Live {
         if stamp == source.stamp {
             return Ok(false);
         }
-        let table = source.load()?;
+        let table = source
+            .load()
+            .inspect_err(|e| source.error = Some(e.to_string()))?;
         self.certs.replace(table);
         source.stamp = stamp;
+        source.error = None;
         Ok(true)
+    }
+
+    /// Why renewed certificate files could not be loaded at the last check, while the
+    /// previous certificate is still served.
+    pub fn cert_reload_error(&self) -> Option<String> {
+        self.cert_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .error
+            .clone()
     }
 
     /// Starts a new access log file at the same path, after logrotate moved the old one.
