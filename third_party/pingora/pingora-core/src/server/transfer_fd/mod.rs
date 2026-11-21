@@ -184,14 +184,15 @@ where
     };
     socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
 
-    /* sock is created before we change user, need to give permission */
+    // Only the owner may connect: the process handing over runs as the same user, and the
+    // descriptors of whoever connects first are served as the listening sockets.
     stat::fchmodat(
         // SAFETY: AT_FDCWD is a well-defined POSIX sentinel constant used by *at() syscalls
         // to indicate the current working directory. It is not a real file descriptor and does
         // not require ownership or lifetime guarantees.
         unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
         path,
-        stat::Mode::from_bits_truncate(0o666),
+        stat::Mode::from_bits_truncate(0o600),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
