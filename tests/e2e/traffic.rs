@@ -18,8 +18,14 @@ async fn get(ca: &Ca, relay: &Relay, proto: Proto, path: &str) -> usize {
     res.bytes().await.unwrap().len()
 }
 
-fn status(relay: &Relay) -> Status {
-    let v = piano_ctl::call(&relay.control_socket(), "status", Duration::from_secs(10)).unwrap();
+async fn status(relay: &Relay) -> Status {
+    let socket = relay.control_socket();
+    let v = tokio::task::spawn_blocking(move || {
+        piano_ctl::call(&socket, "status", Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .unwrap();
     serde_json::from_value(v).unwrap()
 }
 
@@ -110,12 +116,14 @@ async fn a_record_that_cannot_be_written_is_reported_and_retried_without_losing_
     });
     // A directory where the record should be: it can be neither read nor replaced.
     let path = relay.log_path(TRAFFIC_FILE);
+    std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
     assert_eq!(get(&ca, &relay, Proto::H1, "/__bytes/1000").await, 1000);
     status_after(&relay, 1).await;
     relay.record_traffic();
     let unsaved = |s: &Status| s.findings.iter().any(|f| f.code == "traffic_unsaved");
-    assert!(unsaved(&status(&relay)), "{:#?}", status(&relay).findings);
+    let s = status(&relay).await;
+    assert!(unsaved(&s), "{:#?}", s.findings);
     assert!(path.is_dir());
 
     std::fs::remove_dir(&path).unwrap();
@@ -124,5 +132,5 @@ async fn a_record_that_cannot_be_written_is_reported_and_retried_without_losing_
         record.days.values().next().unwrap()["media"].sent.other,
         1000
     );
-    assert!(!unsaved(&status(&relay)));
+    assert!(!unsaved(&status(&relay).await));
 }

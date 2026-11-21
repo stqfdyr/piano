@@ -471,7 +471,7 @@ pub fn traffic(
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "{path} · updated {} ago · local days (UTC{offset})",
+        "{path} · updated {} ago · local days; this host is now at UTC{offset}",
         ago(now, record.updated)
     );
     o.push_str(
@@ -678,7 +678,9 @@ mod tests {
                 .join(" ")
         };
         assert!(
-            out.starts_with("/x/traffic.json · updated 1m ago · local days (UTC+08:00)"),
+            out.starts_with(
+                "/x/traffic.json · updated 1m ago · local days; this host is now at UTC+08:00"
+            ),
             "{out}"
         );
         // today / 7 days / 30 days; 2026-10-01 is outside all of them.

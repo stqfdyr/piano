@@ -373,7 +373,7 @@ impl Admin {
                 format!("the traffic record cannot be written: {error}"),
                 Some(&format!(
                     "the daemon retries every minute and keeps what it counts meanwhile; {} \
-                     must be a readable record, or absent, in a writable directory",
+                     must be absent or a record this version reads, in a writable directory",
                     path.display()
                 )),
             ));

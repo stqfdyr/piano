@@ -123,6 +123,12 @@ pub enum Error {
     },
     #[error("{path}: schema {found}, this version reads {SCHEMA}")]
     Schema { path: String, found: u32 },
+    #[error("{path}: not a traffic record ({why}) and cannot be moved aside: {source}")]
+    Stuck {
+        path: String,
+        why: serde_json::Error,
+        source: std::io::Error,
+    },
 }
 
 fn io(path: &Path, source: std::io::Error) -> Error {
@@ -181,6 +187,8 @@ struct State {
     cutoff: Option<NaiveDate>,
     /// Counter readings already added, by site.
     seen: BTreeMap<String, (ByKind, ByKind)>,
+    /// The cutoff moved since the last write, so the file holds days to drop.
+    prune_due: bool,
     /// Why the file cannot be read or written, until a write succeeds.
     error: Option<String>,
 }
@@ -193,46 +201,26 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Keeps the record at `path`, or none when it is `None`. A file that is not a record
-    /// is moved aside to `<path>.bad` so that a new record can start. A file that cannot be
-    /// read is left alone: writes add to the file as it is then, so they fail, and are
-    /// retried, until it can be read. Returns what went wrong, to be logged.
-    pub fn open(path: Option<&Path>) -> (Self, Option<String>) {
-        let problem = path.and_then(|path| match read(path) {
-            Ok(_) => None,
-            Err(e @ (Error::Parse { .. } | Error::Schema { .. })) => {
-                let mut bad = path.as_os_str().to_owned();
-                bad.push(".bad");
-                Some(match std::fs::rename(path, &bad) {
-                    Ok(()) => (
-                        format!(
-                            "{e}; moved to {} and started a new record",
-                            Path::new(&bad).display()
-                        ),
-                        None,
-                    ),
-                    Err(m) => {
-                        let e = format!("{e}; cannot move it aside: {m}");
-                        (
-                            format!("{e}; nothing is written until it is moved or fixed"),
-                            Some(e),
-                        )
-                    }
-                })
-            }
-            Err(e) => Some((
-                format!("{e}; nothing is written until it can be read"),
+    /// Keeps the record at `path`, or none when it is `None`, and writes it at once so that
+    /// problems show at startup (see [`merge_into_file`]). `now` is Unix seconds. Returns
+    /// what went wrong, to be logged.
+    pub fn open(path: Option<&Path>, now: u64) -> (Self, Option<String>) {
+        let (warning, error) = match path.map(|p| merge_into_file(p, &BTreeMap::new(), None, now)) {
+            None | Some(Ok(None)) => (None, None),
+            Some(Ok(Some(moved))) => (Some(moved), None),
+            Some(Err(e)) => (
+                Some(format!("{e}; nothing is written until that is fixed")),
                 Some(e.to_string()),
-            )),
-        });
-        let (warning, error) = problem.unzip();
+            ),
+        };
         let ledger = Self {
             path: path.map(Path::to_owned),
             state: Mutex::new(State {
                 pending: BTreeMap::new(),
                 cutoff: None,
                 seen: BTreeMap::new(),
-                error: error.flatten(),
+                prune_due: false,
+                error,
             }),
         };
         (ledger, warning)
@@ -269,22 +257,31 @@ impl Ledger {
                 .or_default()
                 .add(&gained);
         }
-        st.cutoff = date.checked_sub_days(Days::new(KEEP_DAYS));
+        let cutoff = date.checked_sub_days(Days::new(KEEP_DAYS));
+        if cutoff != st.cutoff {
+            st.cutoff = cutoff;
+            st.prune_due = true;
+        }
+        prune(&mut st.pending, st.cutoff);
     }
 
-    /// Writes the additions since the last write, if there are any or the last attempt
-    /// failed. `now` is Unix seconds.
+    /// Writes the additions since the last write, if there are any, days fell out of
+    /// [`KEEP_DAYS`] or the last attempt failed. `now` is Unix seconds.
     pub fn save(&self, now: u64) -> Result<bool, Error> {
         let Some(path) = &self.path else {
             return Ok(false);
         };
         let mut st = self.state();
-        if st.pending.is_empty() && st.error.is_none() {
+        if st.pending.is_empty() && !st.prune_due && st.error.is_none() {
             return Ok(false);
         }
         match merge_into_file(path, &st.pending, st.cutoff, now) {
-            Ok(()) => {
+            Ok(moved) => {
+                if let Some(moved) = moved {
+                    log::warn!("traffic record {moved}");
+                }
                 st.pending.clear();
+                st.prune_due = false;
                 st.error = None;
                 Ok(true)
             }
@@ -309,13 +306,16 @@ fn prune(days: &mut BTreeMap<String, BTreeMap<String, SiteBytes>>, cutoff: Optio
 }
 
 /// Adds `pending` to the record in the file at `path` and writes it, holding a lock
-/// beside it so that two processes do not lose each other's additions.
+/// beside it so that two processes do not lose each other's additions. A file that is
+/// not a record is moved aside to `<path>.bad` and a new record started; returns what
+/// was done then. One that cannot be read, or that a newer version wrote, is left alone
+/// and nothing is written.
 fn merge_into_file(
     path: &Path,
     pending: &BTreeMap<String, BTreeMap<String, SiteBytes>>,
     cutoff: Option<NaiveDate>,
     now: u64,
-) -> Result<(), Error> {
+) -> Result<Option<String>, Error> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
     }
@@ -328,7 +328,26 @@ fn merge_into_file(
         .open(&lock_path)
         .map_err(|e| io(Path::new(&lock_path), e))?;
     lock.lock().map_err(|e| io(Path::new(&lock_path), e))?;
-    let mut record = read(path)?.unwrap_or_default();
+    let (mut record, moved) = match read(path) {
+        Ok(r) => (r.unwrap_or_default(), None),
+        Err(Error::Parse { path: p, source }) => {
+            let mut bad = path.as_os_str().to_owned();
+            bad.push(".bad");
+            if let Err(e) = std::fs::rename(path, &bad) {
+                return Err(Error::Stuck {
+                    path: p,
+                    why: source,
+                    source: e,
+                });
+            }
+            let moved = format!(
+                "{p}: not a traffic record ({source}); moved to {} and started a new record",
+                Path::new(&bad).display()
+            );
+            (Record::default(), Some(moved))
+        }
+        Err(e) => return Err(e),
+    };
     for (day, sites) in pending {
         let into = record.days.entry(day.clone()).or_default();
         for (site, bytes) in sites {
@@ -337,7 +356,8 @@ fn merge_into_file(
     }
     prune(&mut record.days, cutoff);
     record.updated = now;
-    write_atomically(path, &record)
+    write_atomically(path, &record)?;
+    Ok(moved)
 }
 
 fn delta(now: &ByKind, before: &ByKind) -> ByteKinds {
@@ -402,7 +422,7 @@ mod tests {
     fn adds_what_the_counters_gained_to_the_day() {
         let dir = Dir::new("gained");
         let path = dir.0.join("traffic.json");
-        let (l, w) = Ledger::open(Some(&path));
+        let (l, w) = Ledger::open(Some(&path), 0);
         assert!(w.is_none());
         l.add(
             &totals(&[("a", [100, 5, 0, 1], [120, 5, 0, 1])]),
@@ -440,11 +460,11 @@ mod tests {
     fn two_processes_writing_one_record_keep_both_additions() {
         let dir = Dir::new("two");
         let path = dir.0.join("traffic.json");
-        let (old, _) = Ledger::open(Some(&path));
+        let (old, _) = Ledger::open(Some(&path), 0);
         old.add(&totals(&[("a", [100, 0, 0, 0], [0; 4])]), day("2026-11-20"));
         assert!(old.save(1).unwrap());
         // The successor takes over the file, then both keep adding.
-        let (new, _) = Ledger::open(Some(&path));
+        let (new, _) = Ledger::open(Some(&path), 0);
         new.add(&totals(&[("a", [50, 0, 0, 0], [0; 4])]), day("2026-11-20"));
         old.add(&totals(&[("a", [130, 0, 0, 0], [0; 4])]), day("2026-11-20"));
         assert!(new.save(2).unwrap());
@@ -458,7 +478,7 @@ mod tests {
     fn days_older_than_kept_are_dropped() {
         let dir = Dir::new("old");
         let path = dir.0.join("traffic.json");
-        let (l, _) = Ledger::open(Some(&path));
+        let (l, _) = Ledger::open(Some(&path), 0);
         for (n, d) in [(1, "2026-09-19"), (2, "2026-09-20"), (3, "2026-11-20")] {
             l.add(&totals(&[("a", [n, 0, 0, 0], [0; 4])]), day(d));
             assert!(l.save(n).unwrap());
@@ -469,10 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn a_new_day_drops_old_days_without_new_traffic() {
+        let dir = Dir::new("newday");
+        let path = dir.0.join("traffic.json");
+        let (l, _) = Ledger::open(Some(&path), 0);
+        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-09-20"));
+        assert!(l.save(1).unwrap());
+        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-09-20"));
+        assert!(!l.save(2).unwrap());
+        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-11-21"));
+        assert!(l.save(3).unwrap());
+        assert!(read(&path).unwrap().unwrap().days.is_empty());
+    }
+
+    #[test]
     fn saves_only_changes_and_reads_back_after_a_restart() {
         let dir = Dir::new("save");
         let path = dir.0.join("sub").join("traffic.json");
-        let (l, w) = Ledger::open(Some(&path));
+        let (l, w) = Ledger::open(Some(&path), 0);
         assert!(w.is_none());
         assert!(!l.save(1).unwrap());
         l.add(
@@ -488,7 +522,7 @@ mod tests {
         assert!(!l.save(4).unwrap());
 
         // A new process starts its counters from zero and adds to the same day.
-        let (l, w) = Ledger::open(Some(&path));
+        let (l, w) = Ledger::open(Some(&path), 0);
         assert!(w.is_none());
         l.add(
             &totals(&[("a", [5, 0, 0, 0], [5, 0, 0, 0])]),
@@ -508,8 +542,8 @@ mod tests {
         let path = dir.0.join("traffic.json");
         // A directory where the file should be: it cannot be read as a record.
         std::fs::create_dir_all(&path).unwrap();
-        let (l, w) = Ledger::open(Some(&path));
-        assert!(w.unwrap().contains("until it can be read"));
+        let (l, w) = Ledger::open(Some(&path), 0);
+        assert!(w.unwrap().contains("until that is fixed"));
         assert!(l.error().is_some());
         assert_eq!(l.path(), Some(path.as_path()));
         l.add(&totals(&[("a", [7, 0, 0, 0], [0; 4])]), day("2026-11-20"));
@@ -532,17 +566,35 @@ mod tests {
         let dir = Dir::new("bad");
         std::fs::create_dir_all(&dir.0).unwrap();
         let path = dir.0.join("traffic.json");
+        let bad = dir.0.join("traffic.json.bad");
         std::fs::write(&path, r#"{"schema":1,"#).unwrap();
-        let (l, w) = Ledger::open(Some(&path));
+        let (l, w) = Ledger::open(Some(&path), 0);
         assert!(w.unwrap().contains("traffic.json.bad"));
-        assert!(dir.0.join("traffic.json.bad").exists());
-        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-11-20"));
-        assert!(l.save(1).unwrap());
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), r#"{"schema":1,"#);
         assert!(read(&path).unwrap().is_some());
 
-        std::fs::write(&path, r#"{"schema":9,"updated":0,"days":{}}"#).unwrap();
-        let (_, w) = Ledger::open(Some(&path));
+        // Damaged while running: moved aside by the next write.
+        std::fs::write(&path, "x").unwrap();
+        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        assert!(l.save(1).unwrap());
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "x");
+        let r = read(&path).unwrap().unwrap();
+        assert_eq!(r.days["2026-11-20"]["a"].sent.media, 1);
+    }
+
+    #[test]
+    fn a_record_of_a_newer_version_is_left_alone() {
+        let dir = Dir::new("newer");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("traffic.json");
+        let newer = r#"{"schema":9,"updated":0,"days":{}}"#;
+        std::fs::write(&path, newer).unwrap();
+        let (l, w) = Ledger::open(Some(&path), 0);
         assert!(w.unwrap().contains("schema 9"));
+        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        assert!(l.save(1).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        assert!(!dir.0.join("traffic.json.bad").exists());
     }
 
     #[test]
@@ -550,9 +602,10 @@ mod tests {
         let dir = Dir::new("fail");
         std::fs::create_dir_all(&dir.0).unwrap();
         let blocker = dir.0.join("blocker");
-        let (l, w) = Ledger::open(Some(&blocker.join("traffic.json")));
+        let (l, w) = Ledger::open(Some(&blocker.join("traffic.json")), 0);
         assert!(w.is_none());
         // A file where the directory should be.
+        std::fs::remove_dir_all(&blocker).unwrap();
         std::fs::write(&blocker, "").unwrap();
         l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-11-20"));
         assert!(l.save(1).is_err());
