@@ -69,6 +69,14 @@ pub async fn connect(
     .unwrap_or_else(|_| panic!("no TLS connection to {relay} within {IO_TIMEOUT:?}"))
 }
 
+/// A plain TCP connection to `relay`, for tests that never reach TLS.
+pub async fn connect_tcp(relay: SocketAddr) -> TcpStream {
+    tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(relay))
+        .await
+        .unwrap_or_else(|_| panic!("no TCP connection to {relay} within {IO_TIMEOUT:?}"))
+        .unwrap()
+}
+
 /// Reads up to the end of a response header, byte by byte so nothing after it is
 /// consumed.
 pub async fn read_head(io: &mut (impl AsyncRead + Unpin)) -> String {

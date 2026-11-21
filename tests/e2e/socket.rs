@@ -1,7 +1,7 @@
 //! The Emby websocket, relayed as an HTTP/1.1 upgrade.
 
 use piano_e2e::SITE_HOST;
-use piano_e2e::client::{Proto, connect, read_head};
+use piano_e2e::client::{IO_TIMEOUT, Proto, connect, read_head};
 use piano_e2e::origin::Origin;
 use piano_e2e::pki::Ca;
 use piano_e2e::relay::{ACCESS_LOG, Relay, RelaySetup};
@@ -31,13 +31,14 @@ async fn world() -> World {
 }
 
 async fn echo(io: &mut (impl AsyncRead + AsyncWrite + Unpin), msg: &[u8]) {
-    io.write_all(msg).await.unwrap();
-    io.flush().await.unwrap();
     let mut back = vec![0u8; msg.len()];
-    tokio::time::timeout(Duration::from_secs(5), io.read_exact(&mut back))
-        .await
-        .expect("echo timed out")
-        .unwrap();
+    tokio::time::timeout(IO_TIMEOUT, async {
+        io.write_all(msg).await.unwrap();
+        io.flush().await.unwrap();
+        io.read_exact(&mut back).await.unwrap();
+    })
+    .await
+    .expect("echo timed out");
     assert_eq!(back, msg);
 }
 
