@@ -272,14 +272,32 @@ fn version(json: bool) {
 }
 
 /// Where the daemon's control socket is: `--socket`, else the configuration file's
-/// setting, else the default. `None` when the configuration turns the socket off.
-fn socket_path(cli: &Cli) -> Option<PathBuf> {
+/// setting, which defaults when the file leaves it out. `None` when the file turns the
+/// socket off. A file that cannot be read is an error, not a reason to try the default:
+/// with several instances on a host, the default belongs to another one.
+fn socket_path(cli: &Cli) -> Result<Option<PathBuf>, piano_config::Error> {
     if let Some(s) = &cli.socket {
-        return Some(s.clone());
+        return Ok(Some(s.clone()));
     }
-    match piano_config::load(&cli.config) {
-        Ok(c) => c.control.socket_path().map(Path::to_owned),
-        Err(_) => Some(PathBuf::from(piano_config::DEFAULT_SOCKET)),
+    piano_config::load_control(&cli.config).map(|c| c.socket_path().map(Path::to_owned))
+}
+
+/// The socket of the daemon to talk to, or the message and exit code why there is none.
+fn daemon_socket(cli: &Cli) -> Result<PathBuf, ExitCode> {
+    match socket_path(cli) {
+        Ok(Some(socket)) => Ok(socket),
+        Ok(None) => {
+            eprintln!(
+                "the control socket is off (control.socket = \"\" in {})",
+                cli.config.display()
+            );
+            Err(ExitCode::from(exit::UNREACHABLE))
+        }
+        Err(e) => {
+            eprintln!("{}", e.to_string().trim_end());
+            eprintln!("cannot tell which control socket to use; give it with --socket");
+            Err(ExitCode::from(exit::CONFIG))
+        }
     }
 }
 
@@ -289,13 +307,7 @@ fn ask<T: serde::de::DeserializeOwned>(
     cmd: &str,
     timeout: Duration,
 ) -> Result<T, ExitCode> {
-    let Some(socket) = socket_path(cli) else {
-        eprintln!(
-            "the control socket is off (control.socket = \"\" in {})",
-            cli.config.display()
-        );
-        return Err(ExitCode::from(exit::UNREACHABLE));
-    };
+    let socket = daemon_socket(cli)?;
     let value = piano_ctl::call(&socket, cmd, timeout).map_err(|e| {
         eprintln!("{e}");
         match e {
@@ -322,7 +334,7 @@ const DOCTOR_TIMEOUT: Duration = Duration::from_secs(120);
 fn doctor(cli: &Cli, user: &str) -> ExitCode {
     use piano::doctor::Level;
     // A daemon that does not answer is one of the findings, not a failure.
-    let socket = socket_path(cli);
+    let socket = socket_path(cli).ok().flatten();
     let status: Option<Status> = socket.as_ref().and_then(|socket| {
         let value = piano_ctl::call(socket, "status", STATUS_TIMEOUT).ok()?;
         serde_json::from_value(value).ok()
@@ -508,12 +520,9 @@ fn top(cli: &Cli, interval: f64) -> ExitCode {
         eprintln!("piano top needs a terminal; piano top --json prints one reply");
         return ExitCode::from(exit::CONFIG);
     }
-    let Some(socket) = socket_path(cli) else {
-        eprintln!(
-            "the control socket is off (control.socket = \"\" in {})",
-            cli.config.display()
-        );
-        return ExitCode::from(exit::UNREACHABLE);
+    let socket = match daemon_socket(cli) {
+        Ok(s) => s,
+        Err(code) => return code,
     };
     // Fail before taking over the screen when the daemon is not there at all.
     if let Err(e) = top::ask(&socket, STATUS_TIMEOUT) {
