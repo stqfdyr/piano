@@ -18,10 +18,11 @@ pub const SITE_HOST: &str = "media.example.com";
 /// Name of the fake origin; resolved to loopback through the test resolver.
 pub const ORIGIN_HOST: &str = "origin.example.net";
 
-/// A loopback port kept for its owner. While this lives the system hands the port to no
-/// other bind to port 0 and no outgoing connection, so a port released before the relay
-/// binds it cannot go to another test in the meantime. A listener that sets SO_REUSEADDR,
-/// as pingora's do, can still bind and listen on it: the reserving socket never listens.
+/// A loopback port kept for its owner. On Linux (with `net.ipv4.ip_autobind_reuse` at its
+/// default 0), while this lives the port goes to no other bind to port 0 and no outgoing
+/// connection, so it cannot go to another test before the relay binds it; a listener that
+/// sets SO_REUSEADDR, as pingora's do, can still bind and listen on it because the
+/// reserving socket never listens. Other systems would need SO_REUSEPORT on both sides.
 pub struct ReservedPort {
     _socket: tokio::net::TcpSocket,
     pub port: u16,
