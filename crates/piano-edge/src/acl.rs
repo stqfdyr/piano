@@ -70,7 +70,8 @@ impl AccessFilter {
 #[async_trait]
 impl ConnectionFilter for AccessFilter {
     async fn should_accept(&self, addr: Option<&SocketAddr>) -> bool {
-        // An address that cannot be read is refused: the list is the only gate.
+        // Refuse without an address: the list is the only gate. pingora skips the filter
+        // when it cannot read the peer address, which happens only once the peer is gone.
         let ip = addr.map(SocketAddr::ip);
         let allowed = ip.is_some_and(|ip| self.acl.load().allows(ip));
         if !allowed {
