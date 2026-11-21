@@ -282,7 +282,8 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
                 }
                 match e {
                     Errno::EAGAIN => {
-                        warn!(
+                        // Expected while the old process has not sent yet; giving up is an error.
+                        debug!(
                             "No incoming socket transfer, sleep {RETRY_INTERVAL:?} and try again"
                         );
                         retried += 1;
@@ -340,7 +341,8 @@ where
                         );
                         break Err(e);
                     }
-                    warn!("server not ready, will try again in {RETRY_INTERVAL:?}");
+                    // Expected while the new process is not listening yet; giving up is an error.
+                    debug!("server not ready, will try again in {RETRY_INTERVAL:?}");
                     thread::sleep(RETRY_INTERVAL);
                 }
                 /* handle nonblocking IO */

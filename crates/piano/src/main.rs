@@ -80,8 +80,8 @@ enum Command {
     /// until they end (server.drain_timeout at most). Also applies settings that need a
     /// restart.
     Upgrade {
-        /// The new binary; by default the file the daemon was started from, which may
-        /// have been replaced since.
+        /// The new binary; by default the file the daemon was started from (a symlink
+        /// resolved at startup), which may have been replaced since.
         #[arg(long)]
         binary: Option<PathBuf>,
     },
@@ -533,8 +533,8 @@ fn top(cli: &Cli, interval: f64) -> ExitCode {
     }
 }
 
-/// The binary as this process was started from: a file installed over it later is what
-/// an upgrade runs.
+/// The binary as `/proc/self/exe` names it (symlinks resolved): a file installed over it
+/// later is what an upgrade runs. Without `/proc`, `piano` as found on PATH.
 fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("piano"))
 }
@@ -552,8 +552,8 @@ fn stop(cli: &Cli) -> ExitCode {
         Err(code) => return code,
     };
     // The process an upgrade replaced gets the signal passed on and stops within the same
-    // limit; it still holds the listening sockets until then, so a start right after
-    // this command would fail without waiting for it too.
+    // limit. It no longer listens, but waiting for it lets its last access log lines and
+    // traffic record be written before the service manager deals with what is left.
     let limit = Duration::from_secs(reply.limit_secs) + STOP_MARGIN;
     let deadline = std::time::Instant::now() + limit;
     let pids: Vec<u32> = std::iter::once(reply.pid)
