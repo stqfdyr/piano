@@ -1,5 +1,5 @@
 //! Signals: SIGHUP rereads the configuration, SIGUSR1 reopens the access log. Also
-//! picks up renewed certificate files.
+//! picks up renewed certificate files and moved upstream addresses.
 
 use crate::{Admin, RUNTIME_GROUP};
 use async_trait::async_trait;
@@ -10,11 +10,18 @@ use pingora_core::services::{ServiceReadyNotifier, ServiceWithDependents};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 /// How often the certificate files are checked for a renewal. Certificates are renewed
 /// weeks before they expire, so an hour's delay costs nothing, and checking needs no
 /// hook in the renewal tool.
 const CERT_CHECK_EVERY: Duration = Duration::from_secs(3600);
+
+/// How often the upstreams are looked up again: the 300 s TTL usual for CDN-fronted
+/// hosts. A dead address is skipped anyway, so this only bounds how long a move goes
+/// unnoticed.
+const ORIGIN_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
 /// Applies configuration reloads and log reopening to the running daemon, picks up
 /// renewed certificates, snapshots the request counters, writes the traffic record and
@@ -38,6 +45,16 @@ impl Reloader {
             ),
             Err(e) => error!("certificate check task failed: {e}"),
         }
+    }
+
+    /// Starts looking the upstreams up again unless the previous round still runs. Not
+    /// awaited: a slow resolver must not hold up signals and the minute tick.
+    fn refresh_origins(&self, running: &mut Option<JoinHandle<()>>) {
+        if running.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let live = Arc::clone(self.admin.live());
+        *running = Some(tokio::task::spawn_blocking(move || live.refresh_origins()));
     }
 
     async fn record_traffic(&self) {
@@ -92,7 +109,16 @@ impl ServiceWithDependents for Reloader {
             "SIGUSR1, the access log cannot be reopened",
         );
         let mut tick = tokio::time::interval(logger::WINDOW);
+        // A late tick is not made up for: back-to-back snapshots would record near-empty
+        // windows.
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut certs = tokio::time::interval(CERT_CHECK_EVERY);
+        // The upstreams were just looked up at startup.
+        let mut origins = tokio::time::interval_at(
+            tokio::time::Instant::now() + ORIGIN_REFRESH_EVERY,
+            ORIGIN_REFRESH_EVERY,
+        );
+        let mut refreshing = None;
         loop {
             tokio::select! {
                 _ = recv(&mut hup) => {
@@ -105,6 +131,7 @@ impl ServiceWithDependents for Reloader {
                     self.record_traffic().await;
                 }
                 _ = certs.tick() => self.refresh_certs().await,
+                _ = origins.tick() => self.refresh_origins(&mut refreshing),
                 _ = shutdown.changed() => break,
             }
         }

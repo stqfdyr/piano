@@ -34,5 +34,9 @@ tokio = { workspace = true, features = ["signal", "process"] }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace = true
 
+[dev-dependencies]
+# Maps upstream names to fixed addresses in unit tests.
+piano-upstream = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true
