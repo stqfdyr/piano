@@ -11,7 +11,13 @@
 	sharedscripts
 	postrotate
 		for f in /run/piano/*.pid; do
-			[ -s "$f" ] && kill -USR1 "$(cat "$f")" 2>/dev/null
+			[ -s "$f" ] || continue
+			pid=$(cat "$f")
+			# A pid file left by a process that died may name another process by now:
+			# signal only the daemon that writes this pid file.
+			case " $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" in
+			*" --pidfile $f "*) kill -USR1 "$pid" 2>/dev/null ;;
+			esac
 		done
 		true
 	endscript

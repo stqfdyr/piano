@@ -143,26 +143,35 @@ fi
 # Certificates: the daemon runs as $user and rereads them when they change, so it
 # needs read access to the key files and every directory above them. certbot keeps
 # the group and group bits of a private key when it renews it.
-as_user() { su -s /bin/sh "$user" -c "$1"; }
+# as_user CMD PATH: sh -c CMD as $user with PATH as $1, never parsed as shell code.
+as_user() { su -s /bin/sh -c "$1" "$user" sh "$2"; }
 grant() {
 	p=$1
-	case $p in *"'"*) die "cannot handle a quote in $p" ;; esac
+	case $p in
+	/*) ;;
+	*) die "$p is not an absolute path; the service does not run in $PWD" ;;
+	esac
 	for target in "$p" "$(readlink -f "$p")"; do
+		# One directory per line, top down: names may hold spaces.
 		dirs=
 		d=$(dirname "$target")
 		while [ "$d" != / ]; do
-			dirs="$d $dirs"
+			dirs="$d
+$dirs"
 			d=$(dirname "$d")
 		done
-		for d in $dirs; do
-			as_user "test -x '$d'" && continue
+		while IFS= read -r d; do
+			[ -n "$d" ] || continue
+			as_user 'test -x "$1"' "$d" && continue
 			[ "$(stat -c %U:%G "$d")" = root:root ] ||
 				die "$user cannot enter $d (owner $(stat -c %U:%G "$d")); grant it access by hand"
 			chgrp "$user" "$d"
 			chmod g+rx "$d"
 			say "$d: group $user may enter"
-		done
-		as_user "test -r '$target'" && continue
+		done <<-EOF
+			$dirs
+		EOF
+		as_user 'test -r "$1"' "$target" && continue
 		[ "$(stat -c %U:%G "$target")" = root:root ] ||
 			die "$user cannot read $target (owner $(stat -c %U:%G "$target")); grant it access by hand"
 		chgrp "$user" "$target"
@@ -171,12 +180,23 @@ grant() {
 	done
 }
 if [ "$new_config" = no ] && [ "$cert_access" = yes ]; then
-	"$piano" -c "$config" config show |
-		sed -nE 's/^[[:space:]]*(cert|key)[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\2/p' |
-		sort -u |
-		while IFS= read -r f; do
-			grant "$f"
-		done
+	# A failing su would read as "cannot enter" and regroup every directory above.
+	as_user true / ||
+		die "cannot run commands as $user with su; run again with --no-cert-access and let $user read the certificate and key by hand"
+	# config show writes a path as a basic string, or as a literal one when it holds
+	# a quote or a backslash; a basic string with escapes is not read.
+	paths=$("$piano" -c "$config" config show | sed -nE \
+		-e '/^\[tls\]$/,/^\[/{' \
+		-e 's/^[[:space:]]*(cert|key)[[:space:]]*=[[:space:]]*"([^"\\]*)"[[:space:]]*$/\2/p' \
+		-e "s/^[[:space:]]*(cert|key)[[:space:]]*=[[:space:]]*'([^']*)'[[:space:]]*\$/\\2/p" \
+		-e '}')
+	[ "$(printf '%s\n' "$paths" | grep -c .)" -eq 2 ] ||
+		die "cannot read the certificate and key paths from piano config show; run again with --no-cert-access"
+	while IFS= read -r f; do
+		grant "$f"
+	done <<-EOF
+		$(printf '%s\n' "$paths" | sort -u)
+	EOF
 fi
 
 # Service.
