@@ -853,7 +853,14 @@ fn run(
         Ok(d) => d,
         Err(e) => {
             log::error!("{e}");
-            return ExitCode::from(exit::CONFIG);
+            // An upstream that does not resolve may at the next start; the service
+            // manager restarts on any code but the configuration one.
+            let code = if e.is_config() {
+                exit::CONFIG
+            } else {
+                exit::RUNTIME
+            };
+            return ExitCode::from(code);
         }
     };
     // Taking over, the old process still listens on the control socket.

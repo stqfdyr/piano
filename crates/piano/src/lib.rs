@@ -81,10 +81,16 @@ pub enum Error {
 }
 
 impl Error {
-    /// Whether fixing the configuration or certificate files cures it, as opposed to a
-    /// problem on the system (resolving an upstream, opening the access log).
+    /// Whether fixing the configuration or certificate files cures it, as opposed to an
+    /// upstream name that does not resolve for now.
     pub fn is_config(&self) -> bool {
-        !matches!(self, Error::Resolve(_) | Error::AccessLog(_))
+        !matches!(
+            self,
+            Error::Resolve(
+                piano_upstream::resolve::Error::Lookup { .. }
+                    | piano_upstream::resolve::Error::NoAddress(_)
+            )
+        )
     }
 }
 
@@ -350,7 +356,6 @@ pub fn build_with(
             |p| p.to_string_lossy().into_owned(),
         ),
         upgrade_sock_connect_accept_max_retries: Some(upgrade::HANDOFF_ATTEMPTS),
-        pid_file: "/run/piano/piano.pid".to_owned(),
         ..ServerConf::default()
     };
     let opt = predecessor.map(|_| Opt {
@@ -858,6 +863,22 @@ mod tests {
             "#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn only_configuration_errors_count_as_such() {
+        use piano_upstream::resolve::Error as Resolve;
+        let io = || std::io::Error::other("x");
+        assert!(Error::AccessLog(io()).is_config());
+        assert!(
+            Error::Resolve(Resolve::NotPublic {
+                host: "a.example.com".into(),
+                ip: [10, 0, 0, 1].into(),
+            })
+            .is_config()
+        );
+        assert!(!Error::Resolve(Resolve::NoAddress("a.example.com".into())).is_config());
+        assert!(Error::Unvalidated("a".into()).is_config());
     }
 
     #[test]
