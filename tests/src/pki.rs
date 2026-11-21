@@ -6,7 +6,7 @@ pub struct Ca {
     issuer: CertifiedIssuer<'static, KeyPair>,
 }
 
-/// A leaf certificate and its key, PEM encoded.
+/// A certificate chain and its leaf's key, PEM encoded.
 pub struct Leaf {
     pub cert_pem: String,
     pub key_pem: String,
@@ -31,7 +31,8 @@ impl Ca {
         self.issuer.der().clone()
     }
 
-    /// Issues a leaf for `names`; the PEM chain holds the leaf only.
+    /// Issues a leaf for `names`; the PEM chain holds the leaf and then this CA, as a
+    /// full chain file does.
     pub fn leaf(&self, names: &[&str]) -> Leaf {
         let key = KeyPair::generate().unwrap();
         let params =
@@ -39,7 +40,7 @@ impl Ca {
                 .unwrap();
         let cert = params.signed_by(&key, &self.issuer).unwrap();
         Leaf {
-            cert_pem: cert.pem(),
+            cert_pem: cert.pem() + &self.issuer.pem(),
             key_pem: key.serialize_pem(),
         }
     }

@@ -188,6 +188,11 @@ async fn half_written_certificate_files_keep_the_current_one() {
     let old_key = w.ca.leaf(&[SITE_HOST]);
     std::fs::write(w.relay.log_path("site0.key"), &old_key.key_pem).unwrap();
     assert!(w.relay.refresh_certs().is_err());
+    let error = w
+        .relay
+        .cert_reload_error()
+        .expect("the failure is kept for status");
+    assert!(error.contains("site0.key"), "{error}");
     let res = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1)
         .get(format!(
             "https://{SITE_HOST}:{}/__info",
@@ -199,4 +204,30 @@ async fn half_written_certificate_files_keep_the_current_one() {
     assert_eq!(res.status(), 200);
     std::fs::write(w.relay.log_path("site0.key"), &leaf.key_pem).unwrap();
     assert!(w.relay.refresh_certs().unwrap());
+    assert_eq!(w.relay.cert_reload_error(), None);
+}
+
+#[tokio::test]
+async fn restored_certificate_files_clear_the_reload_error() {
+    let w = world("", "").await;
+    let paths = ["site0.crt", "site0.key"].map(|f| w.relay.log_path(f));
+    let saved = paths.clone().map(|p| {
+        let modified = std::fs::metadata(&p).unwrap().modified().unwrap();
+        (std::fs::read(&p).unwrap(), modified)
+    });
+    std::fs::write(&paths[1], "not a key").unwrap();
+    assert!(w.relay.refresh_certs().is_err());
+    assert!(w.relay.cert_reload_error().is_some());
+    // Put back as `mv` from a backup would: same bytes, same modification time.
+    for (p, (bytes, modified)) in paths.iter().zip(saved) {
+        std::fs::write(p, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+    assert!(!w.relay.refresh_certs().unwrap());
+    assert_eq!(w.relay.cert_reload_error(), None);
 }

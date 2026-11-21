@@ -337,6 +337,8 @@ impl Admin {
                 names: cert.names,
                 not_after: cert.not_after,
                 loaded: unix(cert.loaded),
+                incomplete_chain: cert.incomplete_chain,
+                reload_error: live.cert_reload_error(),
             },
             access_log: proto::AccessLog {
                 path: live.access_log.path().map(|p| p.display().to_string()),
@@ -461,6 +463,25 @@ fn findings(s: &Status, now: u64) -> Vec<Finding> {
                 hint,
             ));
         }
+    }
+    if let Some(e) = &s.certificate.reload_error {
+        out.push(finding(
+            Level::Warn,
+            "cert_reload_failed",
+            format!(
+                "the renewed certificate files cannot be loaded; the previous certificate \
+                 is still served: {e}"
+            ),
+            Some("fix the files; piano config check shows why, piano reload loads them at once"),
+        ));
+    }
+    if s.certificate.incomplete_chain {
+        out.push(finding(
+            Level::Warn,
+            "cert_chain_incomplete",
+            piano_edge::tls::INCOMPLETE_CHAIN.into(),
+            Some("point tls.cert at the full chain (fullchain.pem), then piano reload"),
+        ));
     }
     if let Some(r) = s.config.last_reload.as_ref().filter(|r| !r.ok) {
         out.push(finding(
@@ -618,6 +639,8 @@ mod tests {
                 names: Vec::new(),
                 not_after: Some(100 * 86_400),
                 loaded: 0,
+                incomplete_chain: false,
+                reload_error: None,
             },
             access_log: AccessLog {
                 path: None,
@@ -648,6 +671,17 @@ mod tests {
     #[test]
     fn a_healthy_status_has_no_findings() {
         assert!(codes(&status(), 0).is_empty());
+    }
+
+    #[test]
+    fn certificate_problems_are_findings() {
+        let mut s = status();
+        s.certificate.reload_error = Some("bad key".into());
+        s.certificate.incomplete_chain = true;
+        assert_eq!(
+            codes(&s, 0),
+            ["cert_reload_failed", "cert_chain_incomplete"]
+        );
     }
 
     #[test]

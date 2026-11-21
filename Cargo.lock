@@ -1791,6 +1791,7 @@ dependencies = [
  "piano-config",
  "piano-telemetry",
  "pingora-core",
+ "rcgen",
  "rustls",
  "thiserror 2.0.21",
  "tokio",

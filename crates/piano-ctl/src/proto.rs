@@ -134,6 +134,13 @@ pub struct Certificate {
     pub names: Vec<String>,
     pub not_after: Option<i64>,
     pub loaded: u64,
+    /// The chain lacks its intermediate certificates.
+    #[serde(default)]
+    pub incomplete_chain: bool,
+    /// Why renewed certificate files could not be loaded; the previous certificate is
+    /// still served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
