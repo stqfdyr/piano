@@ -1,8 +1,10 @@
 //! Credential removal applied to everything piano logs.
 //!
 //! Clients authenticate to Emby with query parameters (`api_key`, `X-Emby-Token`, ...)
-//! and with headers whose values look like `Token="..."`. Any `name=value` pair whose
-//! name marks a credential has its value replaced, wherever it appears in the text.
+//! and with headers (`X-Emby-Token: ...`, `X-Emby-Authorization: ... Token="..."`).
+//! Any `name=value` or `name: value` pair whose name marks a credential has its value
+//! replaced, wherever it appears in the text, including inside Debug output, where
+//! names are quoted and quotes in values are escaped.
 
 use std::borrow::Cow;
 
@@ -21,35 +23,27 @@ pub fn is_secret_name(name: &[u8]) -> bool {
 }
 
 /// `s` with the value of every credential parameter replaced by [`REDACTED`]. A value
-/// starts after `=` and ends at the next delimiter; a value in double quotes ends at the
-/// closing quote.
+/// follows `=` or `: `; a value in double quotes (escaped ones included) ends at the
+/// closing quote, any other at the next delimiter. An authorization value keeps going
+/// past spaces, since it holds a scheme and then the credential (`Bearer ...`).
 pub fn redact(s: &str) -> Cow<'_, str> {
     let b = s.as_bytes();
     let mut out: Option<String> = None;
     let mut copied = 0;
     let mut i = 0;
-    while let Some(off) = b[i..].iter().position(|&c| c == b'=') {
-        let eq = i + off;
-        let start = b[..eq]
-            .iter()
-            .rposition(|&c| !is_name_byte(c))
-            .map_or(0, |p| p + 1);
-        i = eq + 1;
-        if start == eq || !is_secret_name(&b[start..eq]) {
+    while let Some(off) = b[i..].iter().position(|&c| c == b'=' || c == b':') {
+        let sep = i + off;
+        i = sep + 1;
+        let value = match b[sep] {
+            b':' if b.get(sep + 1) == Some(&b' ') => sep + 2,
+            b':' => continue,
+            _ => sep + 1,
+        };
+        let name = name_before(b, sep);
+        if !is_secret_name(name) {
             continue;
         }
-        let value = eq + 1;
-        let end = if b.get(value) == Some(&b'"') {
-            b[value + 1..]
-                .iter()
-                .position(|&c| c == b'"')
-                .map_or(b.len(), |p| value + 1 + p + 1)
-        } else {
-            b[value..]
-                .iter()
-                .position(|&c| is_delimiter(c))
-                .map_or(b.len(), |p| value + p)
-        };
+        let end = value_end(b, value, decode_lower(name).ends_with(b"authorization"));
         if end == value {
             continue;
         }
@@ -67,6 +61,49 @@ pub fn redact(s: &str) -> Cow<'_, str> {
             Cow::Owned(o)
         }
     }
+}
+
+/// The name ending at `sep`, without the quotes Debug output puts around it; empty if
+/// none.
+fn name_before(b: &[u8], sep: usize) -> &[u8] {
+    let mut end = sep;
+    if end > 0 && b[end - 1] == b'"' {
+        end -= 1;
+        if end > 0 && b[end - 1] == b'\\' {
+            end -= 1;
+        }
+    }
+    let start = b[..end]
+        .iter()
+        .rposition(|&c| !is_name_byte(c))
+        .map_or(0, |p| p + 1);
+    &b[start..end]
+}
+
+/// Where the value starting at `v` ends.
+fn value_end(b: &[u8], v: usize, spaces_inside: bool) -> usize {
+    let rest = &b[v..];
+    if rest.starts_with(br#"\""#) {
+        // Quoted inside an escaped string: the closing quote is escaped too.
+        return rest[2..]
+            .windows(2)
+            .position(|w| w == br#"\""#)
+            .map_or(b.len(), |p| v + 2 + p + 2);
+    }
+    if rest.first() == Some(&b'"') {
+        let mut j = 1;
+        while j < rest.len() {
+            match rest[j] {
+                b'\\' => j += 2,
+                b'"' => return v + j + 1,
+                _ => j += 1,
+            }
+        }
+        return b.len();
+    }
+    rest.iter()
+        .position(|&c| is_delimiter(c) && !(spaces_inside && c == b' '))
+        .map_or(b.len(), |p| v + p)
 }
 
 fn is_name_byte(c: u8) -> bool {
@@ -147,9 +184,65 @@ mod tests {
             "MediaBrowser Client=\"x\", Token=REDACTED, Version=\"1\""
         );
         assert_eq!(
-            redact("X-Emby-Authorization=a b"),
-            "X-Emby-Authorization=REDACTED b"
+            redact("X-Emby-Authorization=a b, c=1"),
+            "X-Emby-Authorization=REDACTED, c=1"
         );
+    }
+
+    #[test]
+    fn header_forms_are_replaced() {
+        let cases = [
+            ("X-Emby-Token: t0k\r\n", "X-Emby-Token: REDACTED\r\n"),
+            (
+                "Authorization: Bearer abc.def\r\n",
+                "Authorization: REDACTED\r\n",
+            ),
+            (
+                r#"X-Emby-Authorization: MediaBrowser Client="c", Token="t0k""#,
+                r#"X-Emby-Authorization: REDACTED"c", Token=REDACTED"#,
+            ),
+            // Debug output of a header map: quoted names, escaped quotes in values.
+            (
+                r#"{"x-emby-token": "t0k", "accept": "*/*"}"#,
+                r#"{"x-emby-token": REDACTED, "accept": "*/*"}"#,
+            ),
+            (
+                r#"{"x-emby-authorization": "MediaBrowser Client=\"c\", Token=\"t0k\"", "a": "b"}"#,
+                r#"{"x-emby-authorization": REDACTED, "a": "b"}"#,
+            ),
+            (
+                r#"note="Token=\"t0k\"" x=1"#,
+                r#"note="Token=REDACTED" x=1"#,
+            ),
+            (
+                r#"note="{\"x-emby-token\": \"t0k\"}""#,
+                r#"note="{\"x-emby-token\": REDACTED}""#,
+            ),
+            // Debug output of raw request bytes.
+            (
+                r#"b"GET / HTTP/1.1\r\nX-Emby-Token: t0k\r\nX-Emby-Authorization: MediaBrowser Token=\"t1\"\r\n""#,
+                r#"b"GET / HTTP/1.1\r\nX-Emby-Token: REDACTED\r\nX-Emby-Authorization: REDACTED\"t1\"\r\n""#,
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(input), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn debug_output_of_a_request_has_no_credentials() {
+        let mut req = pingora_http::RequestHeader::build("GET", b"/x?api_key=s1", None).unwrap();
+        req.insert_header("X-Emby-Token", "s2").unwrap();
+        req.insert_header(
+            "X-Emby-Authorization",
+            r#"MediaBrowser Client="c", Token="s3""#,
+        )
+        .unwrap();
+        req.insert_header("Authorization", "Bearer s4").unwrap();
+        let line = redact(&format!("{req:?}")).into_owned();
+        for secret in ["s1", "s2", "s3", "s4"] {
+            assert!(!line.contains(secret), "{secret} in {line}");
+        }
     }
 
     #[test]
@@ -158,6 +251,11 @@ mod tests {
             "/emby/Items?ParentId=1&Fields=a,b",
             "/x?PlaySessionId=9&MediaSourceId=2",
             "a == b",
+            "/emby/token:abc/x",
+            "https://token.example.net:8443/x",
+            "token:",
+            "\"=x",
+            "\\\"=x",
             "=leading",
             "api_key=",
             "",

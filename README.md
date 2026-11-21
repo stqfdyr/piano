@@ -170,8 +170,9 @@ level  = "info"                        # error | warn | info | debug | trace
   INFO is lifecycle. `--log-level` overrides the configured level.
 - Each request carries a `rid` and each connection a `cid`; diagnostic records about a
   request carry the same `rid=`, so the two logs can be joined.
-- Credentials are always removed: values of parameters named `api_key`, `apikey` or
-  ending in `token` or `authorization` become `REDACTED` in both logs.
+- Credentials are always removed: values of parameters and headers named `api_key`,
+  `apikey` or ending in `token` or `authorization` become `REDACTED` in both logs,
+  including the request headers printed at the `debug` level.
 - Failed TLS handshakes and connections refused by `access.allow` are reported at
   most once a minute, followed by a count.
 
