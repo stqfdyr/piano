@@ -727,7 +727,8 @@ fn abandoned() -> Box<Error> {
 }
 
 /// The connection a media request is using, replaced in the background if the request
-/// is dropped before it is done with it.
+/// ends while the connection is still in use: the stream no longer wants the body, or
+/// the task was aborted.
 struct Held {
     reach: Arc<Reach>,
     conn: Option<(String, HttpPeer)>,
@@ -751,10 +752,7 @@ async fn request(
         reach: Arc::clone(&spec.reach),
         conn: None,
     };
-    let done = attempts(spec, id, range, tx, &mut held).await;
-    // Ended on its own: the connection went back to the pool or broke.
-    held.conn = None;
-    done
+    attempts(spec, id, range, tx, &mut held).await
 }
 
 async fn attempts(
@@ -788,6 +786,8 @@ async fn attempts(
     };
     while left > 0 {
         left -= 1;
+        // A connection from an earlier attempt went to the pool, to a drain, or broke.
+        held.conn = None;
         let host = reach::host_of(site, hop.as_ref()).to_owned();
         let (mut peer, addrs, addr) = spec.reach.peer(site, hop.as_ref()).await?;
         peer.options.read_timeout = Some(spec.stall);
@@ -844,6 +844,8 @@ async fn attempts(
         let resp = match exchange(&mut http, req).await {
             Ok(r) => r,
             Err(e) => {
+                // Broken, not dropped: a replacement would most likely fail the same way.
+                held.conn = None;
                 spec.note(entry, |a| a.error = Some(e.etype().as_str()));
                 // A pooled connection that the server closed meanwhile; try another.
                 let stale = matches!(
@@ -924,11 +926,13 @@ async fn attempts(
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    held.conn = None;
                     spec.note(entry, |a| a.error = Some(e.etype().as_str()));
                     return Err(e.into_up());
                 }
             }
         }
+        held.conn = None;
         let idle = peer.options.idle_timeout;
         spec.reach
             .media

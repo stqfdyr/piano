@@ -482,6 +482,8 @@ async fn a_slow_host_gets_back_the_connection_a_seek_dropped() {
         assert_eq!(res.bytes().await.unwrap().len(), 1_000_000);
         let line = &relay.access_lines(ACCESS_LOG, 2)[1];
         assert_eq!(line["up"][0]["reused"], kept, "{delay:?}: {line}");
+        // The replacement took the dropped connection's place: no more connections either way.
+        assert_eq!(origin.connections(), (2, 0), "{delay:?}");
     }
 }
 

@@ -113,10 +113,8 @@ impl Reach {
         };
         let reach = Arc::clone(self);
         rt.spawn(async move {
-            if let Ok((http, _)) = reach.media.get_http_session(&peer).await {
-                let idle = peer.options.idle_timeout;
-                reach.media.release_http_session(http, &peer, idle).await;
-            }
+            let idle = peer.options.idle_timeout;
+            let _ = reach.media.keep_idle(&peer, idle).await;
             reach.spares.done();
         });
     }
@@ -405,6 +403,41 @@ pub(crate) fn clip(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_slow_hosts_get_spares_and_only_so_many_at_once() {
+        let s = Spares::default();
+        assert!(!s.claim("unknown:443"));
+        s.note("near:443", Duration::from_millis(99));
+        assert!(!s.claim("near:443"));
+        s.note("far:443", SPARE_COST);
+        for _ in 0..MAX_SPARING {
+            assert!(s.claim("far:443"));
+        }
+        assert!(!s.claim("far:443"));
+        s.done();
+        assert!(s.claim("far:443"));
+        // The last connection decides: a host that became fast gets none.
+        s.note("far:443", Duration::from_millis(5));
+        s.done();
+        assert!(!s.claim("far:443"));
+    }
+
+    #[test]
+    fn spare_hosts_are_bounded() {
+        let s = Spares::default();
+        for i in 0..MAX_HOSTS {
+            s.note(&format!("h{i}:443"), SPARE_COST);
+        }
+        assert!(s.claim("h0:443"));
+        s.done();
+        s.note("one-more:443", SPARE_COST);
+        assert_eq!(s.lock().hosts.len(), 1);
+        assert!(!s.claim("h0:443"));
+        // Noting a known host again does not count as a new one.
+        s.note("one-more:443", SPARE_COST);
+        assert_eq!(s.lock().hosts.len(), 1);
+    }
 
     #[test]
     fn clipping_keeps_whole_characters() {
