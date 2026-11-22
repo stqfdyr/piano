@@ -89,6 +89,18 @@ async fn images_are_answered_from_memory() {
 }
 
 #[tokio::test]
+async fn images_with_a_session_cookie_are_stored_without_it() {
+    let w = world().await;
+    for _ in 0..2 {
+        let got = w.get("/emby/Items/k1/Images/Primary?tag=1&cookie=1").await;
+        assert_eq!((got.status, got.body.as_str()), (200, "image k1"));
+        assert!(!got.headers.contains_key("set-cookie"), "{:?}", got.headers);
+    }
+    assert_eq!(w.origin.hits("/emby/Items/k1/Images/Primary"), 1);
+    assert_eq!(w.cache_fields(2), ["miss", "hit"]);
+}
+
+#[tokio::test]
 async fn a_client_holding_the_image_gets_304() {
     let w = world().await;
     w.get("/Items/c1/Images/Primary").await;

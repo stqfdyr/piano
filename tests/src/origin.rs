@@ -34,8 +34,9 @@
 //!   86400), `codes=…` answers the n-th request of the path with the n-th status (the
 //!   last repeats; 429 carries `Retry-After` from `retry=N`, default 1), `moved=1` answers
 //!   301 to `/img/{key}` with the same query (`moved=302`: 302), `size=N` pads the body
-//!   with dots to N bytes, `delay_ms=N` waits first. [`Origin::hits`] counts requests per
-//!   path.
+//!   with dots to N bytes, `delay_ms=N` waits first, `cookie=1` adds a session
+//!   `Set-Cookie` as some upstream gateways do on every response. [`Origin::hits`] counts
+//!   requests per path.
 //! - A small Emby API for `piano probe` under `/emby`: `Users/AuthenticateByName` (POST,
 //!   accepts [`PROBE_USER`] / [`PROBE_PASSWORD`]), `Users/{PROBE_USER_ID}/Views` and `…/Items`,
 //!   `Items/{PROBE_ITEM}/PlaybackInfo` (a direct stream URL to `/videos/{PROBE_ITEM}/…`),
@@ -689,6 +690,12 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         size.unwrap_or(0).saturating_sub(body.len()),
     ));
     let mut builder = Response::builder().status(code);
+    if param("cookie") == Some("1") {
+        builder = builder.header(
+            "set-cookie",
+            format!("session={n}; Max-Age=86400; HttpOnly; Path=/"),
+        );
+    }
     if ttl > 0 {
         builder = builder.header("cache-control", format!("public, max-age={ttl}"));
     }
