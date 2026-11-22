@@ -448,6 +448,44 @@ async fn a_pause_in_the_body_is_logged_as_starving_the_client() {
 }
 
 #[tokio::test]
+async fn a_slow_host_gets_back_the_connection_a_seek_dropped() {
+    for (delay, kept) in [(Duration::from_millis(150), true), (Duration::ZERO, false)] {
+        let ca = Ca::new("piano e2e");
+        let origin = Origin::start_far(&ca.leaf(&[ORIGIN_HOST]), delay).await;
+        let roots = [ca.cert_pem()];
+        let relay = Relay::start(&RelaySetup::new(
+            &ca.leaf(&[SITE_HOST]),
+            &roots,
+            origin.addr.port(),
+        ));
+        let c = client(ca.cert_der(), SITE_HOST, relay.addr, Proto::H1);
+        let url = format!(
+            "https://{SITE_HOST}:{}/videos/seek/stream.mkv?len=50000000",
+            relay.addr.port()
+        );
+        // The player reads a little, then seeks: it drops the request mid-body.
+        let mut res = c
+            .get(&url)
+            .header("range", "bytes=0-")
+            .send()
+            .await
+            .unwrap();
+        assert!(res.chunk().await.unwrap().is_some());
+        drop(res);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let res = c
+            .get(&url)
+            .header("range", "bytes=49000000-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.bytes().await.unwrap().len(), 1_000_000);
+        let line = &relay.access_lines(ACCESS_LOG, 2)[1];
+        assert_eq!(line["up"][0]["reused"], kept, "{delay:?}: {line}");
+    }
+}
+
+#[tokio::test]
 async fn a_client_that_leaves_ends_its_stream() {
     let ca = Ca::new("piano e2e");
     let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;
