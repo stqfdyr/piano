@@ -659,6 +659,14 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         }
         None => 200,
     };
+    // `negotiate=1`: WebP for a client that lists it, as an image endpoint that says
+    // `Vary: Accept` may answer; its redirects say so too.
+    let negotiate = param("negotiate") == Some("1");
+    let webp = negotiate
+        && req
+            .headers()
+            .get("accept")
+            .is_some_and(|v| v.to_str().is_ok_and(|a| a.contains("image/webp")));
     let elsewhere = req
         .headers()
         .get("user-agent")
@@ -670,8 +678,12 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         _ => None,
     };
     if let Some(status) = moved.filter(|_| !target && code == 200) {
+        let mut builder = Response::builder();
+        if negotiate {
+            builder = builder.header("vary", "Accept");
+        }
         return Some(
-            Response::builder()
+            builder
                 .status(status)
                 .header("location", format!("/img/{key}?{query}"))
                 .body(full("moved"))
@@ -683,8 +695,13 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
     } else {
         param("ttl").and_then(|v| v.parse().ok()).unwrap_or(60)
     };
-    let etag = format!("\"{key}\"");
-    let mut body = format!("image {key}");
+    let (format, content_type) = if webp {
+        ("webp", "image/webp")
+    } else {
+        ("image", "image/jpeg")
+    };
+    let etag = format!("\"{key}{}\"", if webp { "-webp" } else { "" });
+    let mut body = format!("{format} {key}");
     let size = param("size").and_then(|v| v.parse::<usize>().ok());
     body.extend(std::iter::repeat_n(
         '.',
@@ -699,6 +716,11 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
     }
     if let Some(age) = param("age") {
         builder = builder.header("age", age);
+    }
+    if negotiate {
+        builder = builder
+            .header("vary", "Accept-Encoding")
+            .header("vary", "Accept");
     }
     if ttl > 0 {
         builder = builder.header("cache-control", format!("public, max-age={ttl}"));
@@ -724,7 +746,7 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
     }
     Some(
         builder
-            .header(CONTENT_TYPE, "image/jpeg")
+            .header(CONTENT_TYPE, content_type)
             .header("last-modified", "Sun, 23 Nov 2025 02:39:49 GMT")
             .body(full(body))
             .unwrap(),

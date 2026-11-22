@@ -214,8 +214,8 @@ impl Control {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Cache {
-    /// Memory for stored images (bodies, headers and keys), in MiB; 0 stores none. Remembered redirects and missing
-    /// images are kept either way.
+    /// Memory for stored images (bodies, headers and keys), in MiB; 0 stores none.
+    /// Remembered redirects and missing images are kept either way.
     pub image_memory_mib: u64,
 }
 
