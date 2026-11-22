@@ -22,7 +22,7 @@ use http::{HeaderName, HeaderValue, Method, Version};
 use log::{debug, warn};
 use piano_cache::Budget;
 use piano_edge::acl::canonical;
-use piano_media::{ByteRange, Head, Request, Resume, Stream, StreamGuard, try_key};
+use piano_media::{ByteRange, Head, Request, Resume, Stream, StreamGuard};
 use piano_telemetry::{Id, Kind, SiteCounters, Ttfb};
 use pingora_core::protocols::http::v1::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -124,8 +124,10 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         .map(|a| canonical(a.ip()));
     let range = req.headers.get(RANGE).cloned();
     let (path, logged) = (logged_path(req), logged_range(req));
-    let key = try_key(client, &site.name, &path, logged.as_deref());
-    let (attempt, first_try) = relay.streams.next_try(&key, Instant::now());
+    let key = relay
+        .streams
+        .try_key(client, &site.name, req.raw_path(), logged.as_deref());
+    let (attempt, first_try) = relay.streams.next_try(key, Instant::now());
     let stream = relay.streams.register(
         Stream::new(ctx.rid.to_string(), site.name.clone(), client, path, logged)
             .tried(attempt, first_try),
@@ -164,6 +166,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         rid: ctx.rid,
         stop: relay.stop.watch(),
         client_left: false,
+        stopped: false,
         head_at: None,
         last_write: None,
         starved: Duration::ZERO,
@@ -173,14 +176,23 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
     let result = engine.run(session, ctx).await;
     let end = Instant::now();
     if engine.head_sent {
-        relay.streams.answered(&key);
-        if result.is_err() {
-            // Ended without the rest of the body: a wait for bytes counts up to here.
-            engine.starve_until(end);
+        relay.streams.answered(key);
+        if result.is_err() && !engine.stopped {
+            // Ended without the rest of the body. A wait for bytes counts up to here,
+            // unless the client left in what may have been the upstream's pacing.
+            let gap = engine
+                .last_write
+                .map_or(Duration::ZERO, |w| end.saturating_duration_since(w));
+            if !engine.client_left || gap >= HEDGE_AFTER {
+                engine.starve_until(end);
+            }
         }
-    } else if engine.client_left {
-        relay.streams.gave_up(key, attempt, first_try, end);
-        spec.counters.record_media_gave_up();
+    } else {
+        // The player asks again after a failure as after giving up.
+        relay.streams.unanswered(key, attempt, first_try, end);
+        if engine.client_left {
+            spec.counters.record_media_gave_up();
+        }
     }
     ctx.media = Some(MediaLog {
         attempt,
@@ -344,6 +356,8 @@ struct Engine {
     rid: Id,
     /// The client went away; before the head, it gave up waiting.
     client_left: bool,
+    /// The process stopped the stream.
+    stopped: bool,
     head_at: Option<Instant>,
     /// When the last write to the client ended, the head's included.
     last_write: Option<Instant>,
@@ -435,13 +449,15 @@ impl Engine {
                     ));
                 }
                 Event::Client(e) => {
-                    self.client_left = true;
+                    // A read error is the client closing; data is a protocol error.
+                    self.client_left = e.is_some();
                     let e = e.unwrap_or_else(|| {
                         Error::explain(ErrorType::ConnectionClosed, "client sent data mid-response")
                     });
                     return Err(e.into_down());
                 }
                 Event::Stop => {
+                    self.stopped = true;
                     return Error::e_explain(TERMINATED, "media stream ended at shutdown");
                 }
                 Event::Timer if Instant::now() >= stall_at => {
@@ -535,16 +551,19 @@ impl Engine {
         }
         ctx.cf_ray = resp.headers.get("cf-ray").cloned();
         self.head_sent = true;
-        let now = Instant::now();
-        self.head_at = Some(now);
-        self.last_write = Some(now);
-        until_stop(&mut self.stop, async {
+        let start = Instant::now();
+        self.head_at = Some(start);
+        let written = until_stop(&mut self.stop, async {
             session
                 .write_response_header(resp, false)
                 .await
                 .map_err(|e| e.into_down())
         })
-        .await
+        .await;
+        let done = Instant::now();
+        self.blocked += done.saturating_duration_since(start);
+        self.last_write = Some(done);
+        written
     }
 
     /// Counts the time since the last write as starving the client, if long enough.

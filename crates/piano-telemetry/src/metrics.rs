@@ -82,6 +82,7 @@ pub struct SiteCounters {
     fetched: [AtomicU64; Kind::ALL.len()],
     ttfb: [Histogram; Ttfb::ALL.len()],
     media_gave_up: AtomicU64,
+    media_answered: AtomicU64,
 }
 
 /// Time-to-first-byte histograms by [`Ttfb::ALL`] index.
@@ -116,6 +117,9 @@ impl SiteCounters {
     /// Counts the time from a request to the response head its client got.
     pub fn record_ttfb(&self, kind: Ttfb, d: Duration) {
         self.ttfb[kind.index()].record(d);
+        if kind == Ttfb::Media {
+            self.media_answered.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn ttfb(&self) -> TtfbBuckets {
@@ -133,6 +137,7 @@ impl SiteCounters {
             sent: self.sent.each_ref().map(load),
             fetched: self.fetched.each_ref().map(load),
             media_gave_up: load(&self.media_gave_up),
+            media_answered: load(&self.media_answered),
         }
     }
 }
@@ -157,6 +162,9 @@ pub struct Counts {
     /// longer to answer than the player waits. Not in the time-to-first-byte histogram,
     /// which only has requests that got a head.
     pub media_gave_up: u64,
+    /// Media requests that got a response head; with `media_gave_up`, the media
+    /// requests that ended or are under way.
+    pub media_answered: u64,
 }
 
 impl Counts {
@@ -172,6 +180,7 @@ impl Counts {
             sent: std::array::from_fn(|i| sub(self.sent[i], earlier.sent[i])),
             fetched: std::array::from_fn(|i| sub(self.fetched[i], earlier.fetched[i])),
             media_gave_up: sub(self.media_gave_up, earlier.media_gave_up),
+            media_answered: sub(self.media_answered, earlier.media_answered),
         }
     }
 

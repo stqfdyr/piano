@@ -208,6 +208,9 @@ pub struct Counts {
     /// `ttfb`, which has only requests that got one.
     #[serde(default)]
     pub media_gave_up: u64,
+    /// Media requests that got a response head.
+    #[serde(default)]
+    pub media_answered: u64,
 }
 
 impl Counts {

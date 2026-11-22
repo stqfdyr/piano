@@ -442,6 +442,7 @@ fn wire(c: &Counts) -> proto::Counts {
         bytes_sent: c.sent.iter().sum(),
         bytes_fetched: c.fetched.iter().sum(),
         media_gave_up: c.media_gave_up,
+        media_answered: c.media_answered,
     }
 }
 
@@ -620,7 +621,7 @@ fn findings(s: &Status, now: u64) -> Vec<Finding> {
             ));
         }
         let gave_up = r.media_gave_up;
-        let answered = site.ttfb.get(Ttfb::Media.as_str()).map_or(0, |l| l.count);
+        let answered = r.media_answered;
         if gave_up >= GAVE_UP_MIN && gave_up * 100 >= (gave_up + answered) * GAVE_UP_PERCENT {
             out.push(finding(
                 Level::Warn,
@@ -794,14 +795,8 @@ mod tests {
     fn media_requests_the_player_gave_up_on() {
         let mut s = status();
         let with = |s: &mut Status, gave_up: u64, answered: u64| {
-            s.sites[0].traffic.recent.media_gave_up = gave_up;
-            s.sites[0].ttfb.insert(
-                "media".into(),
-                Latency {
-                    count: answered,
-                    ..Latency::default()
-                },
-            );
+            let r = &mut s.sites[0].traffic.recent;
+            (r.media_gave_up, r.media_answered) = (gave_up, answered);
         };
         with(&mut s, 4, 0);
         assert!(codes(&s, 0).is_empty(), "too few to tell");

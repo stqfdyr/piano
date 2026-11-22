@@ -8,4 +8,4 @@ mod range;
 mod streams;
 
 pub use range::{ByteRange, ContentRange, Head, Mismatch, Resume};
-pub use streams::{Request, Stream, StreamGuard, Streams, try_key};
+pub use streams::{Request, Stream, StreamGuard, Streams};

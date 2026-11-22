@@ -373,15 +373,15 @@ pub fn status(s: &Status, color: Color) -> String {
             size(r.bytes_fetched),
         );
     }
+    // Media requests whose client gave up before the head are not in the percentiles.
+    let gave_up = s.sites.iter().any(|x| x.traffic.recent.media_gave_up > 0);
     let timed = s.sites.iter().any(|x| x.ttfb.values().any(|l| l.count > 0));
-    if timed {
+    if timed || gave_up {
         let _ = writeln!(
             o,
             "\n  time to first byte, p50 / p95, last {}",
             duration(s.ttfb_secs.max(1))
         );
-        // Media requests whose client gave up before the head are not in the percentiles.
-        let gave_up = s.sites.iter().any(|x| x.traffic.recent.media_gave_up > 0);
         let _ = write!(
             o,
             "  {:<w$} {:>15} {:>15} {:>15}",

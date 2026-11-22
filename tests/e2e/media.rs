@@ -315,6 +315,35 @@ async fn a_player_that_gives_up_before_the_head_asks_again() {
 }
 
 #[tokio::test]
+async fn a_try_the_upstream_failed_counts_towards_the_wait() {
+    let ca = Ca::new("piano e2e");
+    let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;
+    let roots = [ca.cert_pem()];
+    let relay = Relay::start(&RelaySetup {
+        read_timeout: Duration::from_secs(1),
+        ..RelaySetup::new(&ca.leaf(&[SITE_HOST]), &roots, origin.addr.port())
+    });
+    let url = format!(
+        "https://{SITE_HOST}:{}/videos/failed/stream.mkv?len={LEN}&plan=h3000,-",
+        relay.addr.port()
+    );
+    let c = client(ca.cert_der(), SITE_HOST, relay.addr, Proto::H1);
+    for status in [502, 206] {
+        let res = c
+            .get(&url)
+            .header("range", "bytes=1000-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), status);
+        res.bytes().await.unwrap();
+    }
+    let lines = relay.access_lines(ACCESS_LOG, 2);
+    assert_eq!(lines[0]["end"], "upstream_timeout", "{}", lines[0]);
+    assert_eq!(lines[1]["attempt"], 2, "{}", lines[1]);
+}
+
+#[tokio::test]
 async fn a_pause_in_the_body_is_logged_as_starving_the_client() {
     let w = world().await;
     for (key, plan) in [("smooth", "-"), ("starve", "s131072:2000")] {
