@@ -40,6 +40,100 @@ const CREDENTIAL_HEADERS: [&str; 3] = [
     "x-mediabrowser-token",
 ];
 
+/// A new connection at least this slow gets a replacement when a media request drops
+/// one mid-way. A file host far from the relay takes about 290 ms to connect, one at
+/// the same CDN as the relay 7–14 ms.
+const SPARE_COST: Duration = Duration::from_millis(100);
+
+/// Replacements being set up at once, and hosts remembered. Each replaces a connection
+/// just closed, and one that finds an idle connection in the pool sets up none, so a
+/// host ends up with at most one idle connection more than before the drop.
+const MAX_SPARING: usize = 8;
+const MAX_HOSTS: usize = 64;
+
+#[derive(Debug, Default)]
+struct SpareState {
+    /// By host and port: how long the last new connection took to set up.
+    hosts: std::collections::HashMap<String, Duration>,
+    in_flight: usize,
+}
+
+/// Replaces media connections that are slow to set up when a request drops one: a
+/// player that seeks closes the request it no longer wants, and an HTTP/1.1 connection
+/// cannot be reused in the middle of a body. The seek's own request has usually asked
+/// for a connection by then; the replacement serves the requests after it.
+#[derive(Debug, Default)]
+pub(crate) struct Spares {
+    state: std::sync::Mutex<SpareState>,
+}
+
+impl Spares {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SpareState> {
+        // Plain data; a panic elsewhere cannot leave it inconsistent.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Notes what setting up a new connection to `host` took.
+    pub fn note(&self, host: &str, took: Duration) {
+        let mut s = self.lock();
+        if s.hosts.len() >= MAX_HOSTS && !s.hosts.contains_key(host) {
+            s.hosts.clear();
+        }
+        s.hosts.insert(host.to_owned(), took);
+    }
+
+    /// Whether to set up a replacement for a connection to `host` dropped now; counts
+    /// it as started.
+    fn claim(&self, host: &str) -> bool {
+        let mut s = self.lock();
+        let slow = s.hosts.get(host).is_some_and(|c| *c >= SPARE_COST);
+        if !slow || s.in_flight >= MAX_SPARING {
+            return false;
+        }
+        s.in_flight += 1;
+        true
+    }
+
+    /// Forgets `host`, which could not be connected to.
+    fn forget(&self, host: &str) {
+        self.lock().hosts.remove(host);
+    }
+
+    fn done(&self) {
+        let mut s = self.lock();
+        s.in_flight = s.in_flight.saturating_sub(1);
+    }
+}
+
+impl Reach {
+    /// A media request dropped its connection to `peer` (at `host`) mid-way: when that host is
+    /// slow to connect to, sets up another in the background and leaves it in the pool,
+    /// unless the pool has one already.
+    pub fn replace(self: &Arc<Self>, host: &str, peer: HttpPeer) {
+        if !self.spares.claim(host) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.spares.done();
+            return;
+        };
+        let reach = Arc::clone(self);
+        let host = host.to_owned();
+        rt.spawn(async move {
+            let idle = peer.options.idle_timeout;
+            let began = Instant::now();
+            match reach.media.keep_idle(&peer, idle).await {
+                Ok(true) => reach.spares.note(&host, began.elapsed()),
+                Ok(false) => {}
+                // An unreachable host would hold a slot for a whole connect timeout on
+                // every drop.
+                Err(_) => reach.spares.forget(&host),
+            }
+            reach.spares.done();
+        });
+    }
+}
+
 /// A redirect being followed, or a mounted host.
 #[derive(Debug, Clone)]
 pub(crate) struct Hop {
@@ -105,6 +199,8 @@ pub(crate) struct Reach {
     pub images: HttpConnector,
     /// Where media requests' redirects led.
     pub redirects: crate::memo::Redirects,
+    /// What a new media connection costs per host, for replacing dropped ones.
+    pub spares: Spares,
 }
 
 impl std::fmt::Debug for Reach {
@@ -123,6 +219,7 @@ impl Reach {
             media: Connector::new(Some(client.clone())),
             images: HttpConnector::new(Some(client)),
             redirects: crate::memo::Redirects::default(),
+            spares: Spares::default(),
         }
     }
 
@@ -320,6 +417,44 @@ pub(crate) fn clip(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_slow_hosts_get_spares_and_only_so_many_at_once() {
+        let s = Spares::default();
+        assert!(!s.claim("unknown:443"));
+        s.note("near:443", Duration::from_millis(99));
+        assert!(!s.claim("near:443"));
+        s.note("far:443", SPARE_COST);
+        for _ in 0..MAX_SPARING {
+            assert!(s.claim("far:443"));
+        }
+        assert!(!s.claim("far:443"));
+        s.done();
+        assert!(s.claim("far:443"));
+        // The last connection decides: a host that became fast gets none.
+        s.note("far:443", Duration::from_millis(5));
+        s.done();
+        assert!(!s.claim("far:443"));
+        s.note("gone:443", SPARE_COST);
+        s.forget("gone:443");
+        assert!(!s.claim("gone:443"));
+    }
+
+    #[test]
+    fn spare_hosts_are_bounded() {
+        let s = Spares::default();
+        for i in 0..MAX_HOSTS {
+            s.note(&format!("h{i}:443"), SPARE_COST);
+        }
+        assert!(s.claim("h0:443"));
+        s.done();
+        s.note("one-more:443", SPARE_COST);
+        assert_eq!(s.lock().hosts.len(), 1);
+        assert!(!s.claim("h0:443"));
+        // Noting a known host again does not count as a new one.
+        s.note("one-more:443", SPARE_COST);
+        assert_eq!(s.lock().hosts.len(), 1);
+    }
 
     #[test]
     fn clipping_keeps_whole_characters() {

@@ -56,6 +56,23 @@ impl Connector {
         Ok((http, reused))
     }
 
+    /// Leaves an idle connection to `peer` in the pool without using it: one taken from the
+    /// pool goes back, otherwise a new one is set up. Returns whether one was set up.
+    ///
+    /// A session that never sent a request cannot be released through
+    /// [`Self::release_http_session`], which keeps only connections whose last response is
+    /// known to be complete.
+    pub async fn keep_idle<P: Peer + Send + Sync + 'static>(
+        &self,
+        peer: &P,
+        idle_timeout: Option<Duration>,
+    ) -> Result<bool> {
+        let (stream, reused) = self.transport.get_stream(peer).await?;
+        self.transport
+            .release_stream(stream, peer.reuse_hash(), idle_timeout);
+        Ok(!reused)
+    }
+
     pub async fn reused_http_session<P: Peer + Send + Sync + 'static>(
         &self,
         peer: &P,

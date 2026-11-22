@@ -168,15 +168,27 @@ impl Origin {
 
     /// Starts the origin on `bind` with `leaf` as its certificate.
     pub async fn start_on(leaf: &Leaf, bind: SocketAddr) -> Self {
-        Self::start_with(leaf, bind, true).await
+        Self::start_with(leaf, bind, true, Duration::ZERO).await
     }
 
     /// Starts an origin on a free loopback port that offers only HTTP/1.1.
     pub async fn start_h1_only(leaf: &Leaf) -> Self {
-        Self::start_with(leaf, SocketAddr::from(([127, 0, 0, 1], 0)), false).await
+        Self::start_with(
+            leaf,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            false,
+            Duration::ZERO,
+        )
+        .await
     }
 
-    async fn start_with(leaf: &Leaf, bind: SocketAddr, h2: bool) -> Self {
+    /// Starts an origin that takes `delay` before each TLS handshake, like a server far
+    /// away.
+    pub async fn start_far(leaf: &Leaf, delay: Duration) -> Self {
+        Self::start_with(leaf, SocketAddr::from(([127, 0, 0, 1], 0)), true, delay).await
+    }
+
+    async fn start_with(leaf: &Leaf, bind: SocketAddr, h2: bool, delay: Duration) -> Self {
         let chain = CertificateDer::pem_slice_iter(leaf.cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -222,6 +234,7 @@ impl Origin {
                 let state = shared.clone();
                 let mut closed = state.closed.clone();
                 let serve = async move {
+                    tokio::time::sleep(delay).await;
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };

@@ -137,6 +137,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
     );
     let spec = Arc::new(Spec {
         reach: Arc::clone(&relay.reach),
+        stop: relay.stop.watch(),
         budget: relay.images.budget(site),
         stall: site.origin.options.read_timeout,
         req: upstream_request(req)?,
@@ -244,6 +245,8 @@ pub(crate) fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
 /// What every upstream request of one stream shares.
 struct Spec {
     reach: Arc<Reach>,
+    /// Set at shutdown, when nothing will use a replaced connection.
+    stop: watch::Receiver<bool>,
     /// The site's upstream request budget, which requests to the upstream itself count
     /// against.
     budget: Arc<Budget>,
@@ -726,11 +729,45 @@ fn abandoned() -> Box<Error> {
     Error::explain(ErrorType::InternalError, "media stream ended")
 }
 
+/// The connection a media request is using, replaced in the background if the request
+/// ends while the connection is still in use: the stream no longer wants the body, or
+/// the task was aborted.
+struct Held {
+    reach: Arc<Reach>,
+    stop: watch::Receiver<bool>,
+    conn: Option<(String, HttpPeer)>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some((host, peer)) = self.conn.take()
+            && !*self.stop.borrow()
+        {
+            self.reach.replace(&host, peer);
+        }
+    }
+}
+
 async fn request(
     spec: &Spec,
     id: u32,
     range: Option<HeaderValue>,
     tx: &mpsc::Sender<(u32, Msg)>,
+) -> Result<()> {
+    let mut held = Held {
+        reach: Arc::clone(&spec.reach),
+        stop: spec.stop.clone(),
+        conn: None,
+    };
+    attempts(spec, id, range, tx, &mut held).await
+}
+
+async fn attempts(
+    spec: &Spec,
+    id: u32,
+    range: Option<HeaderValue>,
+    tx: &mpsc::Sender<(u32, Msg)>,
+    held: &mut Held,
 ) -> Result<()> {
     let site = spec.site()?;
     let remembered = spec
@@ -756,6 +793,8 @@ async fn request(
     };
     while left > 0 {
         left -= 1;
+        // A connection from an earlier attempt went to the pool, to a drain, or broke.
+        held.conn = None;
         let host = reach::host_of(site, hop.as_ref()).to_owned();
         let (mut peer, addrs, addr) = spec.reach.peer(site, hop.as_ref()).await?;
         peer.options.read_timeout = Some(spec.stall);
@@ -767,6 +806,7 @@ async fn request(
         if origin {
             spec.budget.charge(Instant::now());
         }
+        let asked = Instant::now();
         let (mut http, reused) = match spec.reach.media.get_http_session(&peer).await {
             Ok(c) => c,
             Err(e) => {
@@ -790,6 +830,10 @@ async fn request(
             }
         };
         spec.note(entry, |a| a.connected(reused));
+        let key = format!("{host}:{}", addr.port());
+        if !reused {
+            spec.reach.spares.note(&key, asked.elapsed());
+        }
         http.read_timeout = peer.options.read_timeout;
         http.write_timeout = peer.options.write_timeout;
         let mut req = spec.req.clone();
@@ -803,9 +847,12 @@ async fn request(
         if let Some(r) = &range {
             req.insert_header(RANGE, r.clone())?;
         }
+        held.conn = Some((key, peer.clone()));
         let resp = match exchange(&mut http, req).await {
             Ok(r) => r,
             Err(e) => {
+                // Broken, not dropped: a replacement would most likely fail the same way.
+                held.conn = None;
                 spec.note(entry, |a| a.error = Some(e.etype().as_str()));
                 // A pooled connection that the server closed meanwhile; try another.
                 let stale = matches!(
@@ -859,7 +906,8 @@ async fn request(
                 hop.as_ref(),
                 &spec.client_path,
                 location.as_bytes(),
-            )?;
+            )
+            .inspect_err(|_| held.conn = None)?;
             hops += 1;
             tokio::spawn(drain(Arc::clone(&spec.reach), http, peer));
             hop = Some(next);
@@ -886,11 +934,13 @@ async fn request(
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    held.conn = None;
                     spec.note(entry, |a| a.error = Some(e.etype().as_str()));
                     return Err(e.into_up());
                 }
             }
         }
+        held.conn = None;
         let idle = peer.options.idle_timeout;
         spec.reach
             .media
