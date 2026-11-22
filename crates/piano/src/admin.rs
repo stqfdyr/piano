@@ -175,16 +175,10 @@ impl Admin {
         let s = self.live.images.stats();
         CacheStats {
             schema: CACHE_SCHEMA,
-            images: s.images,
-            bytes: s.bytes,
-            capacity: s.capacity,
             missing: s.missing,
             redirects: s.moved,
-            hits: s.hits,
-            misses: s.misses,
+            fetched: s.fetched,
             coalesced: s.coalesced,
-            stale: s.stale,
-            revalidated: s.revalidated,
             missing_hits: s.missing_hits,
             shed: s.shed,
             redirect_hits: s.moved_hits,
@@ -281,16 +275,15 @@ impl Admin {
         }
     }
 
-    /// Forgets stored images, remembered redirects and misses.
+    /// Forgets remembered redirects and misses.
     pub fn purge(&self) -> PurgeReply {
         let p = self.live.images.purge();
         info!(
-            "image cache purged: {} images, {} misses, {} redirects",
-            p.images, p.missing, p.moved
+            "image memory purged: {} misses, {} redirects",
+            p.missing, p.moved
         );
         PurgeReply {
             schema: CACHE_SCHEMA,
-            images: p.images,
             missing: p.missing,
             redirects: p.moved,
         }

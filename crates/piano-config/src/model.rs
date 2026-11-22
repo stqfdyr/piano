@@ -23,8 +23,6 @@ pub struct Config {
     #[serde(default)]
     pub control: Control,
     #[serde(default)]
-    pub cache: Cache,
-    #[serde(default)]
     pub traffic: Traffic,
     #[serde(default, rename = "site")]
     pub sites: Vec<Site>,
@@ -207,26 +205,6 @@ impl Control {
     /// The socket path, unless the control socket is off.
     pub fn socket_path(&self) -> Option<&std::path::Path> {
         (!self.socket.as_os_str().is_empty()).then_some(self.socket.as_path())
-    }
-}
-
-/// The image cache.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Cache {
-    /// Memory for stored images (bodies, headers and keys), in MiB; 0 stores none.
-    /// Remembered redirects and missing images are kept either way.
-    pub image_memory_mib: u64,
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Self {
-            // Replaying two months of image requests at both relays, an LRU of 128 MB
-            // serves 22–40% of them per upstream; all distinct images would take 3 GB.
-            // The smallest relay has 350 MB available.
-            image_memory_mib: 128,
-        }
     }
 }
 

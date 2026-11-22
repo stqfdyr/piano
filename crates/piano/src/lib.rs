@@ -378,7 +378,7 @@ pub fn build_with(
     let mut client = ConnectorOptions::from_server_conf(&conf);
     client.rustls_client_config = Some((client_tls.config, client_tls.roots));
     let streams = Arc::new(Streams::default());
-    let images = Arc::new(Images::new(image_memory(config)));
+    let images = Arc::new(Images::new());
     let stop = Arc::new(Stop::default());
 
     let mut service = ProxyServiceBuilder::new(
@@ -521,11 +521,6 @@ impl ShutdownSignalWatch for Signals {
     }
 }
 
-/// Bytes for stored images (bodies, headers and keys) the configuration allows.
-fn image_memory(config: &Config) -> usize {
-    usize::try_from(config.cache.image_memory_mib.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
-}
-
 /// How client connections are kept between requests.
 fn server_options(config: &Config) -> HttpServerOptions {
     let keepalive = config.limits.keepalive_timeout.get();
@@ -617,7 +612,6 @@ impl Live {
         self.set_cert_error(None);
         self.access.replace(acl);
         self.sites.store(Arc::new(sites));
-        self.images.set_capacity(image_memory(config));
         Ok(self.fixed.changed(&Fixed::of(config)))
     }
 

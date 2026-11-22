@@ -104,8 +104,7 @@ pub struct Ctx {
     rewrite: Option<Rewrite>,
     /// Addresses replaced in the response body, once a collected body was rewritten.
     rewritten: Option<usize>,
-    /// How the image engine answered: hit, miss, coalesced, stale, revalidated, missing
-    /// or shed.
+    /// How the image engine answered: fetched, coalesced, missing or shed.
     pub(crate) cache: Option<&'static str>,
     /// The bytes sent to the client were counted as they went, by the media engine.
     pub(crate) sent_counted: bool,

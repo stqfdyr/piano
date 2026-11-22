@@ -47,7 +47,7 @@ pub const STATUS_SCHEMA: u32 = 1;
 /// Version of [`ReloadReply`].
 pub const RELOAD_SCHEMA: u32 = 1;
 /// Version of [`CacheStats`] and [`PurgeReply`].
-pub const CACHE_SCHEMA: u32 = 1;
+pub const CACHE_SCHEMA: u32 = 2;
 /// Version of [`Live`].
 pub const LIVE_SCHEMA: u32 = 1;
 /// Version of [`UpgradeReply`].
@@ -284,25 +284,16 @@ pub struct ReloadReply {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheStats {
     pub schema: u32,
-    /// Images held, the bytes they weigh (bodies, headers and keys) and the memory
-    /// allowed for them.
-    pub images: u64,
-    pub bytes: u64,
-    pub capacity: u64,
     /// Images the upstream answered 404 for, remembered for a while.
     pub missing: u64,
     /// Remembered permanent redirects.
     pub redirects: u64,
-    /// How image requests were answered since start: from memory (`hits`), by an
-    /// upstream request of their own (`misses`) or one they shared (`coalesced`), from an
-    /// expired copy because the upstream failed (`stale`), after the upstream confirmed
-    /// the copy (`revalidated`), with a remembered 404 (`missing_hits`), or with 429
-    /// because the budget did not allow a request in time (`shed`).
-    pub hits: u64,
-    pub misses: u64,
+    /// How image requests were answered since start: by an upstream request of their own
+    /// (`fetched`) or one they shared (`coalesced`), with a remembered 404
+    /// (`missing_hits`), or with 429 because the budget did not allow a request in time
+    /// (`shed`).
+    pub fetched: u64,
     pub coalesced: u64,
-    pub stale: u64,
-    pub revalidated: u64,
     pub missing_hits: u64,
     pub shed: u64,
     /// Upstream requests that went straight to a remembered redirect target.
@@ -395,7 +386,6 @@ pub struct StreamLive {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PurgeReply {
     pub schema: u32,
-    pub images: u64,
     pub missing: u64,
     pub redirects: u64,
 }

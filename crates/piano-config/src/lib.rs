@@ -12,8 +12,8 @@ mod validate;
 
 pub use duration::{Duration, ParseDurationError};
 pub use model::{
-    Access, Cache, Config, Control, DEFAULT_SOCKET, DEFAULT_TRAFFIC_FILE, Limits, Log, LogLevel,
-    Server, ServerDomains, Site, Tls, Traffic, UaRule, Upstream, UpstreamLimit,
+    Access, Config, Control, DEFAULT_SOCKET, DEFAULT_TRAFFIC_FILE, Limits, Log, LogLevel, Server,
+    ServerDomains, Site, Tls, Traffic, UaRule, Upstream, UpstreamLimit,
 };
 pub use net::{IpNet, ParseIpNetError};
 pub use validate::{UpstreamUrl, ValidationError, Warning, host_matches, is_dns_name};
@@ -101,7 +101,6 @@ fn parse_control(text: &str) -> Result<Control, Error> {
         limits: Option<IgnoredAny>,
         upstream: Option<IgnoredAny>,
         log: Option<IgnoredAny>,
-        cache: Option<IgnoredAny>,
         traffic: Option<IgnoredAny>,
         site: Option<IgnoredAny>,
     }

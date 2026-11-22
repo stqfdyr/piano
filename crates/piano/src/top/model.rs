@@ -166,7 +166,7 @@ pub struct BudgetRow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Images {
     pub answered: u64,
-    /// From memory, a remembered miss or a confirmed copy: no upstream bytes.
+    /// Answered with a remembered miss: no upstream request.
     pub local: u64,
     pub fetched: u64,
     pub shared: u64,
@@ -306,8 +306,8 @@ impl View {
             f(c).saturating_sub(base.map_or(0, |b| f(&b.cache)))
         };
         let images = Images {
-            local: d(|c| c.hits + c.missing_hits + c.revalidated),
-            fetched: d(|c| c.misses + c.stale),
+            local: d(|c| c.missing_hits),
+            fetched: d(|c| c.fetched),
             shared: d(|c| c.coalesced),
             refused: d(|c| c.shed),
             answered: 0,
@@ -499,17 +499,11 @@ mod tests {
             }],
             streams,
             cache: CacheStats {
-                schema: 1,
-                images: 0,
-                bytes: 0,
-                capacity: 0,
+                schema: 2,
                 missing: 0,
                 redirects: 0,
-                hits: 0,
-                misses: 0,
+                fetched: 0,
                 coalesced: 0,
-                stale: 0,
-                revalidated: 0,
                 missing_hits: 0,
                 shed: 0,
                 redirect_hits: 0,

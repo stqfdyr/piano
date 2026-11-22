@@ -59,8 +59,8 @@ async fn bytes_are_counted_by_kind_and_recorded_per_day() {
         ..RelaySetup::new(&ca.leaf(&[SITE_HOST]), &roots, origin.addr.port())
     });
 
-    // Media through the media engine, an image fetched once and then served from
-    // memory, and an API body through the relay.
+    // Media through the media engine, an image fetched twice, and an API body through
+    // the relay.
     let media = get(&ca, &relay, Proto::H1, "/videos/t1/stream.mkv?len=300000").await;
     assert_eq!(media, 300_000);
     for _ in 0..2 {
@@ -74,7 +74,7 @@ async fn bytes_are_counted_by_kind_and_recorded_per_day() {
     let s = status_after(&relay, 4).await;
     let total = &s.sites[0].traffic.total;
     assert_eq!(total.bytes_sent, 300_000 + 16 + 50_000);
-    assert_eq!(total.bytes_fetched, 300_000 + 8 + 50_000);
+    assert_eq!(total.bytes_fetched, 300_000 + 16 + 50_000);
     assert_eq!(s.sites[0].traffic.recent.bytes_sent, total.bytes_sent);
 
     let record = relay.traffic();
@@ -93,7 +93,7 @@ async fn bytes_are_counted_by_kind_and_recorded_per_day() {
     );
     assert_eq!(
         (site.fetched.media, site.fetched.image, site.fetched.other),
-        (300_000, 8, 50_000)
+        (300_000, 16, 50_000)
     );
 
     // Only what was added since the last write goes in.

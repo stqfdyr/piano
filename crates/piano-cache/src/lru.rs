@@ -14,12 +14,6 @@ pub trait Weigh {
     fn weight(&self) -> usize;
 }
 
-impl<T: Weigh> Weigh for Arc<T> {
-    fn weight(&self) -> usize {
-        T::weight(self)
-    }
-}
-
 #[derive(Debug)]
 pub struct Lru<V> {
     capacity: usize,
@@ -103,11 +97,6 @@ impl<V: Weigh> Lru<V> {
         n
     }
 
-    pub fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity;
-        self.evict();
-    }
-
     fn evict(&mut self) {
         while self.used > self.capacity {
             let Some((_, key)) = self.order.pop_first() else {
@@ -156,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_remove_clear_and_shrink() {
+    fn replace_remove_and_clear() {
         let mut l = Lru::new(one(3) * 2);
         l.insert("a".into(), 3usize);
         l.insert("a".into(), 5);
@@ -166,15 +155,12 @@ mod tests {
         l.insert("a".into(), 3);
         l.insert("b".into(), 3);
         assert_eq!(l.len(), 2);
-        l.set_capacity(one(3));
-        assert_eq!(l.len(), 1);
-        assert!(l.get("b").is_some());
-        assert_eq!(l.clear(), 1);
+        assert_eq!(l.clear(), 2);
         assert!(l.is_empty());
         assert_eq!(l.used(), 0);
-        l.set_capacity(0);
-        l.insert("z".into(), 0);
-        assert!(l.is_empty(), "every entry weighs something");
+        let mut none = Lru::new(0);
+        none.insert("z".into(), 0usize);
+        assert!(none.is_empty(), "every entry weighs something");
     }
 
     #[test]
@@ -194,12 +180,5 @@ mod tests {
         assert!(l.get(&key(89)).is_none());
         l.remove(&key(99));
         assert_eq!(l.used(), 9 * (1000 + ENTRY));
-    }
-
-    #[test]
-    fn shared_values_weigh_what_they_hold() {
-        let mut l = Lru::new(100);
-        l.insert("a".into(), Arc::new(6usize));
-        assert_eq!(l.used(), one(6));
     }
 }

@@ -1,7 +1,7 @@
-//! Cache keys for image requests.
+//! Keys of image requests, for sharing fetches and remembering redirects and misses.
 
 /// Query parameters that carry client credentials. Images are the same for every
-/// client of a site, so these must not split the cache, and they must not be kept.
+/// client of a site, so these must not split a key, and they must not be kept.
 const CREDENTIALS: [&str; 4] = [
     "api_key",
     "x-emby-token",
@@ -9,7 +9,7 @@ const CREDENTIALS: [&str; 4] = [
     "x-mediabrowser-token",
 ];
 
-/// The cache key of an image request: the site, the path as sent and the query
+/// The key of an image request: the site, the path as sent and the query
 /// parameters other than credentials, sorted. Path bytes are not decoded, so two
 /// spellings of one path are two keys, which costs a miss and never serves a wrong image.
 pub fn image_key(site: &str, target: &[u8]) -> String {
@@ -44,8 +44,8 @@ pub fn image_key(site: &str, target: &[u8]) -> String {
     key
 }
 
-/// The key of the copy of image `key` for a request with these `Accept` lines, for
-/// images whose response says `Vary: Accept` (an image endpoint may answer WebP to a
+/// The key of image `key` as a request with these `Accept` lines gets it, for images
+/// whose response says `Vary: Accept` (an image endpoint may answer WebP to a
 /// client that lists it). Whitespace and case, which do not change what the lines mean,
 /// are dropped; bytes outside printable ASCII are escaped so distinct values stay apart.
 pub fn variant_key<'a>(key: &str, accept: impl IntoIterator<Item = &'a [u8]>) -> String {

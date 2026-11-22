@@ -129,7 +129,7 @@ async fn image_fetches_move_to_the_next_address() {
         (200, "image n1".into())
     );
     let l = &w.relay.access_lines(ACCESS_LOG, 1)[0];
-    assert_eq!(l["cache"], "miss");
+    assert_eq!(l["cache"], "fetched");
     assert_eq!(l["up"].as_array().unwrap().len(), 3, "{l}");
 }
 

@@ -189,9 +189,8 @@ mod tests {
                 "range": null, "age_ms": 30000, "sent": 2000000000, "position": 2100000000,
                 "size": 8300000000u64, "ttfb_ms": 180, "idle_ms": 50, "requests": 1, "hedges": 0,
                 "resumes": 0, "in_flight": 1, "client_holds": false, "upstream": "vod1.example.com"}],
-            "cache": {"schema": 1, "images": 0, "bytes": 0, "capacity": 0, "missing": 0, "redirects": 0,
-                "hits": 0, "misses": 0, "coalesced": 0, "stale": 0, "revalidated": 0, "missing_hits": 0,
-                "shed": 0, "redirect_hits": 0, "upstreams": [{"upstream": "v1.example.com:443",
+            "cache": {"schema": 2, "missing": 0, "redirects": 0, "fetched": 0, "coalesced": 0,
+                "missing_hits": 0, "shed": 0, "redirect_hits": 0, "upstreams": [{"upstream": "v1.example.com:443",
                 "burst": 200.0, "per_sec": 2.5, "tokens": 180.0, "paused_secs": null, "limited": 0, "waiting": 0}]}
         }))
         .unwrap()
