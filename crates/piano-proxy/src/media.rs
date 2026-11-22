@@ -11,7 +11,7 @@
 
 use crate::follow;
 use crate::reach::{self, AttemptLog, CONNECT_RETRIES, Hop, MAX_ATTEMPTS, Reach};
-use crate::relay::Ctx;
+use crate::relay::{Ctx, logged_path, logged_range};
 use crate::{Relay, Site, Sites, TERMINATED, headers};
 use bytes::Bytes;
 use http::header::{
@@ -23,7 +23,7 @@ use log::{debug, warn};
 use piano_cache::Budget;
 use piano_edge::acl::canonical;
 use piano_media::{ByteRange, Head, Request, Resume, Stream, StreamGuard};
-use piano_telemetry::{Id, Kind, SiteCounters, Ttfb, redact};
+use piano_telemetry::{Id, Kind, SiteCounters, Ttfb};
 use pingora_core::protocols::http::v1::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
@@ -110,10 +110,8 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         ctx.rid.to_string(),
         site.name.clone(),
         client,
-        redact(&String::from_utf8_lossy(req.raw_path())).into_owned(),
-        range
-            .as_ref()
-            .map(|r| String::from_utf8_lossy(r.as_bytes()).into_owned()),
+        logged_path(req),
+        logged_range(req),
     ));
     let spec = Arc::new(Spec {
         reach: Arc::clone(&relay.reach),

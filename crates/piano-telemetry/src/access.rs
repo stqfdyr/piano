@@ -35,6 +35,9 @@ enum Msg {
 #[derive(Debug)]
 pub struct AccessLog {
     tx: SyncSender<Msg>,
+    /// Held while the file is switched, across its open and the queueing.
+    switching: Mutex<()>,
+    /// Apart from `switching` so that `status` never waits for file IO.
     path: Mutex<Option<PathBuf>>,
     enabled: AtomicBool,
     /// Shared with the writer thread, which counts the lines failed writes lose.
@@ -55,6 +58,7 @@ impl AccessLog {
         Ok(Self {
             tx,
             enabled: AtomicBool::new(path.is_some()),
+            switching: Mutex::new(()),
             path: Mutex::new(path.map(Path::to_owned)),
             dropped,
         })
@@ -91,11 +95,14 @@ impl AccessLog {
 
     /// Starts a new file at the current path, after the old one was moved away.
     pub fn reopen(&self) -> io::Result<()> {
-        let path = self.path.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(p) = path.as_deref() else {
+        let _switching = self
+            .switching
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(p) = self.path() else {
             return Ok(());
         };
-        let file = open_file(p)?;
+        let file = open_file(&p)?;
         self.send(Msg::Switch(Some(file)));
         Ok(())
     }
@@ -103,14 +110,17 @@ impl AccessLog {
     /// Moves the log to `path` (`None` turns it off). The new file is opened before
     /// anything changes, so on error the log keeps its current file.
     pub fn set_path(&self, path: Option<&Path>) -> io::Result<()> {
-        let mut current = self.path.lock().unwrap_or_else(PoisonError::into_inner);
-        if current.as_deref() == path {
+        let _switching = self
+            .switching
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.path().as_deref() == path {
             return Ok(());
         }
         let file = path.map(open_file).transpose()?;
         self.send(Msg::Switch(file));
         self.enabled.store(path.is_some(), Ordering::Relaxed);
-        *current = path.map(Path::to_owned);
+        *self.path.lock().unwrap_or_else(PoisonError::into_inner) = path.map(Path::to_owned);
         Ok(())
     }
 
@@ -271,6 +281,40 @@ mod tests {
         log.flush();
         assert_eq!(read(&b), "4\n");
         assert_eq!(log.dropped(), 0);
+    }
+
+    #[test]
+    fn the_path_is_read_while_a_switch_waits_on_the_file() {
+        let d = Dir::new("fifo");
+        let fifo = d.0.join("fifo.log");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let a = d.0.join("a.log");
+        let log = Arc::new(AccessLog::open(Some(&a)).unwrap());
+        // Opening a FIFO for writing waits for a reader: a switch stuck in file IO.
+        let switch = std::thread::spawn({
+            let (log, fifo) = (Arc::clone(&log), fifo.clone());
+            move || log.set_path(Some(&fifo)).unwrap()
+        });
+        while !switch.is_finished() && log.switching.try_lock().is_ok() {
+            std::thread::yield_now();
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn({
+            let log = Arc::clone(&log);
+            move || tx.send(log.path()).unwrap()
+        });
+        let path = rx.recv_timeout(Duration::from_secs(5));
+        // Without a writer waiting, opening the reader would wait in turn.
+        assert!(!switch.is_finished());
+        let reader = File::open(&fifo).unwrap();
+        switch.join().unwrap();
+        drop(reader);
+        assert_eq!(path, Ok(Some(a)));
+        assert_eq!(log.path(), Some(fifo));
     }
 
     #[test]

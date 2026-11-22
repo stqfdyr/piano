@@ -317,9 +317,14 @@ fn header_text(req: &RequestHeader, name: http::header::HeaderName, max: usize) 
 }
 
 /// The request target as logged: credentials removed, length capped.
-fn logged_path(req: &RequestHeader) -> String {
+pub(crate) fn logged_path(req: &RequestHeader) -> String {
     let raw = String::from_utf8_lossy(req.raw_path());
     redact(clip(&raw, MAX_PATH)).into_owned()
+}
+
+/// The Range header as logged: length capped.
+pub(crate) fn logged_range(req: &RequestHeader) -> Option<String> {
+    header_text(req, http::header::RANGE, MAX_RANGE)
 }
 
 fn opt_str(j: &mut JsonLine, k: &str, v: Option<&str>) {
@@ -397,11 +402,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
         "ua",
         header_text(req, http::header::USER_AGENT, MAX_UA).as_deref(),
     );
-    opt_str(
-        &mut j,
-        "range",
-        header_text(req, http::header::RANGE, MAX_RANGE).as_deref(),
-    );
+    opt_str(&mut j, "range", logged_range(req).as_deref());
     let ray = ctx.cf_ray.as_ref().and_then(|v| v.to_str().ok());
     opt_str(&mut j, "cf_ray", ray);
     j.finish()
