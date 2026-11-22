@@ -26,7 +26,8 @@ pub struct Stream {
     pub rid: String,
     pub site: String,
     pub client: Option<std::net::IpAddr>,
-    /// Request target with credentials removed.
+    /// Request target and Range header as the access log has them: credentials removed,
+    /// length capped, so that a listing of all streams stays bounded.
     pub path: String,
     pub range: Option<String>,
     pub started: Instant,

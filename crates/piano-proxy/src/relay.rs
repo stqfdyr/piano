@@ -316,10 +316,15 @@ fn header_text(req: &RequestHeader, name: http::header::HeaderName, max: usize) 
     Some(clip(&String::from_utf8_lossy(v.as_bytes()), max).to_owned())
 }
 
-/// The request target as logged: credentials removed, length capped.
+/// The request target as logged: credentials removed, at most [`MAX_PATH`] bytes.
 pub(crate) fn logged_path(req: &RequestHeader) -> String {
-    let raw = String::from_utf8_lossy(req.raw_path());
-    redact(clip(&raw, MAX_PATH)).into_owned()
+    capped(&String::from_utf8_lossy(req.raw_path()), MAX_PATH)
+}
+
+/// `s` with credentials removed, at most `max` bytes. Cut before redacting to bound its
+/// work and again after, since a placeholder can be longer than the value it replaces.
+fn capped(s: &str, max: usize) -> String {
+    clip(&redact(clip(s, max)), max).to_owned()
 }
 
 /// The Range header as logged: length capped.
@@ -379,7 +384,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
     opt_num(&mut j, "rewrite", ctx.rewritten.map(|n| n as u64));
     opt_str(&mut j, "cache", ctx.cache);
     j.str("end", end.as_str());
-    let err = e.map(|e| redact(clip(&e.to_string(), MAX_ERR)).into_owned());
+    let err = e.map(|e| capped(&e.to_string(), MAX_ERR));
     opt_str(&mut j, "err", err.as_deref());
     j.array("up");
     for a in &ctx.attempts {
@@ -862,6 +867,15 @@ mod tests {
         let target = format!("{head}{}", "s".repeat(64));
         let req = RequestHeader::build("GET", target.as_bytes(), None).unwrap();
         assert_eq!(logged_path(&req), format!("{head}REDACTED"));
+    }
+
+    #[test]
+    fn placeholders_longer_than_their_values_stay_within_the_cap() {
+        let target = format!("/x?{}", "api_key=a&".repeat(300));
+        let req = RequestHeader::build("GET", target.as_bytes(), None).unwrap();
+        let logged = logged_path(&req);
+        assert_eq!(logged.len(), MAX_PATH);
+        assert!(!logged.contains("=a&"), "{logged}");
     }
 
     #[test]
