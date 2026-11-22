@@ -65,6 +65,8 @@ pub(crate) struct AttemptLog {
     pub status: Option<u16>,
     /// What ended the attempt, if it failed.
     pub error: Option<&'static str>,
+    /// The attempt went to a remembered redirect target instead of walking the chain.
+    pub memo: bool,
 }
 
 impl AttemptLog {
@@ -79,6 +81,7 @@ impl AttemptLog {
             proto: None,
             status: None,
             error: None,
+            memo: false,
         }
     }
 
@@ -100,6 +103,8 @@ pub(crate) struct Reach {
     pub media: Connector,
     /// Connections for image fetches, HTTP/2 where the upstream offers it.
     pub images: HttpConnector,
+    /// Where media requests' redirects led.
+    pub redirects: crate::memo::Redirects,
 }
 
 impl std::fmt::Debug for Reach {
@@ -117,6 +122,7 @@ impl Reach {
             follow_addrs: AddrCache::new(FOLLOW_ADDR_TTL),
             media: Connector::new(Some(client.clone())),
             images: HttpConnector::new(Some(client)),
+            redirects: crate::memo::Redirects::default(),
         }
     }
 

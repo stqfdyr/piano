@@ -144,23 +144,106 @@ async fn a_pause_mid_body_gets_a_second_request() {
 }
 
 #[tokio::test]
-async fn a_resume_walks_the_redirect_chain_again() {
+async fn a_resume_goes_to_the_remembered_target() {
     let w = world().await;
-    let path = format!("/videos/chain/original.mkv?redirect=1&len={LEN}&plan=c100000,-");
+    let path = format!("/videos/chain/original.mkv?redirect=1&len={LEN}&plan=c100000,-&api_key=k");
     let got = w.get(Proto::H1, &path, Some("bytes=0-")).await;
     assert_eq!(got.status, 206);
     let body = got.body.unwrap();
     assert!(is_pattern(&body, 0) && body.len() as u64 == LEN);
-    assert_eq!(w.origin.redirects("chain"), 2);
+    assert_eq!(w.origin.redirects("chain"), 1);
     assert_eq!(w.origin.seen("chain").len(), 2);
-    let lines = w.relay.access_lines(ACCESS_LOG, 1);
-    let statuses: Vec<(u64, u64)> = lines[0]["up"]
+    assert_eq!(
+        attempts(&w.relay.access_lines(ACCESS_LOG, 1)[0]),
+        [(0, 302, false), (0, 206, false), (1, 206, true)]
+    );
+}
+
+/// `(src, status, memo)` of each upstream attempt in an access log line.
+fn attempts(line: &serde_json::Value) -> Vec<(u64, u64, bool)> {
+    line["up"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|a| (a["src"].as_u64().unwrap(), a["status"].as_u64().unwrap()))
-        .collect();
-    assert_eq!(statuses, [(0, 302), (0, 206), (1, 302), (1, 206)]);
+        .map(|a| {
+            (
+                a["src"].as_u64().unwrap(),
+                a["status"].as_u64().unwrap(),
+                a["memo"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_remembered_target_that_fails_is_asked_for_again() {
+    let w = world().await;
+    let path = format!("/videos/expired/original.mkv?redirect=1&len={LEN}&plan=-,r403,-&api_key=k");
+    for _ in 0..2 {
+        let got = w.get(Proto::H1, &path, Some("bytes=0-")).await;
+        assert_eq!(got.status, 206);
+        assert_eq!(got.body.unwrap().len() as u64, LEN);
+    }
+    assert_eq!(w.origin.redirects("expired"), 2);
+    assert_eq!(
+        attempts(&w.relay.access_lines(ACCESS_LOG, 2)[1]),
+        [(0, 403, true), (0, 302, false), (0, 206, false)]
+    );
+}
+
+#[tokio::test]
+async fn an_answer_about_the_request_keeps_the_target() {
+    let w = world().await;
+    let path = format!("/videos/past/original.mkv?redirect=1&len={LEN}&plan=-,r416,-&api_key=k");
+    let statuses = [206, 416, 206];
+    for want in statuses {
+        let got = w.get(Proto::H1, &path, Some("bytes=0-")).await;
+        assert_eq!(got.status, want);
+    }
+    assert_eq!(w.origin.redirects("past"), 1);
+}
+
+#[tokio::test]
+async fn targets_are_remembered_per_credentials_and_site_table() {
+    let ca = Ca::new("piano e2e");
+    let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;
+    let roots = [ca.cert_pem()];
+    let leaf = ca.leaf(&[SITE_HOST]);
+    let setup = RelaySetup::new(&leaf, &roots, origin.addr.port());
+    let relay = Relay::start(&setup);
+    let c = client(ca.cert_der(), SITE_HOST, relay.addr, Proto::H1);
+    let get = |token: &str| {
+        let url = format!(
+            "https://{SITE_HOST}:{}/videos/who/original.mkv?redirect=1&len=1000&api_key={token}",
+            relay.addr.port()
+        );
+        let req = c.get(url).header("range", "bytes=0-");
+        async move { req.send().await.unwrap().bytes().await.unwrap().len() }
+    };
+    assert_eq!(get("a").await, 1000);
+    assert_eq!(get("a").await, 1000);
+    assert_eq!(origin.redirects("who"), 1, "the same user again");
+    assert_eq!(get("b").await, 1000);
+    assert_eq!(origin.redirects("who"), 2, "another user asks the upstream");
+    relay.reload(&setup).unwrap();
+    assert_eq!(get("a").await, 1000);
+    assert_eq!(origin.redirects("who"), 3, "the rules may have changed");
+    // Without credentials, or with them in a header, each asks as itself.
+    let by_header = |token: Option<&str>| {
+        let url = format!(
+            "https://{SITE_HOST}:{}/videos/hdr/original.mkv?redirect=1&len=1000",
+            relay.addr.port()
+        );
+        let mut req = c.get(url).header("range", "bytes=0-");
+        if let Some(t) = token {
+            req = req.header("x-emby-token", t);
+        }
+        async move { req.send().await.unwrap().bytes().await.unwrap().len() }
+    };
+    for token in [None, None, Some("a"), Some("a"), Some("b")] {
+        assert_eq!(by_header(token).await, 1000);
+    }
+    assert_eq!(origin.redirects("hdr"), 4);
 }
 
 #[tokio::test]

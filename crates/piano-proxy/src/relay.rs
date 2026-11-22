@@ -405,6 +405,7 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
         opt_str(&mut j, "proto", a.proto);
         opt_num(&mut j, "status", a.status.map(u64::from));
         opt_str(&mut j, "error", a.error);
+        j.bool("memo", a.memo);
         j.end_object();
     }
     j.end_array();

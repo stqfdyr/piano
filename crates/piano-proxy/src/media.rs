@@ -6,10 +6,13 @@
 //! same bytes starts; an upstream request that fails is replaced. Whichever request
 //! delivers the next bytes first carries on and the others are dropped. Every request
 //! walks the redirect chain from the client's own URL again, since redirect targets carry
-//! signatures that expire. A body that is not resumable is relayed as it comes: no
-//! further requests, and an upstream failure ends it.
+//! signatures that expire, unless the same target led somewhere in the last minutes
+//! ([`memo`]): then it goes there, and walks the chain again if that fails. A body that
+//! is not resumable is relayed as it comes: no further requests, and an upstream
+//! failure ends it.
 
 use crate::follow;
+use crate::memo;
 use crate::reach::{self, AttemptLog, CONNECT_RETRIES, Hop, MAX_ATTEMPTS, Reach};
 use crate::relay::{Ctx, logged_path, logged_range};
 use crate::{Relay, Site, Sites, TERMINATED, headers};
@@ -138,6 +141,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         stall: site.origin.options.read_timeout,
         req: upstream_request(req)?,
         client_path: req.raw_path().to_vec(),
+        memo: memo::key(&site.name, ctx.hop.as_ref(), req),
         start: ctx.hop.clone(),
         site: ctx.site,
         sites,
@@ -248,6 +252,8 @@ struct Spec {
     req: RequestHeader,
     /// The client's request target, where redirects from the upstream itself start.
     client_path: Vec<u8>,
+    /// What the request's redirect target is remembered under; `None` when not kept.
+    memo: Option<Vec<u8>>,
     /// Where requests go first: a mounted host, or the site's upstream when `None`.
     start: Option<Hop>,
     /// Longest wait for the upstream: for each read of a request, and for the stream's
@@ -727,15 +733,36 @@ async fn request(
     tx: &mpsc::Sender<(u32, Msg)>,
 ) -> Result<()> {
     let site = spec.site()?;
-    let mut hop = spec.start.clone();
+    let remembered = spec
+        .memo
+        .as_deref()
+        .and_then(|k| spec.reach.redirects.get(k, &spec.sites, Instant::now()));
+    // Whether this attempt goes to a remembered target. One that fails is forgotten and
+    // the chain walked from the start with attempts of its own.
+    let mut at_memo = remembered.is_some();
+    let mut hop = remembered.or_else(|| spec.start.clone());
     let mut hops = 0u8;
     let mut connect_retries = 0u8;
     let mut last = None;
-    for _ in 0..MAX_ATTEMPTS {
+    let mut left = MAX_ATTEMPTS;
+    let forget = |hop: &mut Option<Hop>, at_memo: &mut bool, retries: &mut u8, left: &mut usize| {
+        if let (Some(k), Some(used)) = (&spec.memo, hop.as_ref()) {
+            spec.reach.redirects.forget(k, used);
+        }
+        *at_memo = false;
+        *hop = spec.start.clone();
+        *retries = 0;
+        *left = MAX_ATTEMPTS;
+    };
+    while left > 0 {
+        left -= 1;
         let host = reach::host_of(site, hop.as_ref()).to_owned();
         let (mut peer, addrs, addr) = spec.reach.peer(site, hop.as_ref()).await?;
         peer.options.read_timeout = Some(spec.stall);
         let entry = spec.push(AttemptLog::new(id, host.clone(), addr));
+        if at_memo {
+            spec.note(entry, |a| a.memo = true);
+        }
         let origin = crate::image::at_origin(site, hop.as_ref());
         if origin {
             spec.budget.charge(Instant::now());
@@ -753,6 +780,11 @@ async fn request(
                         last = Some(e);
                         continue;
                     }
+                }
+                if at_memo {
+                    forget(&mut hop, &mut at_memo, &mut connect_retries, &mut left);
+                    last = Some(e);
+                    continue;
                 }
                 return Err(e.into_up());
             }
@@ -784,6 +816,11 @@ async fn request(
                     last = Some(e);
                     continue;
                 }
+                if at_memo {
+                    forget(&mut hop, &mut at_memo, &mut connect_retries, &mut left);
+                    last = Some(e);
+                    continue;
+                }
                 return Err(e.into_up());
             }
         };
@@ -795,6 +832,21 @@ async fn request(
         if origin {
             crate::image::note_upstream(&spec.budget, &resp);
         }
+        if at_memo && matches!(status, 401 | 403 | 404 | 410 | 500..=599) {
+            // An expired signature, a moved file, a failing host: ask the upstream again.
+            // Other answers are the request's own (416 past the end) and stand.
+            tokio::spawn(drain(Arc::clone(&spec.reach), http, peer));
+            forget(&mut hop, &mut at_memo, &mut connect_retries, &mut left);
+            last = Some(
+                Error::explain(
+                    ErrorType::HTTPStatus(status),
+                    "remembered redirect target refused",
+                )
+                .into_up(),
+            );
+            continue;
+        }
+        at_memo = false;
         let location = follow::is_redirect(status)
             .then(|| resp.headers.get(LOCATION))
             .flatten();
@@ -812,6 +864,14 @@ async fn request(
             tokio::spawn(drain(Arc::clone(&spec.reach), http, peer));
             hop = Some(next);
             continue;
+        }
+        if hops > 0
+            && (200..300).contains(&status)
+            && let (Some(k), Some(h)) = (&spec.memo, &hop)
+        {
+            spec.reach
+                .redirects
+                .put(k.clone(), h.clone(), &spec.sites, Instant::now());
         }
         tx.send((id, Msg::Head(Box::new(resp), host)))
             .await
