@@ -20,8 +20,7 @@ use crate::{Relay, Site, Sites};
 use bytes::{Bytes, BytesMut};
 use http::header::{
     ACCEPT_ENCODING, AGE, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER, SET_COOKIE, UPGRADE,
-    VARY,
+    IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER, UPGRADE, VARY,
 };
 use http::{HeaderName, HeaderValue, Method};
 use piano_cache::{Budget, BudgetState, Freshness, Lru, Wait, Weigh, image_key, shared_ttl};
@@ -75,7 +74,8 @@ const DEFAULT_PAUSE: Duration = Duration::from_secs(10);
 /// Longest pause honoured; image requests during a pause are answered locally.
 const MAX_PAUSE: Duration = Duration::from_secs(60);
 
-/// Response fields not stored with an image: about the connection, or recomputed.
+/// Response fields not stored with an image: about the connection, recomputed, or
+/// meant for one client only (a session cookie, which does not change the image).
 const NOT_STORED: [&str; 10] = [
     "connection",
     "keep-alive",
@@ -929,11 +929,7 @@ fn cacheable(resp: &ResponseHeader, len: usize) -> bool {
             .split(|&b| b == b',')
             .all(|t| t.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))
     });
-    resp.status.as_u16() == 200
-        && image
-        && vary_ok
-        && !resp.headers.contains_key(SET_COOKIE)
-        && len <= MAX_IMAGE
+    resp.status.as_u16() == 200 && image && vary_ok && len <= MAX_IMAGE
 }
 
 /// Whether the client already has `s`, by its conditional request.
@@ -1094,7 +1090,9 @@ mod tests {
             &resp(200, &[("content-type", "image/jpeg"), ("vary", "Cookie")]),
             10
         ));
-        assert!(!cacheable(
+        // A gateway's session cookie does not make the image personal; it is never
+        // replayed (NOT_STORED).
+        assert!(cacheable(
             &resp(
                 200,
                 &[("content-type", "image/jpeg"), ("set-cookie", "a=b")]
