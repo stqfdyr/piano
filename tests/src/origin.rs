@@ -861,7 +861,8 @@ fn media_key(path: &str) -> Option<&str> {
 /// head, `bMS` before the first body byte; `cN` breaks the connection at file offset
 /// N; `sN:MS` pauses at file offset N; `eTAG` sets the ETag (default `v1`); `x`
 /// ignores `Range` and does not advertise ranges; `u` sends no length (like a live
-/// transcode); `-` is a plain request.
+/// transcode); `rCODE` answers with status CODE and no file (an expired signature);
+/// `-` is a plain request.
 #[derive(Debug, Default, Clone)]
 struct Plan {
     head_delay: u64,
@@ -871,6 +872,7 @@ struct Plan {
     etag: Option<String>,
     no_ranges: bool,
     unknown_length: bool,
+    status: Option<u16>,
 }
 
 impl Plan {
@@ -889,6 +891,7 @@ impl Plan {
                 "e" => p.etag = Some(v.to_owned()),
                 "x" if v.is_empty() => p.no_ranges = true,
                 "u" if v.is_empty() => p.unknown_length = true,
+                "r" => p.status = Some(v.parse().unwrap()),
                 _ => panic!("unknown plan token {t}"),
             }
         }
@@ -956,6 +959,12 @@ async fn media(req: &Request<Incoming>, key: String, state: &State) -> Response<
     let plan = Plan::parse(plans[(n - 1).min(plans.len() - 1)]);
     if plan.head_delay > 0 {
         tokio::time::sleep(Duration::from_millis(plan.head_delay)).await;
+    }
+    if let Some(code) = plan.status {
+        return Response::builder()
+            .status(code)
+            .body(full("refused"))
+            .unwrap();
     }
     let etag = format!("\"{}\"", plan.etag.as_deref().unwrap_or("v1"));
     // RFC 9110 §13.1.5: a Range whose If-Range does not match is ignored.
