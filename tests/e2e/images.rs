@@ -97,7 +97,19 @@ async fn images_with_a_session_cookie_are_stored_without_it() {
         assert!(!got.headers.contains_key("set-cookie"), "{:?}", got.headers);
     }
     assert_eq!(w.origin.hits("/emby/Items/k1/Images/Primary"), 1);
-    assert_eq!(w.cache_fields(2), ["miss", "hit"]);
+    // The 304 that confirms an expired copy sets a cookie too; it is not kept either.
+    w.get("/Items/k2/Images/Primary?ttl=1&cookie=1").await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for _ in 0..2 {
+        let got = w.get("/Items/k2/Images/Primary?ttl=1&cookie=1").await;
+        assert_eq!((got.status, got.body.as_str()), (200, "image k2"));
+        assert!(!got.headers.contains_key("set-cookie"), "{:?}", got.headers);
+    }
+    assert_eq!(w.origin.hits("/Items/k2/Images/Primary"), 2);
+    assert_eq!(
+        w.cache_fields(5),
+        ["miss", "hit", "miss", "revalidated", "hit"]
+    );
 }
 
 #[tokio::test]
