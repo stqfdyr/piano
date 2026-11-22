@@ -44,18 +44,23 @@ pub fn image_key(site: &str, target: &[u8]) -> String {
     key
 }
 
-/// The key a stored image and a shared fetch go by: the image's `key` and the request's
-/// `Accept` lines, as sent. Image endpoints may choose the format by `Accept` (WebP for
-/// a client that lists it) and say so with `Vary: Accept`, so requests that accept
-/// different formats share neither; a client sends the same value every time.
+/// The key of the copy of image `key` for a request with these `Accept` lines, for
+/// images whose response says `Vary: Accept` (an image endpoint may answer WebP to a
+/// client that lists it). Whitespace and case, which do not change what the lines mean,
+/// are dropped; bytes outside printable ASCII are escaped so distinct values stay apart.
 pub fn variant_key<'a>(key: &str, accept: impl IntoIterator<Item = &'a [u8]>) -> String {
     let mut v = String::from(key);
     v.push('\n');
     for (i, line) in accept.into_iter().enumerate() {
         if i > 0 {
-            v.push_str(", ");
+            v.push(',');
         }
-        v.push_str(&String::from_utf8_lossy(line));
+        let kept: Vec<u8> = line
+            .iter()
+            .filter(|b| !matches!(b, b' ' | b'\t'))
+            .map(u8::to_ascii_lowercase)
+            .collect();
+        v.push_str(&kept.escape_ascii().to_string());
     }
     v
 }
@@ -65,18 +70,17 @@ mod tests {
     use super::{image_key, variant_key};
 
     #[test]
-    fn variants_differ_by_accept_as_sent() {
+    fn variants_differ_by_what_accept_says() {
         let k = "s /x?tag=1";
-        let webp: &[u8] = b"image/webp,image/*";
-        assert_eq!(variant_key(k, [webp]), variant_key(k, [webp]));
-        assert_ne!(variant_key(k, [webp]), variant_key(k, [&b"image/*"[..]]));
-        assert_ne!(variant_key(k, [webp]), variant_key(k, None::<&[u8]>));
-        assert_eq!(variant_key(k, None::<&[u8]>), "s /x?tag=1\n");
-        assert_eq!(
-            variant_key(k, [&b"image/webp"[..], b"*/*"]),
-            "s /x?tag=1\nimage/webp, */*"
-        );
-        assert_ne!(variant_key("s /x", [webp]), variant_key("s /y", [webp]));
+        let v = |lines: &[&[u8]]| variant_key(k, lines.iter().copied());
+        assert_eq!(v(&[b"image/webp,image/*"]), v(&[b"Image/WebP, image/*"]));
+        assert_ne!(v(&[b"image/webp,image/*"]), v(&[b"image/*"]));
+        assert_ne!(v(&[b"image/*"]), v(&[]));
+        assert_eq!(v(&[]), "s /x?tag=1\n");
+        assert_eq!(v(&[b"image/webp", b" */*"]), "s /x?tag=1\nimage/webp,*/*");
+        assert_ne!(v(&[b"image/webp\xff"]), v(&[b"image/webp\xfe"]));
+        assert_ne!(v(&[b"image/webp\xff"]), v(&[b"image/webp\\xff"]));
+        assert_ne!(variant_key("s /y", [&b"image/*"[..]]), v(&[b"image/*"]));
     }
 
     #[test]

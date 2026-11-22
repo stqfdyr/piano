@@ -659,6 +659,14 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         }
         None => 200,
     };
+    // `negotiate=1`: WebP for a client that lists it, as an image endpoint that says
+    // `Vary: Accept` may answer; its redirects say so too.
+    let negotiate = param("negotiate") == Some("1");
+    let webp = negotiate
+        && req
+            .headers()
+            .get("accept")
+            .is_some_and(|v| v.to_str().is_ok_and(|a| a.contains("image/webp")));
     let elsewhere = req
         .headers()
         .get("user-agent")
@@ -670,8 +678,12 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
         _ => None,
     };
     if let Some(status) = moved.filter(|_| !target && code == 200) {
+        let mut builder = Response::builder();
+        if negotiate {
+            builder = builder.header("vary", "Accept");
+        }
         return Some(
-            Response::builder()
+            builder
                 .status(status)
                 .header("location", format!("/img/{key}?{query}"))
                 .body(full("moved"))
@@ -683,14 +695,6 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
     } else {
         param("ttl").and_then(|v| v.parse().ok()).unwrap_or(60)
     };
-    // `negotiate=1`: WebP for a client that lists it, as an image endpoint that says
-    // `Vary: Accept` may answer.
-    let negotiate = param("negotiate") == Some("1");
-    let webp = negotiate
-        && req
-            .headers()
-            .get("accept")
-            .is_some_and(|v| v.to_str().is_ok_and(|a| a.contains("image/webp")));
     let (format, content_type) = if webp {
         ("webp", "image/webp")
     } else {
