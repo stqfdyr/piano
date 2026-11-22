@@ -189,15 +189,17 @@ struct State {
     seen: BTreeMap<String, (ByKind, ByKind)>,
     /// The cutoff moved since the last write, so the file holds days to drop.
     prune_due: bool,
-    /// Why the file cannot be read or written, until a write succeeds.
-    error: Option<String>,
 }
 
 /// The record of a running daemon.
 #[derive(Debug)]
 pub struct Ledger {
     path: Option<PathBuf>,
+    /// Held across the file IO of a write.
     state: Mutex<State>,
+    /// Why the file cannot be read or written, until a write succeeds. Apart from
+    /// `state` so that `status` never waits for a write.
+    error: Mutex<Option<String>>,
 }
 
 impl Ledger {
@@ -220,8 +222,8 @@ impl Ledger {
                 cutoff: None,
                 seen: BTreeMap::new(),
                 prune_due: false,
-                error,
             }),
+            error: Mutex::new(error),
         };
         (ledger, warning)
     }
@@ -272,7 +274,7 @@ impl Ledger {
             return Ok(false);
         };
         let mut st = self.state();
-        if st.pending.is_empty() && !st.prune_due && st.error.is_none() {
+        if st.pending.is_empty() && !st.prune_due && self.error().is_none() {
             return Ok(false);
         }
         match merge_into_file(path, &st.pending, st.cutoff, now) {
@@ -282,11 +284,11 @@ impl Ledger {
                 }
                 st.pending.clear();
                 st.prune_due = false;
-                st.error = None;
+                self.set_error(None);
                 Ok(true)
             }
             Err(e) => {
-                st.error = Some(e.to_string());
+                self.set_error(Some(e.to_string()));
                 Err(e)
             }
         }
@@ -294,7 +296,14 @@ impl Ledger {
 
     /// Why the file cannot be read or written, until a write succeeds.
     pub fn error(&self) -> Option<String> {
-        self.state().error.clone()
+        self.error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_error(&self, error: Option<String>) {
+        *self.error.lock().unwrap_or_else(PoisonError::into_inner) = error;
     }
 }
 
@@ -559,6 +568,34 @@ mod tests {
                 .media,
             7
         );
+    }
+
+    #[test]
+    fn the_error_is_read_while_a_write_waits_on_the_file() {
+        let dir = Dir::new("waiting");
+        let path = dir.0.join("traffic.json");
+        let (l, _) = Ledger::open(Some(&path), 0);
+        let l = std::sync::Arc::new(l);
+        l.add(&totals(&[("a", [1, 0, 0, 0], [0; 4])]), day("2026-11-20"));
+        // Another process holds the record, so the write waits with `state` held.
+        let held = std::fs::File::open(dir.0.join("traffic.json.lock")).unwrap();
+        held.lock().unwrap();
+        let writer = std::thread::spawn({
+            let l = std::sync::Arc::clone(&l);
+            move || l.save(1).unwrap()
+        });
+        while !writer.is_finished() && l.state.try_lock().is_ok() {
+            std::thread::yield_now();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let l = std::sync::Arc::clone(&l);
+            move || tx.send(l.error()).unwrap()
+        });
+        let error = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        assert!(writer.join().unwrap());
+        assert_eq!(error, Ok(None));
     }
 
     #[test]

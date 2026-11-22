@@ -190,8 +190,9 @@ async fn the_socket_is_removed_when_the_daemon_stops() {
 async fn live_lists_a_stalled_stream_and_times_first_bytes() {
     let w = world().await;
     let url = format!(
-        "https://{SITE_HOST}:{}/videos/live/stream.mkv?len=300000&plan=b4000,b4000,-",
-        w.relay.addr.port()
+        "https://{SITE_HOST}:{}/videos/live/stream.mkv?len=300000&plan=b4000,b4000,-&filler={}",
+        w.relay.addr.port(),
+        "x".repeat(8000)
     );
     let c = client(w.ca.cert_der(), SITE_HOST, w.relay.addr, Proto::H1);
     let play = tokio::spawn(async move {
@@ -220,6 +221,9 @@ async fn live_lists_a_stalled_stream_and_times_first_bytes() {
     assert_eq!(stream.site, "media");
     assert_eq!(stream.client.as_deref(), Some("127.0.0.1"));
     assert!(stream.path.starts_with("/videos/live/"), "{}", stream.path);
+    // Capped like the access log, so long targets cannot grow the reply without bound.
+    assert!(stream.path.len() <= 2048, "{}", stream.path.len());
+    assert_eq!(stream.range.as_deref(), Some("bytes=1000-"));
     assert_eq!((stream.position, stream.size), (Some(1000), Some(300_000)));
     assert_eq!((stream.sent, stream.requests, stream.in_flight), (0, 2, 2));
     assert!(stream.ttfb_ms.is_some());
