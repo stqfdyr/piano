@@ -1,15 +1,14 @@
-//! The image engine: answers image requests from memory where it can and spends the
-//! upstream's request limit carefully where it cannot.
+//! The image engine: spends the upstream's request limit carefully on image requests.
 //!
 //! Upstreams rate-limit per client address, and the relay is one address for all its
 //! clients. A client opening a poster wall asks for a few hundred images within
-//! seconds, so image requests (1) are answered from stored bodies while fresh, and from
-//! stale ones when the upstream fails; (2) remember permanent redirects, since one
-//! upstream answers every image with a 301 that it does not let be cached and that costs
-//! a request against its limit, while the redirect target is served by its CDN;
-//! (3) remember images the upstream does not have; (4) share one upstream request among
-//! concurrent requests for the same image; and (5) wait for the site's request budget
+//! seconds, so image requests (1) remember permanent redirects, since one upstream
+//! answers every image with a 301 that it does not let be cached and that costs a
+//! request against its limit, while the redirect target is served by its CDN;
+//! (2) remember images the upstream does not have; (3) share one upstream request among
+//! concurrent requests for the same image; and (4) wait for the site's request budget
 //! ([`Budget`]) instead of running into 429, which would also fail browsing requests.
+//! Image bodies are not kept: clients keep their own copies.
 
 use crate::follow::{self, Target, TargetKind};
 use crate::headers;
@@ -19,14 +18,11 @@ use crate::relay::Ctx;
 use crate::{Relay, Site, Sites};
 use bytes::{Bytes, BytesMut};
 use http::header::{
-    ACCEPT, ACCEPT_ENCODING, AGE, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER,
-    UPGRADE, VARY,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER, UPGRADE, VARY,
 };
 use http::{HeaderName, HeaderValue, Method};
-use piano_cache::{
-    Budget, BudgetState, Freshness, Lru, Wait, Weigh, image_key, shared_ttl, variant_key,
-};
+use piano_cache::{Budget, BudgetState, Lru, Wait, Weigh, image_key, variant_key};
 use piano_telemetry::Kind;
 use pingora_core::protocols::http::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -39,16 +35,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-/// Largest image body kept in memory. Posters at the upstreams are 20–400 KB and
-/// backdrops a few MB; a larger body is relayed as it comes, without caching.
+/// Largest image body buffered to share among the requests waiting for it. Posters at
+/// the upstreams are 20–400 KB and backdrops a few MB; a larger body is relayed by the
+/// plain proxy as it comes.
 const MAX_IMAGE: usize = 8 * 1024 * 1024;
-
-/// Longest a stored image counts as fresh, whatever the upstream allows.
-const MAX_TTL: Duration = Duration::from_secs(30 * 86_400);
-
-/// How long past its freshness a stored image may still stand in for an upstream that
-/// fails or rate-limits. Images rarely change; one upstream lets its CDN keep them 7 days.
-const STALE_FOR: Duration = Duration::from_secs(7 * 86_400);
 
 /// How long a 404 for an image is remembered. Clients ask again for images an item
 /// lists but the upstream lacks, up to hundreds of times an hour; an image added
@@ -65,8 +55,8 @@ const MOVED_TTL: Duration = Duration::from_secs(86_400);
 /// at a relay in two months.
 const MOVED_MEMORY: usize = 8 * 1024 * 1024;
 const MISSING_MEMORY: usize = 2 * 1024 * 1024;
-/// Memory for the images known to vary by `Accept`, whose copies are found through it:
-/// one forgotten costs a fetch, never a wrong copy.
+/// Memory for the images known to vary by `Accept`, which are fetched per variant: one
+/// forgotten costs a request handed back to the plain proxy, never a wrong image.
 const VARIES_MEMORY: usize = 2 * 1024 * 1024;
 
 /// Longest an image request waits for the budget before it is answered 429 itself.
@@ -80,46 +70,45 @@ const DEFAULT_PAUSE: Duration = Duration::from_secs(10);
 /// Longest pause honoured; image requests during a pause are answered locally.
 const MAX_PAUSE: Duration = Duration::from_secs(60);
 
-/// Response fields not stored with an image: about the connection, recomputed, or
-/// meant for one client only (a session cookie, which does not change the image).
-const NOT_STORED: [&str; 10] = [
+/// Response fields not passed on with a shared answer: about the connection, recomputed,
+/// or meant for one client only (a session cookie, which does not change the image).
+const NOT_SHARED: [&str; 8] = [
     "connection",
     "keep-alive",
     "transfer-encoding",
     "content-length",
-    "date",
-    "age",
     "proxy-connection",
     "trailer",
     "upgrade",
     "set-cookie",
 ];
 
-/// An upstream answer, buffered.
+/// An upstream answer, buffered for every request waiting for it.
 #[derive(Debug)]
-pub(crate) struct Stored {
+struct Answer {
     status: u16,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
-    /// Time the response had spent in caches upstream when it arrived (its `Age`).
-    age: Duration,
-    stored_at: Instant,
-    fresh_until: Instant,
-    keep_until: Instant,
 }
 
-impl Weigh for Stored {
-    fn weight(&self) -> usize {
-        let h: usize = self
+impl Answer {
+    /// Whether the answer is the same for every client that asks: not a refusal of the
+    /// leader's credentials, and chosen by nothing beyond `Accept` (requests waiting for it
+    /// asked with the same one) and `Accept-Encoding` (fetched uncompressed).
+    fn shared(&self) -> bool {
+        let vary_ok = self
             .headers
             .iter()
-            .map(|(k, v)| k.as_str().len() + v.len() + 32)
-            .sum();
-        self.body.len() + h + 128
+            .filter(|(k, _)| *k == VARY)
+            .all(|(_, v)| {
+                v.as_bytes().split(|&b| b == b',').all(|t| {
+                    let t = t.trim_ascii();
+                    t.eq_ignore_ascii_case(b"accept") || t.eq_ignore_ascii_case(b"accept-encoding")
+                })
+            });
+        !matches!(self.status, 401 | 403 | 407) && vary_ok
     }
-}
 
-impl Stored {
     fn header(&self, name: &HeaderName) -> Option<&HeaderValue> {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v)
     }
@@ -135,7 +124,7 @@ impl Stored {
     }
 }
 
-/// Marks an image whose copies are kept per variant.
+/// Marks an image fetched per variant.
 #[derive(Debug)]
 struct Varies;
 
@@ -171,9 +160,7 @@ impl Weigh for Moved {
 /// What an upstream fetch came to; shared by every request that waited for it.
 #[derive(Debug)]
 enum Fetched {
-    Response(Arc<Stored>),
-    /// The stored image was confirmed and is fresh again.
-    NotModified,
+    Response(Answer),
     /// The budget did not allow a request in time; retry after this long.
     Shed(Duration),
     Failed(ErrorType, String),
@@ -185,22 +172,17 @@ type Flight = watch::Receiver<Option<Arc<Fetched>>>;
 
 #[derive(Debug)]
 struct State {
-    /// Copies by image key, or by variant key for an image in `varies`.
-    bodies: Lru<Arc<Stored>>,
     missing: Lru<Missing>,
     moved: Lru<Moved>,
-    /// Images whose last stored response said `Vary: Accept`.
+    /// Images whose last response said `Vary: Accept`.
     varies: Lru<Varies>,
 }
 
 /// Counters since start.
 #[derive(Debug, Default)]
 struct Counters {
-    hits: AtomicU64,
-    misses: AtomicU64,
+    fetched: AtomicU64,
     coalesced: AtomicU64,
-    stale: AtomicU64,
-    revalidated: AtomicU64,
     missing: AtomicU64,
     shed: AtomicU64,
     moved: AtomicU64,
@@ -209,16 +191,10 @@ struct Counters {
 /// A snapshot of the image engine for status output.
 #[derive(Debug, Clone)]
 pub struct ImageStats {
-    pub bytes: u64,
-    pub capacity: u64,
-    pub images: u64,
     pub missing: u64,
     pub moved: u64,
-    pub hits: u64,
-    pub misses: u64,
+    pub fetched: u64,
     pub coalesced: u64,
-    pub stale: u64,
-    pub revalidated: u64,
     pub missing_hits: u64,
     pub shed: u64,
     pub moved_hits: u64,
@@ -229,13 +205,12 @@ pub struct ImageStats {
 /// What a purge removed.
 #[derive(Debug, Clone, Copy)]
 pub struct Purged {
-    pub images: u64,
     pub missing: u64,
     pub moved: u64,
 }
 
-/// Stored images, remembered redirects and misses, fetches in flight and the request
-/// budget of each upstream. Shared by all requests and kept across reloads.
+/// Remembered redirects and misses, fetches in flight and the request budget of each
+/// upstream. Shared by all requests and kept across reloads.
 #[derive(Debug)]
 pub struct Images {
     state: Mutex<State>,
@@ -251,19 +226,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-enum Look {
-    Fresh(Arc<Stored>),
-    Missing,
-    Stale(Arc<Stored>),
-    None,
+impl Default for Images {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Images {
-    /// `capacity` is the memory for stored images in bytes: bodies, headers and keys.
-    pub fn new(capacity: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(State {
-                bodies: Lru::new(capacity),
                 missing: Lru::new(MISSING_MEMORY),
                 moved: Lru::new(MOVED_MEMORY),
                 varies: Lru::new(VARIES_MEMORY),
@@ -272,10 +244,6 @@ impl Images {
             budgets: Mutex::new(HashMap::new()),
             counters: Counters::default(),
         }
-    }
-
-    pub fn set_capacity(&self, capacity: usize) {
-        lock(&self.state).bodies.set_capacity(capacity);
     }
 
     /// The request budget of `site`'s upstream, with the site's configured rate.
@@ -292,12 +260,11 @@ impl Images {
         b
     }
 
-    /// Removes stored images, remembered redirects and misses.
+    /// Forgets remembered redirects and misses.
     pub fn purge(&self) -> Purged {
         let mut s = lock(&self.state);
         s.varies.clear();
         Purged {
-            images: s.bodies.clear() as u64,
             missing: s.missing.clear() as u64,
             moved: s.moved.clear() as u64,
         }
@@ -305,15 +272,9 @@ impl Images {
 
     pub fn stats(&self) -> ImageStats {
         let now = Instant::now();
-        let (bytes, capacity, images, missing, moved) = {
+        let (missing, moved) = {
             let s = lock(&self.state);
-            (
-                s.bodies.used() as u64,
-                s.bodies.capacity() as u64,
-                s.bodies.len() as u64,
-                s.missing.len() as u64,
-                s.moved.len() as u64,
-            )
+            (s.missing.len() as u64, s.moved.len() as u64)
         };
         let mut budgets: Vec<(String, BudgetState)> = lock(&self.budgets)
             .iter()
@@ -323,16 +284,10 @@ impl Images {
         let c = &self.counters;
         let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
         ImageStats {
-            bytes,
-            capacity,
-            images,
             missing,
             moved,
-            hits: n(&c.hits),
-            misses: n(&c.misses),
+            fetched: n(&c.fetched),
             coalesced: n(&c.coalesced),
-            stale: n(&c.stale),
-            revalidated: n(&c.revalidated),
             missing_hits: n(&c.missing),
             shed: n(&c.shed),
             moved_hits: n(&c.moved),
@@ -340,34 +295,20 @@ impl Images {
         }
     }
 
-    /// What is known of image `key` as a request whose variant key is `variant` gets it.
-    fn look(&self, key: &str, variant: &str, now: Instant) -> Look {
+    /// Whether image `key` is remembered as missing.
+    fn is_missing(&self, key: &str, now: Instant) -> bool {
         let mut s = lock(&self.state);
-        if let Some(m) = s.missing.get(key) {
-            if m.until > now {
-                return Look::Missing;
-            }
-            s.missing.remove(key);
-        }
-        let slot = if s.varies.get(key).is_some() {
-            variant
-        } else {
-            key
+        let Some(m) = s.missing.get(key) else {
+            return false;
         };
-        let Some(stored) = s.bodies.get(slot).cloned() else {
-            return Look::None;
-        };
-        if stored.fresh_until > now {
-            Look::Fresh(stored)
-        } else if stored.keep_until > now {
-            Look::Stale(stored)
-        } else {
-            s.bodies.remove(slot);
-            Look::None
+        if m.until > now {
+            return true;
         }
+        s.missing.remove(key);
+        false
     }
 
-    /// Whether copies of image `key` are kept per variant.
+    /// Whether image `key` is fetched per variant.
     fn varies(&self, key: &str) -> bool {
         lock(&self.state).varies.get(key).is_some()
     }
@@ -396,17 +337,22 @@ impl Images {
         lock(&self.state).moved.remove(key);
     }
 
-    fn store(&self, key: &str, variant: &str, stored: Arc<Stored>) {
+    /// Notes that the upstream answered image `key` with 200: whether later requests
+    /// for it are fetched per variant.
+    fn found(&self, key: &str, varies: bool) {
         let mut s = lock(&self.state);
         s.missing.remove(key);
-        put(&mut s, key, variant, stored);
+        if varies {
+            s.varies.insert(key.to_owned(), Varies);
+        } else {
+            s.varies.remove(key);
+        }
     }
 
-    /// Remembers that image `key` is missing. Its copies become unreachable, those of
-    /// every variant too, so none comes back once the miss is forgotten.
+    /// Remembers that image `key` is missing; once that is forgotten it is fetched
+    /// for all variants again until a response says otherwise.
     fn remember_missing(&self, key: &str, now: Instant) {
         let mut s = lock(&self.state);
-        s.bodies.remove(key);
         s.varies.remove(key);
         s.missing.insert(
             key.to_owned(),
@@ -414,60 +360,6 @@ impl Images {
                 until: now + MISSING_TTL,
             },
         );
-    }
-
-    /// Stores `old` again after the upstream confirmed it, fresh for what the
-    /// confirmation allows (its stored Cache-Control, less the confirmation's `Age`, when
-    /// it says nothing). It is stored even if it was evicted or purged meanwhile: the
-    /// confirmation makes it current.
-    fn refresh(
-        &self,
-        key: &str,
-        variant: &str,
-        old: &Stored,
-        fresh: Freshness,
-        age: Duration,
-        now: Instant,
-    ) {
-        let mut s = lock(&self.state);
-        let ttl = match fresh {
-            Freshness::For(ttl) => ttl,
-            Freshness::Unstated => match stored_ttl(&old.headers, age) {
-                Freshness::For(ttl) => ttl,
-                _ => old.fresh_until.saturating_duration_since(old.stored_at),
-            },
-            Freshness::Never => {
-                s.bodies.remove(if old.varies() { variant } else { key });
-                return;
-            }
-        };
-        put(
-            &mut s,
-            key,
-            variant,
-            Arc::new(Stored {
-                status: old.status,
-                headers: old.headers.clone(),
-                body: old.body.clone(),
-                age,
-                stored_at: now,
-                fresh_until: now + ttl,
-                keep_until: now + ttl + STALE_FOR,
-            }),
-        );
-    }
-}
-
-/// Stores `stored` as image `key`'s copy, or as its `variant`'s when the response varies
-/// by Accept; the other kind of copy becomes unreachable.
-fn put(s: &mut State, key: &str, variant: &str, stored: Arc<Stored>) {
-    if stored.varies() {
-        s.bodies.remove(key);
-        s.varies.insert(key.to_owned(), Varies);
-        s.bodies.insert(variant.to_owned(), stored);
-    } else {
-        s.varies.remove(key);
-        s.bodies.insert(key.to_owned(), stored);
     }
 }
 
@@ -499,23 +391,12 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         &key,
         req.headers.get_all(ACCEPT).iter().map(|v| v.as_bytes()),
     );
-    let now = Instant::now();
-    let stale = match images.look(&key, &variant, now) {
-        Look::Fresh(s) => {
-            images.counters.hits.fetch_add(1, Ordering::Relaxed);
-            ctx.cache = Some("hit");
-            write(session, ctx, &s, true).await?;
-            return Ok(true);
-        }
-        Look::Missing => {
-            images.counters.missing.fetch_add(1, Ordering::Relaxed);
-            ctx.cache = Some("missing");
-            respond_status(session, ctx, 404, None).await?;
-            return Ok(true);
-        }
-        Look::Stale(s) => Some(s),
-        Look::None => None,
-    };
+    if images.is_missing(&key, Instant::now()) {
+        images.counters.missing.fetch_add(1, Ordering::Relaxed);
+        ctx.cache = Some("missing");
+        respond_status(session, ctx, 404, None).await?;
+        return Ok(true);
+    }
 
     let (flight, spec) = {
         let mut flights = lock(&images.flights);
@@ -545,12 +426,10 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
                         .ok_or_else(|| Error::explain(ErrorType::InternalError, "no sites"))?,
                     site: ctx.site,
                     budget: images.budget(site),
-                    req: fetch_request(session.req_header(), stale.as_deref())?,
-                    held: stale.clone(),
+                    req: fetch_request(session.req_header())?,
                     client_path: session.req_header().raw_path().to_vec(),
                     start: ctx.hop.clone(),
                     key: key.clone(),
-                    variant: variant.clone(),
                     flight,
                     log: Mutex::new(Vec::new()),
                 });
@@ -569,46 +448,28 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         return Ok(false);
     };
     if let Fetched::Response(r) = &*fetched
-        && r.varies()
-        && *by != *variant
+        && ((r.varies() && *by != *variant) || (!leader && !r.shared()))
     {
         return Ok(false);
     }
     let counters = &images.counters;
     if leader {
-        counters.misses.fetch_add(1, Ordering::Relaxed);
+        counters.fetched.fetch_add(1, Ordering::Relaxed);
     } else {
         counters.coalesced.fetch_add(1, Ordering::Relaxed);
     }
-    let label = if leader { "miss" } else { "coalesced" };
-    match (&*fetched, stale) {
-        (Fetched::Response(r), Some(s)) if r.status == 429 || r.status >= 500 => {
-            serve_stale(session, ctx, counters, &s).await?;
-        }
-        (Fetched::Shed(_) | Fetched::Failed(..), Some(s)) => {
-            serve_stale(session, ctx, counters, &s).await?;
-        }
-        (Fetched::Response(r), _) => {
+    let label = if leader { "fetched" } else { "coalesced" };
+    match &*fetched {
+        Fetched::Response(r) => {
             ctx.cache = Some(label);
-            write(session, ctx, r, false).await?;
+            write(session, ctx, r).await?;
         }
-        // The upstream just confirmed the copy: it is current even when it arrived with no
-        // freshness left (then it is confirmed again next time).
-        (Fetched::NotModified, stale) => match (images.look(&key, &variant, Instant::now()), stale)
-        {
-            (Look::Fresh(s) | Look::Stale(s), _) | (_, Some(s)) => {
-                counters.revalidated.fetch_add(1, Ordering::Relaxed);
-                ctx.cache = Some("revalidated");
-                write(session, ctx, &s, true).await?;
-            }
-            _ => return Ok(false),
-        },
-        (Fetched::Shed(after), None) => {
+        Fetched::Shed(after) => {
             counters.shed.fetch_add(1, Ordering::Relaxed);
             ctx.cache = Some("shed");
             respond_status(session, ctx, 429, Some(*after)).await?;
         }
-        (Fetched::Failed(etype, msg), None) => {
+        Fetched::Failed(etype, msg) => {
             ctx.cache = Some(label);
             return Err(Error::create(
                 etype.clone(),
@@ -617,20 +478,9 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
                 None,
             ));
         }
-        (Fetched::TooLarge, _) => return Ok(false),
+        Fetched::TooLarge => return Ok(false),
     }
     Ok(true)
-}
-
-async fn serve_stale(
-    session: &mut Session,
-    ctx: &mut Ctx,
-    counters: &Counters,
-    s: &Stored,
-) -> Result<()> {
-    counters.stale.fetch_add(1, Ordering::Relaxed);
-    ctx.cache = Some("stale");
-    write(session, ctx, s, true).await
 }
 
 async fn wait(mut flight: Flight) -> Option<Arc<Fetched>> {
@@ -639,22 +489,13 @@ async fn wait(mut flight: Flight) -> Option<Arc<Fetched>> {
 }
 
 /// The client's request as sent for an image: no conditions of the client's (the
-/// relay answers those from the whole image), uncompressed, and with the stored
-/// image's validators when it is being revalidated.
-fn fetch_request(req: &RequestHeader, stale: Option<&Stored>) -> Result<RequestHeader> {
+/// answer is shared; the relay answers conditions from the whole image), uncompressed.
+fn fetch_request(req: &RequestHeader) -> Result<RequestHeader> {
     let mut up = media::upstream_request(req)?;
     for name in [IF_NONE_MATCH, IF_MODIFIED_SINCE, IF_RANGE] {
         up.remove_header(&name);
     }
     up.insert_header(ACCEPT_ENCODING, "identity")?;
-    if let Some(s) = stale {
-        if let Some(v) = s.header(&ETAG) {
-            up.insert_header(IF_NONE_MATCH, v.clone())?;
-        }
-        if let Some(v) = s.header(&LAST_MODIFIED) {
-            up.insert_header(IF_MODIFIED_SINCE, v.clone())?;
-        }
-    }
     Ok(up)
 }
 
@@ -671,12 +512,8 @@ struct Spec {
     start: Option<Hop>,
     /// The image, for remembered redirects and misses.
     key: String,
-    /// The image as this request's Accept gets it, when its copies are kept per variant.
-    variant: String,
     /// What the fetch is listed under in `flights`.
     flight: String,
-    /// The stored copy whose validators `req` carries.
-    held: Option<Arc<Stored>>,
     log: Mutex<Vec<AttemptLog>>,
 }
 
@@ -743,34 +580,23 @@ async fn admit(budget: &Budget, free: bool) -> std::result::Result<(), Duration>
 }
 
 enum Got {
-    Response(Arc<Stored>),
-    NotModified(Freshness, Duration),
+    Response(Answer),
     TooLarge,
 }
 
-/// Turns an exchange's outcome into what waiting requests get, updating the store.
+/// Turns an exchange's outcome into what waiting requests get, noting what it says
+/// about the image.
 fn conclude(spec: &Spec, got: Result<Got>) -> Fetched {
-    let now = Instant::now();
     match got {
         Ok(Got::Response(r)) => {
             if r.status == 404 {
-                spec.images.remember_missing(&spec.key, now);
-            } else if r.keep_until > now {
-                spec.images.store(&spec.key, &spec.variant, Arc::clone(&r));
+                spec.images.remember_missing(&spec.key, Instant::now());
+            } else if r.status == 200 {
+                // Error pages say nothing about how the image itself is chosen.
+                spec.images.found(&spec.key, r.varies());
             }
             Fetched::Response(r)
         }
-        Ok(Got::NotModified(fresh, age)) => match &spec.held {
-            Some(old) => {
-                spec.images
-                    .refresh(&spec.key, &spec.variant, old, fresh, age, now);
-                Fetched::NotModified
-            }
-            None => Fetched::Failed(
-                ErrorType::InvalidHTTPHeader,
-                "304 to an unconditional request".into(),
-            ),
-        },
         Ok(Got::TooLarge) => Fetched::TooLarge,
         Err(e) => Fetched::Failed(e.etype().clone(), e.to_string()),
     }
@@ -897,13 +723,15 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             continue;
         }
         if status == 304 {
-            let ttl = ttl_of(&resp);
             let idle = peer.options.idle_timeout;
             spec.reach
                 .images
                 .release_http_session(http, &peer, idle)
                 .await;
-            return Ok(Got::NotModified(ttl, upstream_age(&resp)));
+            return Error::e_explain(
+                ErrorType::InvalidHTTPHeader,
+                "304 to an unconditional request",
+            );
         }
         let announced = resp
             .headers
@@ -913,11 +741,8 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
         if announced.is_some_and(|n| n > MAX_IMAGE as u64) {
             return Ok(Got::TooLarge);
         }
-        // Within MAX_IMAGE by the check above; only an image that may be stored is
-        // worth allocating for before it arrives.
-        let presize = announced
-            .filter(|_| status == 200)
-            .and_then(|n| usize::try_from(n).ok());
+        // Within MAX_IMAGE by the check above.
+        let presize = announced.and_then(|n| usize::try_from(n).ok());
         let mut body = BytesMut::with_capacity(presize.unwrap_or(0));
         loop {
             match http.read_response_body().await {
@@ -940,75 +765,11 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             .images
             .release_http_session(http, &peer, idle)
             .await;
-        return Ok(Got::Response(Arc::new(stored(site, &host, resp, body)?)));
+        return Ok(Got::Response(answer(site, &host, resp, body)?));
     }
     Err(last
         .unwrap_or_else(|| Error::explain(ErrorType::InternalError, "no upstream attempt"))
         .into_up())
-}
-
-/// A header field in allocations of its own. Parsed fields can be slices of the
-/// connection's read buffer, which a stored copy would keep alive uncounted.
-fn owned(name: &HeaderName, value: &HeaderValue) -> (HeaderName, HeaderValue) {
-    let name = HeaderName::from_bytes(name.as_str().as_bytes()).unwrap_or_else(|_| name.clone());
-    let value = HeaderValue::from_bytes(value.as_bytes()).unwrap_or_else(|_| value.clone());
-    (name, value)
-}
-
-/// `body` without spare capacity. A stored image keeps its whole allocation, and a
-/// buffer grown by doubling has up to as much again unused, which the store's bound
-/// would not count.
-fn exact(body: BytesMut) -> Bytes {
-    if body.capacity() > body.len() {
-        Bytes::copy_from_slice(&body)
-    } else {
-        body.freeze()
-    }
-}
-
-/// How long a stored copy with `headers` may be served, `age` after it left the upstream.
-fn stored_ttl(headers: &[(HeaderName, HeaderValue)], age: Duration) -> Freshness {
-    let lines = headers
-        .iter()
-        .filter(|(k, _)| *k == CACHE_CONTROL)
-        .map(|(_, v)| v.as_bytes());
-    shared_ttl(lines, age, MAX_TTL)
-}
-
-/// How long `resp` may be served from the store.
-fn ttl_of(resp: &ResponseHeader) -> Freshness {
-    let lines = resp.headers.get_all(CACHE_CONTROL).into_iter();
-    shared_ttl(
-        lines.map(HeaderValue::as_bytes),
-        upstream_age(resp),
-        MAX_TTL,
-    )
-}
-
-/// Largest `Age` taken as given; larger ones, too large to parse included, count as this
-/// (RFC 9111 §1.2.2).
-const MAX_AGE: Duration = Duration::from_secs(1 << 31);
-
-/// The `Age` of `resp` (the first value of a list), at most [`MAX_AGE`]; none, or one that
-/// is not a number of seconds, counts as zero.
-fn upstream_age(resp: &ResponseHeader) -> Duration {
-    let Some(v) = resp.headers.get(AGE) else {
-        return Duration::ZERO;
-    };
-    let first = v
-        .as_bytes()
-        .split(|&b| b == b',')
-        .next()
-        .unwrap_or_default();
-    let digits = first.trim_ascii();
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return Duration::ZERO;
-    }
-    std::str::from_utf8(digits)
-        .ok()
-        .and_then(|d| d.parse().ok())
-        .map_or(MAX_AGE, Duration::from_secs)
-        .min(MAX_AGE)
 }
 
 /// Sends a bodiless request and reads the response header.
@@ -1047,61 +808,29 @@ async fn drain(reach: Arc<Reach>, mut http: HttpSession, peer: HttpPeer) {
     }
 }
 
-/// The upstream's answer as kept and replayed; fresh for as long as it may be cached.
-fn stored(site: &Site, host: &str, mut resp: ResponseHeader, body: BytesMut) -> Result<Stored> {
+/// The upstream's answer as passed on to every waiting request.
+fn answer(site: &Site, host: &str, mut resp: ResponseHeader, body: BytesMut) -> Result<Answer> {
     headers::scrub_response(&mut resp, host, &site.host)?;
-    let now = Instant::now();
-    let ttl = cacheable(&resp, body.len())
-        .then(|| ttl_of(&resp).ttl())
-        .flatten();
-    let kept = ttl.is_some();
     let headers = resp
         .headers
         .iter()
-        .filter(|(k, _)| !NOT_STORED.contains(&k.as_str()))
-        .map(|(k, v)| {
-            if kept {
-                owned(k, v)
-            } else {
-                (k.clone(), v.clone())
-            }
-        })
+        .filter(|(k, _)| !NOT_SHARED.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let body = if kept { exact(body) } else { body.freeze() };
-    Ok(Stored {
+    Ok(Answer {
         status: resp.status.as_u16(),
         headers,
-        body,
-        age: upstream_age(&resp),
-        stored_at: now,
-        fresh_until: now + ttl.unwrap_or_default(),
-        keep_until: now + ttl.map_or(Duration::ZERO, |t| t + STALE_FOR),
+        body: body.freeze(),
     })
 }
 
-/// A whole image, the same for every client.
-fn cacheable(resp: &ResponseHeader, len: usize) -> bool {
-    let h = |name| resp.headers.get(name).map(HeaderValue::as_bytes);
-    let image =
-        h(CONTENT_TYPE).is_some_and(|v| v.len() >= 6 && v[..6].eq_ignore_ascii_case(b"image/"));
-    // Bodies are fetched uncompressed, and copies of an image that varies by Accept are
-    // kept per variant (`put`), so only a Vary on these two is harmless.
-    let vary_ok = resp.headers.get_all(VARY).iter().all(|v| {
-        v.as_bytes().split(|&b| b == b',').all(|t| {
-            let t = t.trim_ascii();
-            t.eq_ignore_ascii_case(b"accept-encoding") || t.eq_ignore_ascii_case(b"accept")
-        })
-    });
-    resp.status.as_u16() == 200 && image && vary_ok && len <= MAX_IMAGE
-}
-
-/// Whether the client already has `s`, by its conditional request.
-fn not_modified(req: &RequestHeader, s: &Stored) -> bool {
-    if s.status != 200 {
+/// Whether the client already has `a`, by its conditional request.
+fn not_modified(req: &RequestHeader, a: &Answer) -> bool {
+    if a.status != 200 {
         return false;
     }
     if let Some(inm) = req.headers.get(IF_NONE_MATCH) {
-        let Some(etag) = s.header(&ETAG) else {
+        let Some(etag) = a.header(&ETAG) else {
             return false;
         };
         let weak = |t: &[u8]| t.strip_prefix(b"W/").unwrap_or(t).to_owned();
@@ -1112,23 +841,19 @@ fn not_modified(req: &RequestHeader, s: &Stored) -> bool {
             .map(<[u8]>::trim_ascii)
             .any(|t| t == b"*" || weak(t) == ours);
     }
-    match (req.headers.get(IF_MODIFIED_SINCE), s.header(&LAST_MODIFIED)) {
+    match (req.headers.get(IF_MODIFIED_SINCE), a.header(&LAST_MODIFIED)) {
         (Some(ims), Some(lm)) => ims.as_bytes().trim_ascii() == lm.as_bytes().trim_ascii(),
         _ => false,
     }
 }
 
-/// Writes `s` to the client; `from_store` adds its age.
-async fn write(session: &mut Session, ctx: &mut Ctx, s: &Stored, from_store: bool) -> Result<()> {
-    let unchanged = not_modified(session.req_header(), s);
-    let status = if unchanged { 304 } else { s.status };
-    let mut resp = ResponseHeader::build(status, Some(s.headers.len() + 3))?;
-    for (k, v) in &s.headers {
+/// Writes `a` to the client, or 304 when its conditional request matches.
+async fn write(session: &mut Session, ctx: &mut Ctx, a: &Answer) -> Result<()> {
+    let unchanged = not_modified(session.req_header(), a);
+    let status = if unchanged { 304 } else { a.status };
+    let mut resp = ResponseHeader::build(status, Some(a.headers.len() + 2))?;
+    for (k, v) in &a.headers {
         resp.append_header(k.clone(), v.clone())?;
-    }
-    // Upstream time first: the response may have waited in a CDN before it came here.
-    if from_store || !s.age.is_zero() {
-        resp.insert_header(AGE, s.age.saturating_add(s.stored_at.elapsed()).as_secs())?;
     }
     ctx.ttfb = ctx.start.map(|t| t.elapsed());
     if unchanged {
@@ -1138,13 +863,13 @@ async fn write(session: &mut Session, ctx: &mut Ctx, s: &Stored, from_store: boo
             .await
             .map_err(|e| e.into_down());
     }
-    resp.insert_header(CONTENT_LENGTH, s.body.len())?;
+    resp.insert_header(CONTENT_LENGTH, a.body.len())?;
     session
         .write_response_header(Box::new(resp), false)
         .await
         .map_err(|e| e.into_down())?;
     session
-        .write_response_body(Some(s.body.clone()), true)
+        .write_response_body(Some(a.body.clone()), true)
         .await
         .map_err(|e| e.into_down())
 }
@@ -1173,9 +898,8 @@ async fn respond_status(
 mod tests {
     use super::*;
 
-    fn stored(headers: &[(&str, &str)]) -> Stored {
-        let now = Instant::now();
-        Stored {
+    fn answer(headers: &[(&str, &str)]) -> Answer {
+        Answer {
             status: 200,
             headers: headers
                 .iter()
@@ -1187,10 +911,6 @@ mod tests {
                 })
                 .collect(),
             body: Bytes::new(),
-            age: Duration::ZERO,
-            stored_at: now,
-            fresh_until: now,
-            keep_until: now,
         }
     }
 
@@ -1205,28 +925,28 @@ mod tests {
     #[test]
     fn conditional_requests() {
         let lm = "Sun, 23 Nov 2025 02:39:49 GMT";
-        let s = stored(&[("etag", "\"a\""), ("last-modified", lm)]);
-        assert!(not_modified(&req(&[("if-none-match", "\"a\"")]), &s));
+        let a = answer(&[("etag", "\"a\""), ("last-modified", lm)]);
+        assert!(not_modified(&req(&[("if-none-match", "\"a\"")]), &a));
         assert!(not_modified(
             &req(&[("if-none-match", "\"b\", W/\"a\"")]),
-            &s
+            &a
         ));
-        assert!(not_modified(&req(&[("if-none-match", "*")]), &s));
-        assert!(!not_modified(&req(&[("if-none-match", "\"b\"")]), &s));
+        assert!(not_modified(&req(&[("if-none-match", "*")]), &a));
+        assert!(!not_modified(&req(&[("if-none-match", "\"b\"")]), &a));
         // If-None-Match takes precedence over a matching date.
         assert!(!not_modified(
             &req(&[("if-none-match", "\"b\""), ("if-modified-since", lm)]),
-            &s
+            &a
         ));
-        assert!(not_modified(&req(&[("if-modified-since", lm)]), &s));
+        assert!(not_modified(&req(&[("if-modified-since", lm)]), &a));
         assert!(!not_modified(
             &req(&[("if-modified-since", "Mon, 24 Nov 2025 00:00:00 GMT")]),
-            &s
+            &a
         ));
-        assert!(!not_modified(&req(&[]), &s));
+        assert!(!not_modified(&req(&[]), &a));
         assert!(!not_modified(
             &req(&[("if-none-match", "\"a\"")]),
-            &stored(&[])
+            &answer(&[])
         ));
     }
 
@@ -1239,67 +959,19 @@ mod tests {
     }
 
     #[test]
-    fn what_is_cacheable() {
-        let jpeg = [("content-type", "image/jpeg")];
-        assert!(cacheable(&resp(200, &jpeg), 10));
-        assert!(cacheable(
-            &resp(
-                200,
-                &[("content-type", "IMAGE/webp"), ("vary", "Accept-Encoding")]
-            ),
-            10
-        ));
-        assert!(!cacheable(&resp(200, &[("content-type", "text/html")]), 10));
-        assert!(!cacheable(&resp(206, &jpeg), 10));
-        assert!(!cacheable(
-            &resp(200, &[("content-type", "image/jpeg"), ("vary", "Cookie")]),
-            10
-        ));
-        // Copies are kept per Accept, so an image chosen by Accept is stored, on one line
-        // or two.
-        assert!(cacheable(
-            &resp(
-                200,
-                &[
-                    ("content-type", "image/jpeg"),
-                    ("vary", "Accept-Encoding"),
-                    ("vary", "accept")
-                ]
-            ),
-            10
-        ));
-        assert!(!cacheable(
-            &resp(
-                200,
-                &[
-                    ("content-type", "image/jpeg"),
-                    ("vary", "Accept, User-Agent")
-                ]
-            ),
-            10
-        ));
-        // A gateway's session cookie does not make the image personal; it is never
-        // replayed (NOT_STORED).
-        assert!(cacheable(
-            &resp(
-                200,
-                &[("content-type", "image/jpeg"), ("set-cookie", "a=b")]
-            ),
-            10
-        ));
-        assert!(!cacheable(&resp(200, &jpeg), MAX_IMAGE + 1));
-    }
-
-    #[test]
-    fn upstream_age_is_bounded() {
-        let a = |v: &str| upstream_age(&resp(200, &[("age", v)])).as_secs();
-        assert_eq!(a("120"), 120);
-        assert_eq!(a(" 7 , 9"), 7);
-        assert_eq!(a("99999999999999999999"), 1 << 31);
-        assert_eq!(a("18446744073709551615"), 1 << 31);
-        assert_eq!(a("-3"), 0);
-        assert_eq!(a("1e3"), 0);
-        assert_eq!(upstream_age(&resp(200, &[])), Duration::ZERO);
+    fn only_answers_alike_for_every_client_are_shared() {
+        let with = |status: u16, h: &[(&str, &str)]| Answer {
+            status,
+            ..answer(h)
+        };
+        assert!(with(200, &[]).shared());
+        assert!(with(200, &[("vary", "Accept-Encoding"), ("vary", "accept")]).shared());
+        assert!(with(404, &[]).shared());
+        assert!(with(429, &[]).shared());
+        assert!(!with(200, &[("vary", "Accept, Cookie")]).shared());
+        assert!(!with(200, &[("vary", "*")]).shared());
+        assert!(!with(401, &[]).shared());
+        assert!(!with(403, &[]).shared());
     }
 
     #[test]
@@ -1314,26 +986,9 @@ mod tests {
         );
     }
 
-    fn image(len: usize) -> Arc<Stored> {
-        Arc::new(Stored {
-            body: Bytes::from(vec![0; len]),
-            ..stored(&[("etag", "\"a\"")])
-        })
-    }
-
     #[test]
-    fn the_store_is_bounded_by_what_it_holds() {
-        let images = Images::new(10_000);
-        images.store("a", "a", image(4_000));
-        images.store("b", "b", image(4_000));
-        // Body, header name and value, fixed overheads per field and per image, the key.
-        let one = (4_000 + (4 + 3 + 32) + 128 + 1 + piano_cache::ENTRY) as u64;
-        assert_eq!(images.stats().bytes, 2 * one);
-        images.store("c", "c", image(4_000));
-        assert_eq!(images.stats().images, 2, "the oldest made room");
-        images.set_capacity(5_000);
-        assert_eq!(images.stats().images, 1);
-
+    fn memories_are_bounded() {
+        let images = Images::new();
         let now = Instant::now();
         for i in 0..40_000 {
             let k = format!("{i:05}");
@@ -1356,115 +1011,24 @@ mod tests {
     }
 
     #[test]
-    fn copies_that_vary_by_accept_are_kept_apart_and_a_miss_ends_them_all() {
-        let images = Images::new(1 << 20);
+    fn what_the_upstream_says_decides_per_variant_fetches() {
+        let images = Images::new();
         let now = Instant::now();
-        let day = Duration::from_secs(86_400);
-        let image = |vary: &str, len| {
-            Arc::new(Stored {
-                body: Bytes::from(vec![0; len]),
-                fresh_until: now + day,
-                keep_until: now + day,
-                ..stored(&[("vary", vary)])
-            })
-        };
-        // One copy serves every Accept unless the response varies by it.
-        images.store("a", "a w", image("Accept-Encoding", 10));
-        assert!(matches!(images.look("a", "a j", now), Look::Fresh(_)));
-        images.store("a", "a w", image("Accept-Encoding, Accept", 10));
-        assert!(matches!(images.look("a", "a w", now), Look::Fresh(_)));
-        assert!(matches!(images.look("a", "a j", now), Look::None));
-        images.store("a", "a j", image("accept", 20));
-        assert!(matches!(images.look("a", "a j", now), Look::Fresh(s) if s.body.len() == 20));
-        assert!(matches!(images.look("a", "a w", now), Look::Fresh(s) if s.body.len() == 10));
-        // A miss ends every variant, also once it is forgotten.
+        assert!(!images.varies("a"));
+        images.found("a", true);
+        assert!(images.varies("a"));
+        images.found("a", false);
+        assert!(!images.varies("a"));
+        // A miss ends per-variant fetching, also once it is forgotten.
+        images.found("a", true);
         images.remember_missing("a", now);
-        assert!(matches!(images.look("a", "a w", now), Look::Missing));
+        assert!(images.is_missing("a", now));
+        assert!(!images.varies("a"));
         let later = now + MISSING_TTL + Duration::from_secs(1);
-        assert!(matches!(images.look("a", "a w", later), Look::None));
-        assert!(matches!(images.look("a", "a j", later), Look::None));
-        // A response that no longer varies replaces them all.
-        images.store("a", "a w", image("Accept", 10));
-        images.store("a", "a j", image("Accept-Encoding", 30));
-        assert!(matches!(images.look("a", "a w", now), Look::Fresh(s) if s.body.len() == 30));
-    }
-
-    #[test]
-    fn a_refreshed_image_is_fresh_then_stale_then_gone() {
-        let images = Images::new(1 << 20);
-        let t = Instant::now();
-        let old = image(10);
-        images.refresh(
-            "a",
-            "a",
-            &old,
-            Freshness::For(Duration::from_secs(60)),
-            Duration::ZERO,
-            t,
-        );
-        let at = |d: u64| images.look("a", "a", t + Duration::from_secs(d));
-        assert!(matches!(at(59), Look::Fresh(_)));
-        assert!(matches!(at(61), Look::Stale(_)));
-        assert!(matches!(at(60 + STALE_FOR.as_secs() - 1), Look::Stale(_)));
-        assert!(matches!(at(60 + STALE_FOR.as_secs() + 1), Look::None));
-        assert!(
-            matches!(at(0), Look::None),
-            "gone once past its stale window"
-        );
-    }
-
-    #[test]
-    fn a_confirmation_keeps_or_ends_the_lifetime() {
-        let images = Images::new(1 << 20);
-        let base = stored(&[]);
-        let start = base.stored_at;
-        let old = Stored {
-            fresh_until: start + Duration::from_secs(30),
-            ..base
-        };
-        let at = |d: u64| start + Duration::from_secs(d);
-        images.refresh("a", "a", &old, Freshness::Unstated, Duration::ZERO, at(100));
-        assert!(
-            matches!(images.look("a", "a", at(129)), Look::Fresh(_)),
-            "its previous lifetime again"
-        );
-        assert!(matches!(images.look("a", "a", at(131)), Look::Stale(_)));
-        images.refresh("a", "a", &old, Freshness::Never, Duration::ZERO, at(100));
-        assert!(
-            matches!(images.look("a", "a", at(100)), Look::None),
-            "a confirmation that forbids storing"
-        );
-    }
-
-    #[test]
-    fn every_cache_control_line_counts() {
-        let two = |second| {
-            resp(
-                200,
-                &[("cache-control", "max-age=60"), ("cache-control", second)],
-            )
-        };
-        assert_eq!(ttl_of(&two("private")), Freshness::Never);
-        assert_eq!(
-            ttl_of(&two("s-maxage=600")),
-            Freshness::For(Duration::from_secs(600))
-        );
-        assert_eq!(ttl_of(&resp(200, &[])), Freshness::Unstated);
-    }
-
-    #[test]
-    fn stored_bodies_hold_no_spare_capacity() {
-        let capacity = |b: Bytes| b.try_into_mut().map(|m| m.capacity());
-        // Grown chunk by chunk, as a body without Content-Length: 320 KiB in 512 KiB.
-        let mut grown = BytesMut::new();
-        for _ in 0..20 {
-            grown.extend_from_slice(&[7; 16_384]);
-        }
-        assert!(grown.capacity() > grown.len());
-        assert_eq!(capacity(exact(grown)), Ok(20 * 16_384));
-        // Allocated for the announced length.
-        let mut sized = BytesMut::with_capacity(1000);
-        sized.extend_from_slice(&[7; 1000]);
-        assert_eq!(capacity(exact(sized)), Ok(1000));
+        assert!(!images.is_missing("a", later));
+        // An answer other than 404 ends a remembered miss.
+        images.remember_missing("b", now);
+        images.found("b", false);
+        assert!(!images.is_missing("b", now));
     }
 }

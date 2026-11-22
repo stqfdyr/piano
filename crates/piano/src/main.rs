@@ -107,7 +107,7 @@ enum Command {
         #[command(subcommand)]
         command: LogCommand,
     },
-    /// Image cache commands.
+    /// What the image engine remembers and each upstream's request budget.
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
@@ -163,9 +163,9 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum CacheCommand {
-    /// How image requests were answered, memory in use and each upstream's budget.
+    /// How image requests were answered, what is remembered and each upstream's budget.
     Stats,
-    /// Forget stored images, remembered redirects and remembered misses.
+    /// Forget remembered redirects and remembered misses.
     Purge,
 }
 
@@ -680,8 +680,8 @@ fn cache_purge(cli: &Cli) -> ExitCode {
         print_json(&reply);
     } else {
         println!(
-            "purged {} images, {} remembered misses, {} remembered redirects",
-            reply.images, reply.missing, reply.redirects
+            "purged {} remembered misses, {} remembered redirects",
+            reply.missing, reply.redirects
         );
     }
     ExitCode::SUCCESS

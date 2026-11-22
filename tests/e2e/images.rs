@@ -1,5 +1,5 @@
-//! Images: stored bodies, remembered redirects and misses, shared fetches, stale
-//! copies, and the upstream request budget.
+//! Images: remembered redirects and misses, shared fetches, and the upstream request
+//! budget. Bodies are not kept.
 
 use piano_ctl::proto::{CacheStats, PurgeReply};
 use piano_e2e::client::{Proto, client};
@@ -67,53 +67,28 @@ impl World {
 }
 
 #[tokio::test]
-async fn images_are_answered_from_memory() {
+async fn every_image_request_reaches_the_upstream() {
     let w = world().await;
-    let a = w
-        .get("/emby/Items/a1/Images/Primary?tag=1&api_key=one")
-        .await;
-    assert_eq!((a.status, a.body.as_str()), (200, "image a1"));
-    assert_eq!(a.headers["content-type"], "image/jpeg");
-    // Credentials do not split the cache.
-    let b = w
-        .get("/emby/Items/a1/Images/Primary?api_key=two&tag=1")
-        .await;
-    assert_eq!((b.status, b.body.as_str()), (200, "image a1"));
-    assert!(b.headers.contains_key("age"));
-    assert_eq!(b.headers["etag"], "\"a1\"");
-    assert!(b.headers.contains_key("strict-transport-security"));
-    // Another tag is another image.
-    w.get("/emby/Items/a1/Images/Primary?tag=2").await;
+    for key in ["one", "two"] {
+        let got = w
+            .get(&format!(
+                "/emby/Items/a1/Images/Primary?tag=1&api_key={key}&cookie=1"
+            ))
+            .await;
+        assert_eq!((got.status, got.body.as_str()), (200, "image a1"));
+        assert_eq!(got.headers["content-type"], "image/jpeg");
+        assert_eq!(got.headers["etag"], "\"a1\"");
+        assert!(got.headers.contains_key("strict-transport-security"));
+        // An answer may be shared by other clients: the gateway's session cookie stays out.
+        assert!(!got.headers.contains_key("set-cookie"), "{:?}", got.headers);
+        assert!(!got.headers.contains_key("age"), "{:?}", got.headers);
+    }
     assert_eq!(w.origin.hits("/emby/Items/a1/Images/Primary"), 2);
-    assert_eq!(w.cache_fields(3), ["miss", "hit", "miss"]);
+    assert_eq!(w.cache_fields(2), ["fetched", "fetched"]);
 }
 
 #[tokio::test]
-async fn images_with_a_session_cookie_are_stored_without_it() {
-    let w = world().await;
-    for _ in 0..2 {
-        let got = w.get("/emby/Items/k1/Images/Primary?tag=1&cookie=1").await;
-        assert_eq!((got.status, got.body.as_str()), (200, "image k1"));
-        assert!(!got.headers.contains_key("set-cookie"), "{:?}", got.headers);
-    }
-    assert_eq!(w.origin.hits("/emby/Items/k1/Images/Primary"), 1);
-    // The 304 that confirms an expired copy sets a cookie too; it is not kept either.
-    w.get("/Items/k2/Images/Primary?ttl=1&cookie=1").await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    for _ in 0..2 {
-        let got = w.get("/Items/k2/Images/Primary?ttl=1&cookie=1").await;
-        assert_eq!((got.status, got.body.as_str()), (200, "image k2"));
-        assert!(!got.headers.contains_key("set-cookie"), "{:?}", got.headers);
-    }
-    assert_eq!(w.origin.hits("/Items/k2/Images/Primary"), 2);
-    assert_eq!(
-        w.cache_fields(5),
-        ["miss", "hit", "miss", "revalidated", "hit"]
-    );
-}
-
-#[tokio::test]
-async fn images_chosen_by_accept_are_kept_per_accept() {
+async fn images_chosen_by_accept_are_fetched_per_accept() {
     let w = world().await;
     let path = "/emby/Items/v1/Images/Primary?tag=1&negotiate=1&delay_ms=300";
     let webp = [("accept", "image/avif,image/webp,image/*,*/*;q=0.8")];
@@ -123,13 +98,20 @@ async fn images_chosen_by_accept_are_kept_per_accept() {
     assert_eq!((a.status, a.body.as_str()), (200, "webp v1"));
     assert_eq!(a.headers["content-type"], "image/webp");
     assert_eq!((b.status, b.body.as_str()), (200, "image v1"));
-    // Then each is answered from its own copy.
-    for _ in 0..3 {
-        assert_eq!(w.get_with(path, &webp).await.body, "webp v1");
-        assert_eq!(w.get_with(path, &jpeg).await.body, "image v1");
-    }
-    assert_eq!(w.origin.hits("/emby/Items/v1/Images/Primary"), 3);
-    assert_eq!(w.cache_fields(8)[4..], ["hit"; 4]);
+    // Once known to vary, requests with the same Accept share a fetch and others do not.
+    let (a, b, c) = tokio::join!(
+        w.get_with(path, &webp),
+        w.get_with(path, &webp),
+        w.get_with(path, &jpeg)
+    );
+    assert_eq!(
+        (a.body.as_str(), b.body.as_str(), c.body.as_str()),
+        ("webp v1", "webp v1", "image v1")
+    );
+    // With the first two: the one handed to the plain proxy (no field) and its fetch.
+    let mut fields = w.cache_fields(5);
+    fields.sort();
+    assert_eq!(fields, ["-", "coalesced", "fetched", "fetched", "fetched"]);
 }
 
 #[tokio::test]
@@ -141,14 +123,25 @@ async fn images_that_do_not_vary_by_accept_are_shared() {
         w.get_with(path, &[("accept", "image/*")])
     );
     assert_eq!((a.body.as_str(), b.body.as_str()), ("image v2", "image v2"));
-    w.get_with(path, &[("accept", "*/*")]).await;
     assert_eq!(w.origin.hits("/emby/Items/v2/Images/Primary"), 1);
+}
+
+#[tokio::test]
+async fn a_refusal_is_not_shared() {
+    let w = world().await;
+    let path = "/Items/d1/Images/Primary?codes=403&delay_ms=300";
+    let (a, b) = tokio::join!(w.get(path), w.get(path));
+    assert_eq!((a.status, b.status), (403, 403));
+    // The one that waited asked again on its own.
+    assert_eq!(w.origin.hits("/Items/d1/Images/Primary"), 2);
+    let mut fields = w.cache_fields(2);
+    fields.sort();
+    assert_eq!(fields, ["-", "fetched"]);
 }
 
 #[tokio::test]
 async fn a_client_holding_the_image_gets_304() {
     let w = world().await;
-    w.get("/Items/c1/Images/Primary").await;
     let again = w
         .get_with("/Items/c1/Images/Primary", &[("if-none-match", "\"c1\"")])
         .await;
@@ -159,8 +152,8 @@ async fn a_client_holding_the_image_gets_304() {
 
 #[tokio::test]
 async fn permanent_redirects_are_remembered() {
-    // Without stored bodies, every request goes upstream; only the first asks where.
-    let w = world_with("[cache]\nimage_memory_mib = 0\n", false).await;
+    // Every request goes upstream; only the first asks where.
+    let w = world().await;
     for _ in 0..3 {
         let got = w.get("/Items/r1/Images/Primary?moved=1").await;
         assert_eq!((got.status, got.body.as_str()), (200, "image r1"));
@@ -174,7 +167,7 @@ async fn permanent_redirects_are_remembered() {
 
 #[tokio::test]
 async fn redirects_chosen_by_accept_are_not_remembered() {
-    let w = world_with("[cache]\nimage_memory_mib = 0\n", false).await;
+    let w = world().await;
     for _ in 0..2 {
         let got = w.get("/Items/r2/Images/Primary?moved=1&negotiate=1").await;
         assert_eq!((got.status, got.body.as_str()), (200, "image r2"));
@@ -189,7 +182,7 @@ async fn missing_images_are_remembered() {
         assert_eq!(w.get("/Items/n1/Images/Logo?codes=404").await.status, 404);
     }
     assert_eq!(w.origin.hits("/Items/n1/Images/Logo"), 1);
-    assert_eq!(w.cache_fields(3), ["miss", "missing", "missing"]);
+    assert_eq!(w.cache_fields(3), ["fetched", "missing", "missing"]);
 }
 
 #[tokio::test]
@@ -206,7 +199,7 @@ async fn concurrent_requests_share_one_fetch() {
         fields,
         ["coalesced"; 5]
             .iter()
-            .chain(&["miss"])
+            .chain(&["fetched"])
             .copied()
             .collect::<Vec<_>>()
     );
@@ -233,47 +226,6 @@ async fn join_all<F: Future>(fs: impl IntoIterator<Item = F>) -> Vec<F::Output> 
 }
 
 #[tokio::test]
-async fn expired_images_are_revalidated_or_stand_in_for_failures() {
-    let w = world().await;
-    // Confirmed by the upstream with 304.
-    w.get("/Items/v1/Images/Primary?ttl=1").await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let got = w.get("/Items/v1/Images/Primary?ttl=1").await;
-    assert_eq!((got.status, got.body.as_str()), (200, "image v1"));
-    // The upstream fails: the expired copy is served.
-    w.get("/Items/f1/Images/Primary?ttl=1&codes=200,503").await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let got = w.get("/Items/f1/Images/Primary?ttl=1&codes=200,503").await;
-    assert_eq!((got.status, got.body.as_str()), (200, "image f1"));
-    assert_eq!(w.origin.hits("/Items/v1/Images/Primary"), 2);
-    assert_eq!(w.origin.hits("/Items/f1/Images/Primary"), 2);
-    assert_eq!(w.cache_fields(4), ["miss", "revalidated", "miss", "stale"]);
-}
-
-#[tokio::test]
-async fn time_spent_in_upstream_caches_counts() {
-    let w = world().await;
-    // A 2 s lifetime of which a CDN already used 1 s.
-    let first = w.get("/Items/g1/Images/Primary?ttl=2&age=1").await;
-    assert_eq!(first.headers["age"], "1");
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let again = w.get("/Items/g1/Images/Primary?ttl=2&age=1").await;
-    assert_eq!((again.status, again.body.as_str()), (200, "image g1"));
-    assert_eq!(again.headers["age"], "1");
-    assert_eq!(w.origin.hits("/Items/g1/Images/Primary"), 2);
-    assert_eq!(w.cache_fields(2), ["miss", "revalidated"]);
-    // Older than its lifetime on arrival: kept, and confirmed before every use.
-    w.get("/Items/g2/Images/Primary?ttl=60&age=90").await;
-    let again = w.get("/Items/g2/Images/Primary?ttl=60&age=90").await;
-    assert_eq!((again.status, again.body.as_str()), (200, "image g2"));
-    assert_eq!(w.origin.hits("/Items/g2/Images/Primary"), 2);
-    assert_eq!(
-        w.cache_fields(4),
-        ["miss", "revalidated", "miss", "revalidated"]
-    );
-}
-
-#[tokio::test]
 async fn an_upstream_429_pauses_image_requests_only() {
     let w = world().await;
     let limited = w.get("/Items/l1/Images/Primary?codes=429&retry=30").await;
@@ -292,7 +244,7 @@ async fn an_upstream_429_pauses_image_requests_only() {
     assert_eq!(w.origin.hits("/Items/l2/Images/Primary"), 0);
     // Browsing still reaches the upstream.
     assert_eq!(w.get("/__info").await.status, 200);
-    assert_eq!(w.cache_fields(3), ["miss", "shed", "-"]);
+    assert_eq!(w.cache_fields(3), ["fetched", "shed", "-"]);
 }
 
 #[tokio::test]
@@ -331,7 +283,7 @@ async fn images_queue_for_the_upstream_limit() {
 }
 
 #[tokio::test]
-async fn cache_stats_and_purge() {
+async fn stats_and_purge() {
     let w = world_with("", true).await;
     w.get("/Items/k1/Images/Primary?moved=1").await;
     w.get("/Items/k1/Images/Primary?moved=1").await;
@@ -344,45 +296,14 @@ async fn cache_stats_and_purge() {
         })
     };
     let s: CacheStats = serde_json::from_value(ask("cache").await.unwrap()).unwrap();
-    assert_eq!((s.images, s.missing, s.redirects), (1, 1, 1));
-    assert_eq!((s.hits, s.misses), (1, 2));
-    assert!(s.bytes > 0);
+    assert_eq!((s.missing, s.redirects), (1, 1));
+    assert_eq!((s.fetched, s.missing_hits, s.redirect_hits), (3, 0, 1));
     assert_eq!(s.upstreams.len(), 1);
     assert_eq!(s.upstreams[0].burst, None);
     let p: PurgeReply = serde_json::from_value(ask("cache purge").await.unwrap()).unwrap();
-    assert_eq!((p.images, p.missing, p.redirects), (1, 1, 1));
+    assert_eq!((p.missing, p.redirects), (1, 1));
     let s: CacheStats = serde_json::from_value(ask("cache").await.unwrap()).unwrap();
-    assert_eq!((s.images, s.missing, s.redirects, s.bytes), (0, 0, 0, 0));
-}
-
-#[tokio::test]
-async fn an_image_purged_while_revalidated_is_stored_again() {
-    let w = world_with("", true).await;
-    let path = "/Items/e1/Images/Primary?ttl=1&delay_ms=1000";
-    w.get(path).await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    // The stored copy goes while the upstream is asked to confirm it; a request that
-    // arrives then has no copy of its own and waits for the same confirmation.
-    let late = async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let socket = w.relay.control_socket();
-        tokio::task::spawn_blocking(move || {
-            piano_ctl::call(&socket, "cache purge", Duration::from_secs(10)).unwrap()
-        })
-        .await
-        .unwrap();
-        w.get(path).await
-    };
-    let (first, late) = tokio::join!(w.get(path), late);
-    assert_eq!((first.status, first.body.as_str()), (200, "image e1"));
-    assert_eq!((late.status, late.body.as_str()), (200, "image e1"));
-    assert_eq!(w.origin.hits("/Items/e1/Images/Primary"), 2);
-    // The confirmed copy is stored again.
-    assert_eq!(w.get(path).await.status, 200);
-    assert_eq!(
-        w.cache_fields(4),
-        ["miss", "revalidated", "revalidated", "hit"]
-    );
+    assert_eq!((s.missing, s.redirects), (0, 0));
 }
 
 #[tokio::test]
@@ -393,30 +314,12 @@ async fn partial_requests_go_to_the_plain_proxy() {
         .await;
     assert_eq!(got.status, 200);
     w.get("/Items/g1/Images/Primary").await;
-    assert_eq!(w.cache_fields(2), ["-", "miss"]);
-}
-
-#[tokio::test]
-async fn an_expired_image_stands_in_only_for_failures() {
-    let w = world().await;
-    for path in [
-        "/Items/h1/Images/Primary?ttl=1&codes=200,404",
-        "/Items/h2/Images/Primary?ttl=1&codes=200,429",
-    ] {
-        w.get(path).await;
-    }
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    // The upstream's answer stands unless it is a failure.
-    let gone = w.get("/Items/h1/Images/Primary?ttl=1&codes=200,404").await;
-    assert_eq!(gone.status, 404);
-    let limited = w.get("/Items/h2/Images/Primary?ttl=1&codes=200,429").await;
-    assert_eq!((limited.status, limited.body.as_str()), (200, "image h2"));
-    assert_eq!(w.cache_fields(4), ["miss", "miss", "miss", "stale"]);
+    assert_eq!(w.cache_fields(2), ["-", "fetched"]);
 }
 
 #[tokio::test]
 async fn a_remembered_target_that_is_gone_is_asked_for_again() {
-    let w = world_with("[cache]\nimage_memory_mib = 0\n", false).await;
+    let w = world().await;
     let query = "moved=1&codes=200,200,404,200";
     // Requests for the target itself are relayed as they are and count with it.
     assert_eq!(w.get(&format!("/img/t1?{query}")).await.status, 200);
@@ -431,7 +334,7 @@ async fn a_remembered_target_that_is_gone_is_asked_for_again() {
 
 #[tokio::test]
 async fn temporary_redirects_are_not_remembered() {
-    let w = world_with("[cache]\nimage_memory_mib = 0\n", false).await;
+    let w = world().await;
     for _ in 0..2 {
         let got = w.get("/Items/r2/Images/Primary?moved=302").await;
         assert_eq!((got.status, got.body.as_str()), (200, "image r2"));
@@ -440,11 +343,11 @@ async fn temporary_redirects_are_not_remembered() {
 }
 
 #[tokio::test]
-async fn images_of_many_chunks_are_stored() {
+async fn images_of_many_chunks_are_relayed_whole() {
     let w = world().await;
     for _ in 0..2 {
         let got = w.get("/Items/b1/Images/Primary?size=1000000").await;
         assert_eq!((got.status, got.body.len()), (200, 1_000_000));
     }
-    assert_eq!(w.cache_fields(2), ["miss", "hit"]);
+    assert_eq!(w.cache_fields(2), ["fetched", "fetched"]);
 }

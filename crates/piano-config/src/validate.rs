@@ -875,15 +875,11 @@ max_connections = 0
     }
 
     #[test]
-    fn cache_and_upstream_limit() {
+    fn upstream_limit() {
         let c = parse(MINIMAL).unwrap();
-        assert_eq!(c.cache.image_memory_mib, 128);
         assert_eq!(c.sites[0].upstream_limit, None);
-        let ok = format!(
-            "{MINIMAL}upstream_limit = {{ burst = 200, per_sec = 2.5 }}\n[cache]\nimage_memory_mib = 0\n"
-        );
+        let ok = format!("{MINIMAL}upstream_limit = {{ burst = 200, per_sec = 2.5 }}\n");
         let c = parse(&ok).unwrap();
-        assert_eq!(c.cache.image_memory_mib, 0);
         let l = c.sites[0].upstream_limit.unwrap();
         assert_eq!((l.burst, l.per_sec), (200.0, 2.5));
         let shown = c.effective_toml().unwrap();
