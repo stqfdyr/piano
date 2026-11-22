@@ -40,6 +40,88 @@ const CREDENTIAL_HEADERS: [&str; 3] = [
     "x-mediabrowser-token",
 ];
 
+/// A new connection at least this slow gets a replacement when a media request drops
+/// one mid-way. A file host far from the relay takes about 290 ms to connect, one at
+/// the same CDN as the relay 7–14 ms.
+const SPARE_COST: Duration = Duration::from_millis(100);
+
+/// Replacements being set up at once, and hosts remembered. Each replaces a connection
+/// just closed, and one that finds an idle connection in the pool sets up none, so the
+/// connections to a host do not grow.
+const MAX_SPARING: usize = 8;
+const MAX_HOSTS: usize = 64;
+
+#[derive(Debug, Default)]
+struct SpareState {
+    /// By host and port: how long the last new connection took to set up.
+    hosts: std::collections::HashMap<String, Duration>,
+    in_flight: usize,
+}
+
+/// Replaces media connections that are slow to set up when a request drops one: a
+/// player that seeks closes the request it no longer wants, and an HTTP/1.1 connection
+/// cannot be reused in the middle of a body.
+#[derive(Debug, Default)]
+pub(crate) struct Spares {
+    state: std::sync::Mutex<SpareState>,
+}
+
+impl Spares {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SpareState> {
+        // Plain data; a panic elsewhere cannot leave it inconsistent.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Notes what setting up a new connection to `host` took.
+    pub fn note(&self, host: &str, took: Duration) {
+        let mut s = self.lock();
+        if s.hosts.len() >= MAX_HOSTS && !s.hosts.contains_key(host) {
+            s.hosts.clear();
+        }
+        s.hosts.insert(host.to_owned(), took);
+    }
+
+    /// Whether to set up a replacement for a connection to `host` dropped now; counts
+    /// it as started.
+    fn claim(&self, host: &str) -> bool {
+        let mut s = self.lock();
+        let slow = s.hosts.get(host).is_some_and(|c| *c >= SPARE_COST);
+        if !slow || s.in_flight >= MAX_SPARING {
+            return false;
+        }
+        s.in_flight += 1;
+        true
+    }
+
+    fn done(&self) {
+        let mut s = self.lock();
+        s.in_flight = s.in_flight.saturating_sub(1);
+    }
+}
+
+impl Reach {
+    /// A media request dropped its connection to `peer` (at `host`) mid-way: when that host is
+    /// slow to connect to, sets up another in the background and leaves it in the pool,
+    /// unless the pool has one already.
+    pub fn replace(self: &Arc<Self>, host: &str, peer: HttpPeer) {
+        if !self.spares.claim(host) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.spares.done();
+            return;
+        };
+        let reach = Arc::clone(self);
+        rt.spawn(async move {
+            if let Ok((http, _)) = reach.media.get_http_session(&peer).await {
+                let idle = peer.options.idle_timeout;
+                reach.media.release_http_session(http, &peer, idle).await;
+            }
+            reach.spares.done();
+        });
+    }
+}
+
 /// A redirect being followed, or a mounted host.
 #[derive(Debug, Clone)]
 pub(crate) struct Hop {
@@ -105,6 +187,8 @@ pub(crate) struct Reach {
     pub images: HttpConnector,
     /// Where media requests' redirects led.
     pub redirects: crate::memo::Redirects,
+    /// What a new media connection costs per host, for replacing dropped ones.
+    pub spares: Spares,
 }
 
 impl std::fmt::Debug for Reach {
@@ -123,6 +207,7 @@ impl Reach {
             media: Connector::new(Some(client.clone())),
             images: HttpConnector::new(Some(client)),
             redirects: crate::memo::Redirects::default(),
+            spares: Spares::default(),
         }
     }
 

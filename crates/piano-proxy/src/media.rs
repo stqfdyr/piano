@@ -726,11 +726,43 @@ fn abandoned() -> Box<Error> {
     Error::explain(ErrorType::InternalError, "media stream ended")
 }
 
+/// The connection a media request is using, replaced in the background if the request
+/// is dropped before it is done with it.
+struct Held {
+    reach: Arc<Reach>,
+    conn: Option<(String, HttpPeer)>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some((host, peer)) = self.conn.take() {
+            self.reach.replace(&host, peer);
+        }
+    }
+}
+
 async fn request(
     spec: &Spec,
     id: u32,
     range: Option<HeaderValue>,
     tx: &mpsc::Sender<(u32, Msg)>,
+) -> Result<()> {
+    let mut held = Held {
+        reach: Arc::clone(&spec.reach),
+        conn: None,
+    };
+    let done = attempts(spec, id, range, tx, &mut held).await;
+    // Ended on its own: the connection went back to the pool or broke.
+    held.conn = None;
+    done
+}
+
+async fn attempts(
+    spec: &Spec,
+    id: u32,
+    range: Option<HeaderValue>,
+    tx: &mpsc::Sender<(u32, Msg)>,
+    held: &mut Held,
 ) -> Result<()> {
     let site = spec.site()?;
     let remembered = spec
@@ -767,6 +799,7 @@ async fn request(
         if origin {
             spec.budget.charge(Instant::now());
         }
+        let asked = Instant::now();
         let (mut http, reused) = match spec.reach.media.get_http_session(&peer).await {
             Ok(c) => c,
             Err(e) => {
@@ -790,6 +823,11 @@ async fn request(
             }
         };
         spec.note(entry, |a| a.connected(reused));
+        let key = format!("{host}:{}", addr.port());
+        if !reused {
+            spec.reach.spares.note(&key, asked.elapsed());
+        }
+        held.conn = Some((key, peer.clone()));
         http.read_timeout = peer.options.read_timeout;
         http.write_timeout = peer.options.write_timeout;
         let mut req = spec.req.clone();
