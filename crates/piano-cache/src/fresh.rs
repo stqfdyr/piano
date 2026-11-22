@@ -9,7 +9,8 @@ pub enum Freshness {
     Unstated,
     /// Not to be stored, or stale at once.
     Never,
-    /// Fresh for this long.
+    /// Fresh for this long; zero when it arrived stale (its `Age` used up its lifetime),
+    /// which may still be stored and confirmed before use.
     For(Duration),
 }
 
@@ -63,10 +64,8 @@ pub fn shared_ttl<'a>(
     }
     match s_maxage.or(max_age) {
         None => Freshness::Unstated,
-        Some(secs) => match Duration::from_secs(secs).checked_sub(age) {
-            Some(left) if !left.is_zero() => Freshness::For(left.min(max)),
-            _ => Freshness::Never,
-        },
+        Some(0) => Freshness::Never,
+        Some(secs) => Freshness::For(Duration::from_secs(secs).saturating_sub(age).min(max)),
     }
 }
 
@@ -134,8 +133,10 @@ mod tests {
             f("max-age=2592100", 200),
             Freshness::For(Duration::from_secs(2_591_900))
         );
-        assert_eq!(f("max-age=600", 600), Freshness::Never);
-        assert_eq!(f("max-age=600", 900), Freshness::Never);
+        // Arrived stale: kept, to be confirmed before use.
+        assert_eq!(f("max-age=600", 600), Freshness::For(Duration::ZERO));
+        assert_eq!(f("max-age=600", 900), Freshness::For(Duration::ZERO));
+        assert_eq!(f("max-age=0", 0), Freshness::Never);
         assert_eq!(f("public", 900), Freshness::Unstated);
     }
 }

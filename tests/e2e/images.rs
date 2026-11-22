@@ -219,6 +219,15 @@ async fn time_spent_in_upstream_caches_counts() {
     assert_eq!(again.headers["age"], "1");
     assert_eq!(w.origin.hits("/Items/g1/Images/Primary"), 2);
     assert_eq!(w.cache_fields(2), ["miss", "revalidated"]);
+    // Older than its lifetime on arrival: kept, and confirmed before every use.
+    w.get("/Items/g2/Images/Primary?ttl=60&age=90").await;
+    let again = w.get("/Items/g2/Images/Primary?ttl=60&age=90").await;
+    assert_eq!((again.status, again.body.as_str()), (200, "image g2"));
+    assert_eq!(w.origin.hits("/Items/g2/Images/Primary"), 2);
+    assert_eq!(
+        w.cache_fields(4),
+        ["miss", "revalidated", "miss", "revalidated"]
+    );
 }
 
 #[tokio::test]

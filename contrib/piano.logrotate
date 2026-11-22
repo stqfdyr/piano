@@ -1,5 +1,7 @@
 # piano logs. The access log is reopened on SIGUSR1; a process still draining
-# after an upgrade keeps writing the rotated file until it exits.
+# after an upgrade keeps writing the rotated file until it exits. Rotation runs as
+# the piano user that install.sh creates; with another service user (PIANO_USER),
+# change both su lines.
 /var/log/piano/*access.log {
 	# The directory belongs to piano: rotate as piano, not as root.
 	su piano piano
