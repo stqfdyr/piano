@@ -208,6 +208,29 @@ async fn expired_images_are_revalidated_or_stand_in_for_failures() {
 }
 
 #[tokio::test]
+async fn time_spent_in_upstream_caches_counts() {
+    let w = world().await;
+    // A 2 s lifetime of which a CDN already used 1 s.
+    let first = w.get("/Items/g1/Images/Primary?ttl=2&age=1").await;
+    assert_eq!(first.headers["age"], "1");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let again = w.get("/Items/g1/Images/Primary?ttl=2&age=1").await;
+    assert_eq!((again.status, again.body.as_str()), (200, "image g1"));
+    assert_eq!(again.headers["age"], "1");
+    assert_eq!(w.origin.hits("/Items/g1/Images/Primary"), 2);
+    assert_eq!(w.cache_fields(2), ["miss", "revalidated"]);
+    // Older than its lifetime on arrival: kept, and confirmed before every use.
+    w.get("/Items/g2/Images/Primary?ttl=60&age=90").await;
+    let again = w.get("/Items/g2/Images/Primary?ttl=60&age=90").await;
+    assert_eq!((again.status, again.body.as_str()), (200, "image g2"));
+    assert_eq!(w.origin.hits("/Items/g2/Images/Primary"), 2);
+    assert_eq!(
+        w.cache_fields(4),
+        ["miss", "revalidated", "miss", "revalidated"]
+    );
+}
+
+#[tokio::test]
 async fn an_upstream_429_pauses_image_requests_only() {
     let w = world().await;
     let limited = w.get("/Items/l1/Images/Primary?codes=429&retry=30").await;

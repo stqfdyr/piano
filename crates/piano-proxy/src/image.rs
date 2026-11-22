@@ -95,6 +95,8 @@ pub(crate) struct Stored {
     status: u16,
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
+    /// Time the response had spent in caches upstream when it arrived (its `Age`).
+    age: Duration,
     stored_at: Instant,
     fresh_until: Instant,
     keep_until: Instant,
@@ -368,13 +370,17 @@ impl Images {
     }
 
     /// Stores `old` again after the upstream confirmed it, fresh for what the
-    /// confirmation allows (its previous lifetime when it says nothing). It is stored
-    /// even if it was evicted or purged meanwhile: the confirmation makes it current.
-    fn refresh(&self, key: &str, old: &Stored, fresh: Freshness, now: Instant) {
+    /// confirmation allows (its stored Cache-Control, less the confirmation's `Age`, when
+    /// it says nothing). It is stored even if it was evicted or purged meanwhile: the
+    /// confirmation makes it current.
+    fn refresh(&self, key: &str, old: &Stored, fresh: Freshness, age: Duration, now: Instant) {
         let mut s = lock(&self.state);
         let ttl = match fresh {
             Freshness::For(ttl) => ttl,
-            Freshness::Unstated => old.fresh_until.saturating_duration_since(old.stored_at),
+            Freshness::Unstated => match stored_ttl(&old.headers, age) {
+                Freshness::For(ttl) => ttl,
+                _ => old.fresh_until.saturating_duration_since(old.stored_at),
+            },
             Freshness::Never => {
                 s.bodies.remove(key);
                 return;
@@ -386,6 +392,7 @@ impl Images {
                 status: old.status,
                 headers: old.headers.clone(),
                 body: old.body.clone(),
+                age,
                 stored_at: now,
                 fresh_until: now + ttl,
                 keep_until: now + ttl + STALE_FOR,
@@ -481,13 +488,14 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
             ctx.cache = Some(label);
             write(session, ctx, r, false).await?;
         }
+        // The upstream just confirmed the copy: it is current even when it arrived with no
+        // freshness left (then it is confirmed again next time).
         (Fetched::NotModified, stale) => match (images.look(&key, Instant::now()), stale) {
-            (Look::Fresh(s), _) => {
+            (Look::Fresh(s) | Look::Stale(s), _) | (_, Some(s)) => {
                 counters.revalidated.fetch_add(1, Ordering::Relaxed);
                 ctx.cache = Some("revalidated");
                 write(session, ctx, &s, true).await?;
             }
-            (_, Some(s)) => serve_stale(session, ctx, counters, &s).await?,
             _ => return Ok(false),
         },
         (Fetched::Shed(after), None) => {
@@ -626,7 +634,7 @@ async fn admit(budget: &Budget, free: bool) -> std::result::Result<(), Duration>
 
 enum Got {
     Response(Arc<Stored>),
-    NotModified(Freshness),
+    NotModified(Freshness, Duration),
     TooLarge,
 }
 
@@ -637,14 +645,14 @@ fn conclude(spec: &Spec, got: Result<Got>) -> Fetched {
         Ok(Got::Response(r)) => {
             if r.status == 404 {
                 spec.images.remember_missing(&spec.key, now);
-            } else if r.fresh_until > now {
+            } else if r.keep_until > now {
                 spec.images.store(&spec.key, Arc::clone(&r));
             }
             Fetched::Response(r)
         }
-        Ok(Got::NotModified(fresh)) => match &spec.held {
+        Ok(Got::NotModified(fresh, age)) => match &spec.held {
             Some(old) => {
-                spec.images.refresh(&spec.key, old, fresh, now);
+                spec.images.refresh(&spec.key, old, fresh, age, now);
                 Fetched::NotModified
             }
             None => Fetched::Failed(
@@ -782,7 +790,7 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
                 .images
                 .release_http_session(http, &peer, idle)
                 .await;
-            return Ok(Got::NotModified(ttl));
+            return Ok(Got::NotModified(ttl, upstream_age(&resp)));
         }
         let announced = resp
             .headers
@@ -845,10 +853,49 @@ fn exact(body: BytesMut) -> Bytes {
     }
 }
 
+/// How long a stored copy with `headers` may be served, `age` after it left the upstream.
+fn stored_ttl(headers: &[(HeaderName, HeaderValue)], age: Duration) -> Freshness {
+    let lines = headers
+        .iter()
+        .filter(|(k, _)| *k == CACHE_CONTROL)
+        .map(|(_, v)| v.as_bytes());
+    shared_ttl(lines, age, MAX_TTL)
+}
+
 /// How long `resp` may be served from the store.
 fn ttl_of(resp: &ResponseHeader) -> Freshness {
     let lines = resp.headers.get_all(CACHE_CONTROL).into_iter();
-    shared_ttl(lines.map(HeaderValue::as_bytes), MAX_TTL)
+    shared_ttl(
+        lines.map(HeaderValue::as_bytes),
+        upstream_age(resp),
+        MAX_TTL,
+    )
+}
+
+/// Largest `Age` taken as given; larger ones, too large to parse included, count as this
+/// (RFC 9111 §1.2.2).
+const MAX_AGE: Duration = Duration::from_secs(1 << 31);
+
+/// The `Age` of `resp` (the first value of a list), at most [`MAX_AGE`]; none, or one that
+/// is not a number of seconds, counts as zero.
+fn upstream_age(resp: &ResponseHeader) -> Duration {
+    let Some(v) = resp.headers.get(AGE) else {
+        return Duration::ZERO;
+    };
+    let first = v
+        .as_bytes()
+        .split(|&b| b == b',')
+        .next()
+        .unwrap_or_default();
+    let digits = first.trim_ascii();
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Duration::ZERO;
+    }
+    std::str::from_utf8(digits)
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .map_or(MAX_AGE, Duration::from_secs)
+        .min(MAX_AGE)
 }
 
 /// Sends a bodiless request and reads the response header.
@@ -912,6 +959,7 @@ fn stored(site: &Site, host: &str, mut resp: ResponseHeader, body: BytesMut) -> 
         status: resp.status.as_u16(),
         headers,
         body,
+        age: upstream_age(&resp),
         stored_at: now,
         fresh_until: now + ttl.unwrap_or_default(),
         keep_until: now + ttl.map_or(Duration::ZERO, |t| t + STALE_FOR),
@@ -963,8 +1011,9 @@ async fn write(session: &mut Session, ctx: &mut Ctx, s: &Stored, from_store: boo
     for (k, v) in &s.headers {
         resp.append_header(k.clone(), v.clone())?;
     }
-    if from_store {
-        resp.insert_header(AGE, s.stored_at.elapsed().as_secs())?;
+    // Upstream time first: the response may have waited in a CDN before it came here.
+    if from_store || !s.age.is_zero() {
+        resp.insert_header(AGE, s.age.saturating_add(s.stored_at.elapsed()).as_secs())?;
     }
     ctx.ttfb = ctx.start.map(|t| t.elapsed());
     if unchanged {
@@ -1023,6 +1072,7 @@ mod tests {
                 })
                 .collect(),
             body: Bytes::new(),
+            age: Duration::ZERO,
             stored_at: now,
             fresh_until: now,
             keep_until: now,
@@ -1103,6 +1153,18 @@ mod tests {
     }
 
     #[test]
+    fn upstream_age_is_bounded() {
+        let a = |v: &str| upstream_age(&resp(200, &[("age", v)])).as_secs();
+        assert_eq!(a("120"), 120);
+        assert_eq!(a(" 7 , 9"), 7);
+        assert_eq!(a("99999999999999999999"), 1 << 31);
+        assert_eq!(a("18446744073709551615"), 1 << 31);
+        assert_eq!(a("-3"), 0);
+        assert_eq!(a("1e3"), 0);
+        assert_eq!(upstream_age(&resp(200, &[])), Duration::ZERO);
+    }
+
+    #[test]
     fn retry_after_is_bounded() {
         let r = |v: &[(&str, &str)]| pause_of(&resp(429, v));
         assert_eq!(r(&[("retry-after", "3")]), Duration::from_secs(3));
@@ -1159,7 +1221,13 @@ mod tests {
         let images = Images::new(1 << 20);
         let t = Instant::now();
         let old = image(10);
-        images.refresh("a", &old, Freshness::For(Duration::from_secs(60)), t);
+        images.refresh(
+            "a",
+            &old,
+            Freshness::For(Duration::from_secs(60)),
+            Duration::ZERO,
+            t,
+        );
         let at = |d: u64| images.look("a", t + Duration::from_secs(d));
         assert!(matches!(at(59), Look::Fresh(_)));
         assert!(matches!(at(61), Look::Stale(_)));
@@ -1181,13 +1249,13 @@ mod tests {
             ..base
         };
         let at = |d: u64| start + Duration::from_secs(d);
-        images.refresh("a", &old, Freshness::Unstated, at(100));
+        images.refresh("a", &old, Freshness::Unstated, Duration::ZERO, at(100));
         assert!(
             matches!(images.look("a", at(129)), Look::Fresh(_)),
             "its previous lifetime again"
         );
         assert!(matches!(images.look("a", at(131)), Look::Stale(_)));
-        images.refresh("a", &old, Freshness::Never, at(100));
+        images.refresh("a", &old, Freshness::Never, Duration::ZERO, at(100));
         assert!(
             matches!(images.look("a", at(100)), Look::None),
             "a confirmation that forbids storing"
