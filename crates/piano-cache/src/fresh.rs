@@ -24,11 +24,13 @@ impl Freshness {
 }
 
 /// How long a response may be served from a shared cache, capped at `max`.
-/// `cache_control` holds every `Cache-Control` field line, which together form one list.
-/// `s-maxage` wins over `max-age`; image endpoints that want caching say so, so a
-/// response without either is not stored.
+/// `cache_control` holds every `Cache-Control` field line, which together form one list;
+/// `age` is the response's `Age`, the time it already spent in caches upstream, which
+/// its lifetime includes (RFC 9111 §4.2.3). `s-maxage` wins over `max-age`; image
+/// endpoints that want caching say so, so a response without either is not stored.
 pub fn shared_ttl<'a>(
     cache_control: impl IntoIterator<Item = &'a [u8]>,
+    age: Duration,
     max: Duration,
 ) -> Freshness {
     let mut max_age = None;
@@ -61,8 +63,10 @@ pub fn shared_ttl<'a>(
     }
     match s_maxage.or(max_age) {
         None => Freshness::Unstated,
-        Some(0) => Freshness::Never,
-        Some(secs) => Freshness::For(Duration::from_secs(secs).min(max)),
+        Some(secs) => match Duration::from_secs(secs).checked_sub(age) {
+            Some(left) if !left.is_zero() => Freshness::For(left.min(max)),
+            _ => Freshness::Never,
+        },
     }
 }
 
@@ -74,7 +78,9 @@ mod tests {
     const MAX: Duration = Duration::from_secs(30 * 86_400);
 
     fn ttl(v: &str) -> Option<u64> {
-        shared_ttl([v.as_bytes()], MAX).ttl().map(|d| d.as_secs())
+        shared_ttl([v.as_bytes()], Duration::ZERO, MAX)
+            .ttl()
+            .map(|d| d.as_secs())
     }
 
     #[test]
@@ -92,8 +98,11 @@ mod tests {
         assert_eq!(ttl("no-store, max-age=60"), None);
         assert_eq!(ttl("no-cache"), None);
         assert_eq!(ttl("max-age=x"), None);
-        assert_eq!(shared_ttl(std::iter::empty(), MAX), Freshness::Unstated);
-        let f = |v: &str| shared_ttl([v.as_bytes()], MAX);
+        assert_eq!(
+            shared_ttl(std::iter::empty(), Duration::ZERO, MAX),
+            Freshness::Unstated
+        );
+        let f = |v: &str| shared_ttl([v.as_bytes()], Duration::ZERO, MAX);
         assert_eq!(f("public"), Freshness::Unstated);
         assert_eq!(f("max-age=x"), Freshness::Unstated);
         assert_eq!(f("max-age=0"), Freshness::Never);
@@ -104,11 +113,29 @@ mod tests {
     #[test]
     fn field_lines_form_one_list() {
         let lines = |l: &[&'static str]| {
-            shared_ttl(l.iter().map(|s| s.as_bytes()), MAX)
+            shared_ttl(l.iter().map(|s| s.as_bytes()), Duration::ZERO, MAX)
                 .ttl()
                 .map(|d| d.as_secs())
         };
         assert_eq!(lines(&["public, max-age=60", "private"]), None);
         assert_eq!(lines(&["max-age=60", "s-maxage=600"]), Some(600));
+    }
+
+    #[test]
+    fn time_spent_upstream_counts() {
+        let f = |v: &str, age: u64| shared_ttl([v.as_bytes()], Duration::from_secs(age), MAX);
+        assert_eq!(
+            f("max-age=600", 100),
+            Freshness::For(Duration::from_secs(500))
+        );
+        // The cap applies to what is left, not to the whole lifetime.
+        assert_eq!(f("max-age=31536000", 86_400), Freshness::For(MAX));
+        assert_eq!(
+            f("max-age=2592100", 200),
+            Freshness::For(Duration::from_secs(2_591_900))
+        );
+        assert_eq!(f("max-age=600", 600), Freshness::Never);
+        assert_eq!(f("max-age=600", 900), Freshness::Never);
+        assert_eq!(f("public", 900), Freshness::Unstated);
     }
 }

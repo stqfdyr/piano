@@ -35,7 +35,8 @@
 //!   last repeats; 429 carries `Retry-After` from `retry=N`, default 1), `moved=1` answers
 //!   301 to `/img/{key}` with the same query (`moved=302`: 302), `size=N` pads the body
 //!   with dots to N bytes, `delay_ms=N` waits first, `cookie=1` adds a session
-//!   `Set-Cookie` as some upstream gateways do on every response. [`Origin::hits`] counts
+//!   `Set-Cookie` as some upstream gateways do on every response, `age=N` an `Age` as from
+//!   a CDN cache. [`Origin::hits`] counts
 //!   requests per path.
 //! - A small Emby API for `piano probe` under `/emby`: `Users/AuthenticateByName` (POST,
 //!   accepts [`PROBE_USER`] / [`PROBE_PASSWORD`]), `Users/{PROBE_USER_ID}/Views` and `…/Items`,
@@ -695,6 +696,9 @@ async fn image(req: &Request<Incoming>, state: &State) -> Option<Response<ResBod
             "set-cookie",
             format!("session={n}; Max-Age=86400; HttpOnly; Path=/"),
         );
+    }
+    if let Some(age) = param("age") {
+        builder = builder.header("age", age);
     }
     if ttl > 0 {
         builder = builder.header("cache-control", format!("public, max-age={ttl}"));

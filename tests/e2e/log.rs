@@ -21,6 +21,28 @@ async fn get(w: &World, proto: Proto, path: &str) -> reqwest::Response {
         .unwrap()
 }
 
+/// The fields `piano log tail` (filters and the readable form) and the problems pane of
+/// `piano top` read, by name and JSON type; they parse the log on their own.
+#[tokio::test]
+async fn lines_carry_the_fields_their_readers_use() {
+    let w = world(None, true).await;
+    get(&w, Proto::H1, "/__info").await;
+    let refused = get(&w, Proto::H1, "/__redirect?to=https://elsewhere.example/x").await;
+    assert_eq!(refused.status(), 502);
+    let lines = w.relay.access_lines(ACCESS_LOG, 2);
+    for l in &lines {
+        for k in ["ts", "site", "method", "path", "client", "class", "end"] {
+            assert!(l[k].is_string(), "{k}: {l}");
+        }
+        for k in ["status", "dur_ms"] {
+            assert!(l[k].is_u64(), "{k}: {l}");
+        }
+    }
+    assert_eq!(lines[0]["end"], "ok");
+    assert_eq!(lines[1]["end"], "redirect_refused");
+    assert!(lines[1]["err"].is_string(), "{}", lines[1]);
+}
+
 #[tokio::test]
 async fn each_request_is_one_line_without_credentials() {
     let w = world(None, true).await;
