@@ -92,6 +92,23 @@ struct Answer {
 }
 
 impl Answer {
+    /// Whether the answer is the same for every client that asks: not a refusal of the
+    /// leader's credentials, and chosen by nothing beyond `Accept` (requests waiting for it
+    /// asked with the same one) and `Accept-Encoding` (fetched uncompressed).
+    fn shared(&self) -> bool {
+        let vary_ok = self
+            .headers
+            .iter()
+            .filter(|(k, _)| *k == VARY)
+            .all(|(_, v)| {
+                v.as_bytes().split(|&b| b == b',').all(|t| {
+                    let t = t.trim_ascii();
+                    t.eq_ignore_ascii_case(b"accept") || t.eq_ignore_ascii_case(b"accept-encoding")
+                })
+            });
+        !matches!(self.status, 401 | 403 | 407) && vary_ok
+    }
+
     fn header(&self, name: &HeaderName) -> Option<&HeaderValue> {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v)
     }
@@ -320,8 +337,8 @@ impl Images {
         lock(&self.state).moved.remove(key);
     }
 
-    /// Notes what the upstream answered for image `key` other than 404: whether later
-    /// requests for it are fetched per variant.
+    /// Notes that the upstream answered image `key` with 200: whether later requests
+    /// for it are fetched per variant.
     fn found(&self, key: &str, varies: bool) {
         let mut s = lock(&self.state);
         s.missing.remove(key);
@@ -431,8 +448,7 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         return Ok(false);
     };
     if let Fetched::Response(r) = &*fetched
-        && r.varies()
-        && *by != *variant
+        && ((r.varies() && *by != *variant) || (!leader && !r.shared()))
     {
         return Ok(false);
     }
@@ -575,7 +591,8 @@ fn conclude(spec: &Spec, got: Result<Got>) -> Fetched {
         Ok(Got::Response(r)) => {
             if r.status == 404 {
                 spec.images.remember_missing(&spec.key, Instant::now());
-            } else {
+            } else if r.status == 200 {
+                // Error pages say nothing about how the image itself is chosen.
                 spec.images.found(&spec.key, r.varies());
             }
             Fetched::Response(r)
@@ -706,6 +723,11 @@ async fn exchange(spec: &Spec, start: Option<Hop>, remember: bool) -> Result<Got
             continue;
         }
         if status == 304 {
+            let idle = peer.options.idle_timeout;
+            spec.reach
+                .images
+                .release_http_session(http, &peer, idle)
+                .await;
             return Error::e_explain(
                 ErrorType::InvalidHTTPHeader,
                 "304 to an unconditional request",
@@ -934,6 +956,22 @@ mod tests {
             r.append_header(k.to_string(), *v).unwrap();
         }
         r
+    }
+
+    #[test]
+    fn only_answers_alike_for_every_client_are_shared() {
+        let with = |status: u16, h: &[(&str, &str)]| Answer {
+            status,
+            ..answer(h)
+        };
+        assert!(with(200, &[]).shared());
+        assert!(with(200, &[("vary", "Accept-Encoding"), ("vary", "accept")]).shared());
+        assert!(with(404, &[]).shared());
+        assert!(with(429, &[]).shared());
+        assert!(!with(200, &[("vary", "Accept, Cookie")]).shared());
+        assert!(!with(200, &[("vary", "*")]).shared());
+        assert!(!with(401, &[]).shared());
+        assert!(!with(403, &[]).shared());
     }
 
     #[test]

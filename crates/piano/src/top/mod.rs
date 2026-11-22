@@ -176,7 +176,7 @@ mod tests {
 
     fn live() -> Live {
         serde_json::from_value(serde_json::json!({
-            "schema": 1, "version": "0.1.0", "pid": 1, "uptime_ms": 45000,
+            "schema": 2, "version": "0.1.0", "pid": 1, "uptime_ms": 45000,
             "connections": {"open": 4, "handshaking": 0, "limit": 1024, "closed_at_limit": 0,
                 "handshake_timeouts": 0, "handshake_errors": 0, "denied": 0, "media_streams": 1},
             "access_log": "/var/log/piano/access.log",

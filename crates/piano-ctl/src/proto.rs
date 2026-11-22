@@ -49,7 +49,7 @@ pub const RELOAD_SCHEMA: u32 = 1;
 /// Version of [`CacheStats`] and [`PurgeReply`].
 pub const CACHE_SCHEMA: u32 = 2;
 /// Version of [`Live`].
-pub const LIVE_SCHEMA: u32 = 1;
+pub const LIVE_SCHEMA: u32 = 2;
 /// Version of [`UpgradeReply`].
 pub const UPGRADE_SCHEMA: u32 = 1;
 /// Version of [`StopReply`].

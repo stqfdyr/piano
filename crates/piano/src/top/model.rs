@@ -476,7 +476,7 @@ mod tests {
         ]
         .into();
         Live {
-            schema: 1,
+            schema: 2,
             version: "0.1.0".into(),
             pid: 7,
             uptime_ms,

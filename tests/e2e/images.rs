@@ -127,6 +127,19 @@ async fn images_that_do_not_vary_by_accept_are_shared() {
 }
 
 #[tokio::test]
+async fn a_refusal_is_not_shared() {
+    let w = world().await;
+    let path = "/Items/d1/Images/Primary?codes=403&delay_ms=300";
+    let (a, b) = tokio::join!(w.get(path), w.get(path));
+    assert_eq!((a.status, b.status), (403, 403));
+    // The one that waited asked again on its own.
+    assert_eq!(w.origin.hits("/Items/d1/Images/Primary"), 2);
+    let mut fields = w.cache_fields(2);
+    fields.sort();
+    assert_eq!(fields, ["-", "fetched"]);
+}
+
+#[tokio::test]
 async fn a_client_holding_the_image_gets_304() {
     let w = world().await;
     let again = w
