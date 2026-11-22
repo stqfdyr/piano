@@ -137,6 +137,7 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
     );
     let spec = Arc::new(Spec {
         reach: Arc::clone(&relay.reach),
+        stop: relay.stop.watch(),
         budget: relay.images.budget(site),
         stall: site.origin.options.read_timeout,
         req: upstream_request(req)?,
@@ -244,6 +245,8 @@ pub(crate) fn upstream_request(req: &RequestHeader) -> Result<RequestHeader> {
 /// What every upstream request of one stream shares.
 struct Spec {
     reach: Arc<Reach>,
+    /// Set at shutdown, when nothing will use a replaced connection.
+    stop: watch::Receiver<bool>,
     /// The site's upstream request budget, which requests to the upstream itself count
     /// against.
     budget: Arc<Budget>,
@@ -731,12 +734,15 @@ fn abandoned() -> Box<Error> {
 /// the task was aborted.
 struct Held {
     reach: Arc<Reach>,
+    stop: watch::Receiver<bool>,
     conn: Option<(String, HttpPeer)>,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if let Some((host, peer)) = self.conn.take() {
+        if let Some((host, peer)) = self.conn.take()
+            && !*self.stop.borrow()
+        {
             self.reach.replace(&host, peer);
         }
     }
@@ -750,6 +756,7 @@ async fn request(
 ) -> Result<()> {
     let mut held = Held {
         reach: Arc::clone(&spec.reach),
+        stop: spec.stop.clone(),
         conn: None,
     };
     attempts(spec, id, range, tx, &mut held).await
@@ -827,7 +834,6 @@ async fn attempts(
         if !reused {
             spec.reach.spares.note(&key, asked.elapsed());
         }
-        held.conn = Some((key, peer.clone()));
         http.read_timeout = peer.options.read_timeout;
         http.write_timeout = peer.options.write_timeout;
         let mut req = spec.req.clone();
@@ -841,6 +847,7 @@ async fn attempts(
         if let Some(r) = &range {
             req.insert_header(RANGE, r.clone())?;
         }
+        held.conn = Some((key, peer.clone()));
         let resp = match exchange(&mut http, req).await {
             Ok(r) => r,
             Err(e) => {
@@ -899,7 +906,8 @@ async fn attempts(
                 hop.as_ref(),
                 &spec.client_path,
                 location.as_bytes(),
-            )?;
+            )
+            .inspect_err(|_| held.conn = None)?;
             hops += 1;
             tokio::spawn(drain(Arc::clone(&spec.reach), http, peer));
             hop = Some(next);

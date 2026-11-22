@@ -46,8 +46,8 @@ const CREDENTIAL_HEADERS: [&str; 3] = [
 const SPARE_COST: Duration = Duration::from_millis(100);
 
 /// Replacements being set up at once, and hosts remembered. Each replaces a connection
-/// just closed, and one that finds an idle connection in the pool sets up none, so the
-/// connections to a host do not grow.
+/// just closed, and one that finds an idle connection in the pool sets up none, so a
+/// host ends up with at most one idle connection more than before the drop.
 const MAX_SPARING: usize = 8;
 const MAX_HOSTS: usize = 64;
 
@@ -60,7 +60,8 @@ struct SpareState {
 
 /// Replaces media connections that are slow to set up when a request drops one: a
 /// player that seeks closes the request it no longer wants, and an HTTP/1.1 connection
-/// cannot be reused in the middle of a body.
+/// cannot be reused in the middle of a body. The seek's own request has usually asked
+/// for a connection by then; the replacement serves the requests after it.
 #[derive(Debug, Default)]
 pub(crate) struct Spares {
     state: std::sync::Mutex<SpareState>,
@@ -93,6 +94,11 @@ impl Spares {
         true
     }
 
+    /// Forgets `host`, which could not be connected to.
+    fn forget(&self, host: &str) {
+        self.lock().hosts.remove(host);
+    }
+
     fn done(&self) {
         let mut s = self.lock();
         s.in_flight = s.in_flight.saturating_sub(1);
@@ -112,9 +118,17 @@ impl Reach {
             return;
         };
         let reach = Arc::clone(self);
+        let host = host.to_owned();
         rt.spawn(async move {
             let idle = peer.options.idle_timeout;
-            let _ = reach.media.keep_idle(&peer, idle).await;
+            let began = Instant::now();
+            match reach.media.keep_idle(&peer, idle).await {
+                Ok(true) => reach.spares.note(&host, began.elapsed()),
+                Ok(false) => {}
+                // An unreachable host would hold a slot for a whole connect timeout on
+                // every drop.
+                Err(_) => reach.spares.forget(&host),
+            }
             reach.spares.done();
         });
     }
@@ -421,6 +435,9 @@ mod tests {
         s.note("far:443", Duration::from_millis(5));
         s.done();
         assert!(!s.claim("far:443"));
+        s.note("gone:443", SPARE_COST);
+        s.forget("gone:443");
+        assert!(!s.claim("gone:443"));
     }
 
     #[test]
