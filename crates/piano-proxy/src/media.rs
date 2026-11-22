@@ -22,7 +22,7 @@ use http::{HeaderName, HeaderValue, Method, Version};
 use log::{debug, warn};
 use piano_cache::Budget;
 use piano_edge::acl::canonical;
-use piano_media::{ByteRange, Head, Request, Resume, Stream, StreamGuard};
+use piano_media::{ByteRange, Head, Request, Resume, Stream, StreamGuard, try_key};
 use piano_telemetry::{Id, Kind, SiteCounters, Ttfb};
 use pingora_core::protocols::http::v1::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -51,6 +51,23 @@ const MAX_UNPRODUCTIVE: u8 = 4;
 /// Messages queued from the requests of one stream. Bodies are read 32 KiB at a time,
 /// so a stream holds a few reads in the queue and one in each request's buffer.
 const QUEUE: usize = 2;
+
+/// Shortest pause in the body, with the client ready for more, counted as starving it.
+/// Shorter pauses are the upstream's pacing; players buffer seconds ahead.
+const STARVED_GAP: Duration = Duration::from_secs(1);
+
+/// What the access log says about a media stream beyond what every request has.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MediaLog {
+    /// Which try of the client this was (1 for the first).
+    pub attempt: u32,
+    /// From the client's first try to the response head, or to the end without one.
+    pub waited: Duration,
+    /// Pauses of at least [`STARVED_GAP`] in the body while the client could take more.
+    pub starved: Duration,
+    /// Time spent handing bytes to the client: a full player buffer or a slow link.
+    pub blocked: Duration,
+}
 
 /// A redirect's connection is reused if its body arrives within this time and size.
 pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -106,13 +123,13 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         .and_then(|a| a.as_inet())
         .map(|a| canonical(a.ip()));
     let range = req.headers.get(RANGE).cloned();
-    let stream = relay.streams.register(Stream::new(
-        ctx.rid.to_string(),
-        site.name.clone(),
-        client,
-        logged_path(req),
-        logged_range(req),
-    ));
+    let (path, logged) = (logged_path(req), logged_range(req));
+    let key = try_key(client, &site.name, &path, logged.as_deref());
+    let (attempt, first_try) = relay.streams.next_try(&key, Instant::now());
+    let stream = relay.streams.register(
+        Stream::new(ctx.rid.to_string(), site.name.clone(), client, path, logged)
+            .tried(attempt, first_try),
+    );
     let spec = Arc::new(Spec {
         reach: Arc::clone(&relay.reach),
         budget: relay.images.budget(site),
@@ -146,9 +163,34 @@ pub(crate) async fn relay(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         serving: None,
         rid: ctx.rid,
         stop: relay.stop.watch(),
+        client_left: false,
+        head_at: None,
+        last_write: None,
+        starved: Duration::ZERO,
+        blocked: Duration::ZERO,
     };
     engine.launch(range, Request::First);
     let result = engine.run(session, ctx).await;
+    let end = Instant::now();
+    if engine.head_sent {
+        relay.streams.answered(&key);
+        if result.is_err() {
+            // Ended without the rest of the body: a wait for bytes counts up to here.
+            engine.starve_until(end);
+        }
+    } else if engine.client_left {
+        relay.streams.gave_up(key, attempt, first_try, end);
+        spec.counters.record_media_gave_up();
+    }
+    ctx.media = Some(MediaLog {
+        attempt,
+        waited: engine
+            .head_at
+            .unwrap_or(end)
+            .saturating_duration_since(first_try),
+        starved: engine.starved,
+        blocked: engine.blocked,
+    });
     // Requests still running are dropped with the engine; their log entries so far
     // belong to this request.
     drop(engine);
@@ -300,6 +342,13 @@ struct Engine {
     /// The request whose bytes the client got last.
     serving: Option<u32>,
     rid: Id,
+    /// The client went away; before the head, it gave up waiting.
+    client_left: bool,
+    head_at: Option<Instant>,
+    /// When the last write to the client ended, the head's included.
+    last_write: Option<Instant>,
+    starved: Duration,
+    blocked: Duration,
 }
 
 impl Engine {
@@ -386,6 +435,7 @@ impl Engine {
                     ));
                 }
                 Event::Client(e) => {
+                    self.client_left = true;
                     let e = e.unwrap_or_else(|| {
                         Error::explain(ErrorType::ConnectionClosed, "client sent data mid-response")
                     });
@@ -485,6 +535,9 @@ impl Engine {
         }
         ctx.cf_ray = resp.headers.get("cf-ray").cloned();
         self.head_sent = true;
+        let now = Instant::now();
+        self.head_at = Some(now);
+        self.last_write = Some(now);
         until_stop(&mut self.stop, async {
             session
                 .write_response_header(resp, false)
@@ -492,6 +545,16 @@ impl Engine {
                 .map_err(|e| e.into_down())
         })
         .await
+    }
+
+    /// Counts the time since the last write as starving the client, if long enough.
+    fn starve_until(&mut self, now: Instant) {
+        if let Some(last) = self.last_write {
+            let gap = now.saturating_duration_since(last);
+            if gap >= STARVED_GAP {
+                self.starved += gap;
+            }
+        }
     }
 
     /// Takes the head of a later request if it continues the body; drops the request
@@ -568,6 +631,8 @@ impl Engine {
 
     async fn write(&mut self, session: &mut Session, data: Bytes) -> Result<()> {
         let n = data.len() as u64;
+        let start = Instant::now();
+        self.starve_until(start);
         self.stream.set_writing(true);
         let written = until_stop(&mut self.stop, async {
             session
@@ -577,6 +642,9 @@ impl Engine {
         })
         .await;
         self.stream.set_writing(false);
+        let done = Instant::now();
+        self.blocked += done.saturating_duration_since(start);
+        self.last_write = Some(done);
         written?;
         self.pos += n;
         self.stream.add_sent(n);

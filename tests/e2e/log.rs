@@ -39,6 +39,10 @@ async fn lines_carry_the_fields_their_readers_use() {
         }
     }
     assert_eq!(lines[0]["end"], "ok");
+    // Only media streams have these.
+    for k in ["attempt", "waited_ms", "starved_ms", "blocked_ms"] {
+        assert!(lines[0][k].is_null(), "{k}: {}", lines[0]);
+    }
     assert_eq!(lines[1]["end"], "redirect_refused");
     assert!(lines[1]["err"].is_string(), "{}", lines[1]);
 }

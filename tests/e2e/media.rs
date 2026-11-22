@@ -251,6 +251,91 @@ async fn wait_streams(relay: &Relay, n: u64) {
 }
 
 #[tokio::test]
+async fn a_player_that_gives_up_before_the_head_asks_again() {
+    let ca = Ca::new("piano e2e");
+    let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;
+    let roots = [ca.cert_pem()];
+    let relay = Relay::start(&RelaySetup {
+        control: true,
+        ..RelaySetup::new(&ca.leaf(&[SITE_HOST]), &roots, origin.addr.port())
+    });
+    let url = format!(
+        "https://{SITE_HOST}:{}/videos/tries/stream.mkv?len={LEN}&plan=h3000,h3000,-",
+        relay.addr.port()
+    );
+    let c = client(ca.cert_der(), SITE_HOST, relay.addr, Proto::H1);
+    let started = Instant::now();
+    // Like a player that waits 0.8 s for the head, then asks again for the same bytes.
+    for _ in 0..2 {
+        let req = c.get(&url).header("range", "bytes=1000-").send();
+        let waited = tokio::time::timeout(Duration::from_millis(800), req).await;
+        assert!(waited.is_err(), "a head came before the upstream sent one");
+        wait_streams(&relay, 0).await;
+    }
+    let res = c
+        .get(&url)
+        .header("range", "bytes=1000-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 206);
+    assert_eq!(res.bytes().await.unwrap().len() as u64, LEN - 1000);
+    let lines = relay.access_lines(ACCESS_LOG, 3);
+    let attempts: Vec<_> = lines.iter().map(|l| l["attempt"].as_u64()).collect();
+    assert_eq!(attempts, [Some(1), Some(2), Some(3)], "{lines:?}");
+    for l in &lines[..2] {
+        assert!(l["status"].is_null() && l["end"] == "client_closed", "{l}");
+    }
+    // The third try counts from the first.
+    let waited = lines[2]["waited_ms"].as_u64().unwrap();
+    assert!(waited >= 1600, "{}", lines[2]);
+    assert!(
+        waited <= started.elapsed().as_millis() as u64,
+        "{}",
+        lines[2]
+    );
+    let socket = relay.control_socket();
+    let status = tokio::task::spawn_blocking(move || {
+        piano_ctl::call(&socket, "status", Duration::from_secs(5))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(status["sites"][0]["total"]["media_gave_up"], 2, "{status}");
+    // Another range is another wait.
+    let res = c
+        .get(&url)
+        .header("range", "bytes=0-")
+        .send()
+        .await
+        .unwrap();
+    res.bytes().await.unwrap();
+    let last = &relay.access_lines(ACCESS_LOG, 4)[3];
+    assert_eq!(last["attempt"], 1, "{last}");
+}
+
+#[tokio::test]
+async fn a_pause_in_the_body_is_logged_as_starving_the_client() {
+    let w = world().await;
+    for (key, plan) in [("smooth", "-"), ("starve", "s131072:2000")] {
+        let path = format!("/videos/{key}/stream.mkv?len={LEN}&plan={plan}");
+        let got = w.get(Proto::H1, &path, Some("bytes=0-")).await;
+        assert_eq!(got.body.unwrap().len() as u64, LEN);
+    }
+    let lines = w.relay.access_lines(ACCESS_LOG, 2);
+    let starved = |l: &serde_json::Value| l["starved_ms"].as_u64().unwrap();
+    assert_eq!(starved(&lines[0]), 0, "{}", lines[0]);
+    // Two seconds without bytes, short of the hedge: one pause, one request.
+    let s = starved(&lines[1]);
+    assert!((1800..3000).contains(&s), "{}", lines[1]);
+    assert_eq!(lines[1]["up"].as_array().unwrap().len(), 1, "{}", lines[1]);
+    for l in &lines {
+        assert_eq!(l["attempt"], 1, "{l}");
+        assert!(l["blocked_ms"].is_u64() && l["waited_ms"].is_u64(), "{l}");
+    }
+}
+
+#[tokio::test]
 async fn a_client_that_leaves_ends_its_stream() {
     let ca = Ca::new("piano e2e");
     let origin = Origin::start(&ca.leaf(&[ORIGIN_HOST])).await;

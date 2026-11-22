@@ -275,10 +275,16 @@ fn state(st: State) -> Line<'static> {
     let secs = |ms: u64| format!("{:.0}s", ms as f64 / 1000.0);
     match st {
         State::Playing => Line::from(vec![colored("● ", OK), Span::raw("playing")]),
-        State::Waiting(ms) => Line::from(vec![
-            colored("● ", WARN),
-            Span::raw(format!("waiting {}", secs(ms))),
-        ]),
+        State::Waiting { ms, attempt } => {
+            let mut l = vec![
+                colored("● ", WARN),
+                Span::raw(format!("waiting {}", secs(ms))),
+            ];
+            if attempt > 1 {
+                l.push(dim(format!(" · try {attempt}")));
+            }
+            Line::from(l)
+        }
         State::Held(ms) => Line::from(vec![dim("● "), dim(format!("held by client {}", secs(ms)))]),
         State::Stalled { ms, hedging } => {
             let c = if ms >= 15_000 { BAD } else { WARN };
