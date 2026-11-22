@@ -19,11 +19,14 @@ use crate::relay::Ctx;
 use crate::{Relay, Site, Sites};
 use bytes::{Bytes, BytesMut};
 use http::header::{
-    ACCEPT_ENCODING, AGE, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER, UPGRADE, VARY,
+    ACCEPT, ACCEPT_ENCODING, AGE, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER,
+    UPGRADE, VARY,
 };
 use http::{HeaderName, HeaderValue, Method};
-use piano_cache::{Budget, BudgetState, Freshness, Lru, Wait, Weigh, image_key, shared_ttl};
+use piano_cache::{
+    Budget, BudgetState, Freshness, Lru, Wait, Weigh, image_key, shared_ttl, variant_key,
+};
 use piano_telemetry::Kind;
 use pingora_core::protocols::http::client::HttpSession;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -307,7 +310,8 @@ impl Images {
         }
     }
 
-    fn look(&self, key: &str, now: Instant) -> Look {
+    /// What is known of image `key`, and of its `variant` for the request's Accept.
+    fn look(&self, key: &str, variant: &str, now: Instant) -> Look {
         let mut s = lock(&self.state);
         if let Some(m) = s.missing.get(key) {
             if m.until > now {
@@ -315,7 +319,7 @@ impl Images {
             }
             s.missing.remove(key);
         }
-        let Some(stored) = s.bodies.get(key).cloned() else {
+        let Some(stored) = s.bodies.get(variant).cloned() else {
             return Look::None;
         };
         if stored.fresh_until > now {
@@ -323,7 +327,7 @@ impl Images {
         } else if stored.keep_until > now {
             Look::Stale(stored)
         } else {
-            s.bodies.remove(key);
+            s.bodies.remove(variant);
             Look::None
         }
     }
@@ -352,15 +356,17 @@ impl Images {
         lock(&self.state).moved.remove(key);
     }
 
-    fn store(&self, key: &str, stored: Arc<Stored>) {
+    fn store(&self, key: &str, variant: &str, stored: Arc<Stored>) {
         let mut s = lock(&self.state);
         s.missing.remove(key);
-        s.bodies.insert(key.to_owned(), stored);
+        s.bodies.insert(variant.to_owned(), stored);
     }
 
-    fn remember_missing(&self, key: &str, now: Instant) {
+    /// Remembers that image `key` is missing, whatever the Accept; other variants still
+    /// stored are not served while it is remembered.
+    fn remember_missing(&self, key: &str, variant: &str, now: Instant) {
         let mut s = lock(&self.state);
-        s.bodies.remove(key);
+        s.bodies.remove(variant);
         s.missing.insert(
             key.to_owned(),
             Missing {
@@ -373,7 +379,7 @@ impl Images {
     /// confirmation allows (its stored Cache-Control, less the confirmation's `Age`, when
     /// it says nothing). It is stored even if it was evicted or purged meanwhile: the
     /// confirmation makes it current.
-    fn refresh(&self, key: &str, old: &Stored, fresh: Freshness, age: Duration, now: Instant) {
+    fn refresh(&self, variant: &str, old: &Stored, fresh: Freshness, age: Duration, now: Instant) {
         let mut s = lock(&self.state);
         let ttl = match fresh {
             Freshness::For(ttl) => ttl,
@@ -382,12 +388,12 @@ impl Images {
                 _ => old.fresh_until.saturating_duration_since(old.stored_at),
             },
             Freshness::Never => {
-                s.bodies.remove(key);
+                s.bodies.remove(variant);
                 return;
             }
         };
         s.bodies.insert(
-            key.to_owned(),
+            variant.to_owned(),
             Arc::new(Stored {
                 status: old.status,
                 headers: old.headers.clone(),
@@ -414,9 +420,14 @@ pub(crate) fn takes(session: &mut Session) -> bool {
 pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
     let images = Arc::clone(&relay.images);
     let site = ctx.site()?;
-    let key = image_key(&site.name, session.req_header().raw_path());
+    let req = session.req_header();
+    let key = image_key(&site.name, req.raw_path());
+    let variant = variant_key(
+        &key,
+        req.headers.get_all(ACCEPT).iter().map(|v| v.as_bytes()),
+    );
     let now = Instant::now();
-    let stale = match images.look(&key, now) {
+    let stale = match images.look(&key, &variant, now) {
         Look::Fresh(s) => {
             images.counters.hits.fetch_add(1, Ordering::Relaxed);
             ctx.cache = Some("hit");
@@ -436,11 +447,11 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
     let (flight, spec) = {
         let mut flights = lock(&images.flights);
         // A fetch whose task ended without an answer has a closed channel; start anew.
-        match flights.get(&key).filter(|f| f.has_changed().is_ok()) {
+        match flights.get(&variant).filter(|f| f.has_changed().is_ok()) {
             Some(f) => (f.clone(), None),
             None => {
                 let (tx, rx) = watch::channel(None);
-                flights.insert(key.clone(), rx.clone());
+                flights.insert(variant.clone(), rx.clone());
                 let spec = Arc::new(Spec {
                     images: Arc::clone(&images),
                     reach: Arc::clone(&relay.reach),
@@ -455,6 +466,7 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
                     client_path: session.req_header().raw_path().to_vec(),
                     start: ctx.hop.clone(),
                     key: key.clone(),
+                    variant: variant.clone(),
                     log: Mutex::new(Vec::new()),
                 });
                 tokio::spawn(run(Arc::clone(&spec), tx));
@@ -490,7 +502,8 @@ pub(crate) async fn serve(relay: &Relay, session: &mut Session, ctx: &mut Ctx) -
         }
         // The upstream just confirmed the copy: it is current even when it arrived with no
         // freshness left (then it is confirmed again next time).
-        (Fetched::NotModified, stale) => match (images.look(&key, Instant::now()), stale) {
+        (Fetched::NotModified, stale) => match (images.look(&key, &variant, Instant::now()), stale)
+        {
             (Look::Fresh(s) | Look::Stale(s), _) | (_, Some(s)) => {
                 counters.revalidated.fetch_add(1, Ordering::Relaxed);
                 ctx.cache = Some("revalidated");
@@ -564,7 +577,10 @@ struct Spec {
     client_path: Vec<u8>,
     /// A mounted host, or the site's upstream when `None`.
     start: Option<Hop>,
+    /// The image, for remembered redirects and misses.
     key: String,
+    /// The image as the request's Accept may get it, for the stored copy and the fetch.
+    variant: String,
     /// The stored copy whose validators `req` carries.
     held: Option<Arc<Stored>>,
     log: Mutex<Vec<AttemptLog>>,
@@ -580,7 +596,7 @@ impl Spec {
 
 async fn run(spec: Arc<Spec>, tx: watch::Sender<Option<Arc<Fetched>>>) {
     let fetched = Arc::new(fetch(&spec).await);
-    lock(&spec.images.flights).remove(&spec.key);
+    lock(&spec.images.flights).remove(&spec.variant);
     let _ = tx.send(Some(fetched));
 }
 
@@ -644,15 +660,15 @@ fn conclude(spec: &Spec, got: Result<Got>) -> Fetched {
     match got {
         Ok(Got::Response(r)) => {
             if r.status == 404 {
-                spec.images.remember_missing(&spec.key, now);
+                spec.images.remember_missing(&spec.key, &spec.variant, now);
             } else if r.keep_until > now {
-                spec.images.store(&spec.key, Arc::clone(&r));
+                spec.images.store(&spec.key, &spec.variant, Arc::clone(&r));
             }
             Fetched::Response(r)
         }
         Ok(Got::NotModified(fresh, age)) => match &spec.held {
             Some(old) => {
-                spec.images.refresh(&spec.key, old, fresh, age, now);
+                spec.images.refresh(&spec.variant, old, fresh, age, now);
                 Fetched::NotModified
             }
             None => Fetched::Failed(
@@ -971,11 +987,13 @@ fn cacheable(resp: &ResponseHeader, len: usize) -> bool {
     let h = |name| resp.headers.get(name).map(HeaderValue::as_bytes);
     let image =
         h(CONTENT_TYPE).is_some_and(|v| v.len() >= 6 && v[..6].eq_ignore_ascii_case(b"image/"));
-    // Bodies are fetched uncompressed, so only a Vary on encoding is harmless.
+    // Bodies are fetched uncompressed, and copies are kept per Accept (`variant_key`), so
+    // only a Vary on these two is harmless.
     let vary_ok = resp.headers.get_all(VARY).iter().all(|v| {
-        v.as_bytes()
-            .split(|&b| b == b',')
-            .all(|t| t.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))
+        v.as_bytes().split(|&b| b == b',').all(|t| {
+            let t = t.trim_ascii();
+            t.eq_ignore_ascii_case(b"accept-encoding") || t.eq_ignore_ascii_case(b"accept")
+        })
     });
     resp.status.as_u16() == 200 && image && vary_ok && len <= MAX_IMAGE
 }
@@ -1140,6 +1158,29 @@ mod tests {
             &resp(200, &[("content-type", "image/jpeg"), ("vary", "Cookie")]),
             10
         ));
+        // Copies are kept per Accept, so an image chosen by Accept is stored, on one line
+        // or two.
+        assert!(cacheable(
+            &resp(
+                200,
+                &[
+                    ("content-type", "image/jpeg"),
+                    ("vary", "Accept-Encoding"),
+                    ("vary", "accept")
+                ]
+            ),
+            10
+        ));
+        assert!(!cacheable(
+            &resp(
+                200,
+                &[
+                    ("content-type", "image/jpeg"),
+                    ("vary", "Accept, User-Agent")
+                ]
+            ),
+            10
+        ));
         // A gateway's session cookie does not make the image personal; it is never
         // replayed (NOT_STORED).
         assert!(cacheable(
@@ -1186,19 +1227,20 @@ mod tests {
     #[test]
     fn the_store_is_bounded_by_what_it_holds() {
         let images = Images::new(10_000);
-        images.store("a", image(4_000));
-        images.store("b", image(4_000));
+        images.store("a", "a", image(4_000));
+        images.store("b", "b", image(4_000));
         // Body, header name and value, fixed overheads per field and per image, the key.
         let one = (4_000 + (4 + 3 + 32) + 128 + 1 + piano_cache::ENTRY) as u64;
         assert_eq!(images.stats().bytes, 2 * one);
-        images.store("c", image(4_000));
+        images.store("c", "c", image(4_000));
         assert_eq!(images.stats().images, 2, "the oldest made room");
         images.set_capacity(5_000);
         assert_eq!(images.stats().images, 1);
 
         let now = Instant::now();
         for i in 0..40_000 {
-            images.remember_missing(&format!("{i:05}"), now);
+            let k = format!("{i:05}");
+            images.remember_missing(&k, &k, now);
         }
         assert_eq!(
             images.stats().missing as usize,
@@ -1217,6 +1259,30 @@ mod tests {
     }
 
     #[test]
+    fn variants_are_stored_apart_and_a_miss_covers_them_all() {
+        let images = Images::new(1 << 20);
+        let now = Instant::now();
+        let image = |len| {
+            Arc::new(Stored {
+                body: Bytes::from(vec![0; len]),
+                fresh_until: now + Duration::from_secs(60),
+                keep_until: now + Duration::from_secs(60),
+                ..stored(&[])
+            })
+        };
+        images.store("a", "a webp", image(10));
+        assert!(matches!(images.look("a", "a webp", now), Look::Fresh(_)));
+        assert!(matches!(images.look("a", "a jpeg", now), Look::None));
+        images.store("a", "a jpeg", image(20));
+        assert_eq!(images.stats().images, 2);
+        images.remember_missing("a", "a jpeg", now);
+        assert!(matches!(images.look("a", "a webp", now), Look::Missing));
+        assert!(matches!(images.look("a", "a jpeg", now), Look::Missing));
+        images.store("a", "a webp", image(10));
+        assert!(matches!(images.look("a", "a webp", now), Look::Fresh(_)));
+    }
+
+    #[test]
     fn a_refreshed_image_is_fresh_then_stale_then_gone() {
         let images = Images::new(1 << 20);
         let t = Instant::now();
@@ -1228,7 +1294,7 @@ mod tests {
             Duration::ZERO,
             t,
         );
-        let at = |d: u64| images.look("a", t + Duration::from_secs(d));
+        let at = |d: u64| images.look("a", "a", t + Duration::from_secs(d));
         assert!(matches!(at(59), Look::Fresh(_)));
         assert!(matches!(at(61), Look::Stale(_)));
         assert!(matches!(at(60 + STALE_FOR.as_secs() - 1), Look::Stale(_)));
@@ -1251,13 +1317,13 @@ mod tests {
         let at = |d: u64| start + Duration::from_secs(d);
         images.refresh("a", &old, Freshness::Unstated, Duration::ZERO, at(100));
         assert!(
-            matches!(images.look("a", at(129)), Look::Fresh(_)),
+            matches!(images.look("a", "a", at(129)), Look::Fresh(_)),
             "its previous lifetime again"
         );
-        assert!(matches!(images.look("a", at(131)), Look::Stale(_)));
+        assert!(matches!(images.look("a", "a", at(131)), Look::Stale(_)));
         images.refresh("a", &old, Freshness::Never, Duration::ZERO, at(100));
         assert!(
-            matches!(images.look("a", at(100)), Look::None),
+            matches!(images.look("a", "a", at(100)), Look::None),
             "a confirmation that forbids storing"
         );
     }

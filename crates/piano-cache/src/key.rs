@@ -44,9 +44,40 @@ pub fn image_key(site: &str, target: &[u8]) -> String {
     key
 }
 
+/// The key a stored image and a shared fetch go by: the image's `key` and the request's
+/// `Accept` lines, as sent. Image endpoints may choose the format by `Accept` (WebP for
+/// a client that lists it) and say so with `Vary: Accept`, so requests that accept
+/// different formats share neither; a client sends the same value every time.
+pub fn variant_key<'a>(key: &str, accept: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut v = String::from(key);
+    v.push('\n');
+    for (i, line) in accept.into_iter().enumerate() {
+        if i > 0 {
+            v.push_str(", ");
+        }
+        v.push_str(&String::from_utf8_lossy(line));
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
-    use super::image_key;
+    use super::{image_key, variant_key};
+
+    #[test]
+    fn variants_differ_by_accept_as_sent() {
+        let k = "s /x?tag=1";
+        let webp: &[u8] = b"image/webp,image/*";
+        assert_eq!(variant_key(k, [webp]), variant_key(k, [webp]));
+        assert_ne!(variant_key(k, [webp]), variant_key(k, [&b"image/*"[..]]));
+        assert_ne!(variant_key(k, [webp]), variant_key(k, None::<&[u8]>));
+        assert_eq!(variant_key(k, None::<&[u8]>), "s /x?tag=1\n");
+        assert_eq!(
+            variant_key(k, [&b"image/webp"[..], b"*/*"]),
+            "s /x?tag=1\nimage/webp, */*"
+        );
+        assert_ne!(variant_key("s /x", [webp]), variant_key("s /y", [webp]));
+    }
 
     #[test]
     fn credentials_are_dropped_and_parameters_sorted() {

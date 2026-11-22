@@ -113,6 +113,29 @@ async fn images_with_a_session_cookie_are_stored_without_it() {
 }
 
 #[tokio::test]
+async fn images_chosen_by_accept_are_kept_per_accept() {
+    let w = world().await;
+    let path = "/emby/Items/v1/Images/Primary?tag=1&negotiate=1&delay_ms=300";
+    let webp = [("accept", "image/avif,image/webp,image/*,*/*;q=0.8")];
+    let jpeg = [("accept", "image/*")];
+    // At the same time, neither shares the other's fetch.
+    let (a, b) = tokio::join!(w.get_with(path, &webp), w.get_with(path, &jpeg));
+    assert_eq!((a.status, a.body.as_str()), (200, "webp v1"));
+    assert_eq!(a.headers["content-type"], "image/webp");
+    assert_eq!((b.status, b.body.as_str()), (200, "image v1"));
+    // Afterwards each is answered from its own copy.
+    for _ in 0..2 {
+        assert_eq!(w.get_with(path, &webp).await.body, "webp v1");
+        assert_eq!(w.get_with(path, &jpeg).await.body, "image v1");
+    }
+    assert_eq!(w.origin.hits("/emby/Items/v1/Images/Primary"), 2);
+    let mut first = w.cache_fields(6);
+    let rest = first.split_off(2);
+    assert_eq!(first, ["miss", "miss"]);
+    assert_eq!(rest, ["hit"; 4]);
+}
+
+#[tokio::test]
 async fn a_client_holding_the_image_gets_304() {
     let w = world().await;
     w.get("/Items/c1/Images/Primary").await;
