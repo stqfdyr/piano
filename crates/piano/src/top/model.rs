@@ -88,8 +88,12 @@ fn per_sec(n: u64, ms: u64) -> f64 {
 /// What a stream is doing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum State {
-    /// No response head yet, for this many milliseconds.
-    Waiting(u64),
+    /// No response head yet: waited this many milliseconds since the client's first try,
+    /// and this is its `attempt`-th try.
+    Waiting {
+        ms: u64,
+        attempt: u32,
+    },
     Playing,
     /// Bytes wait for the client: a paused player or a slow link.
     Held(u64),
@@ -104,7 +108,10 @@ pub enum State {
 impl State {
     fn of(s: &StreamLive) -> Self {
         match s.ttfb_ms {
-            None => State::Waiting(s.age_ms),
+            None => State::Waiting {
+                ms: s.waited_ms.max(s.age_ms),
+                attempt: s.attempt,
+            },
             Some(_) if s.idle_ms < STALL_MS => State::Playing,
             Some(_) if s.client_holds => State::Held(s.idle_ms),
             Some(_) => State::Stalled {
@@ -455,6 +462,8 @@ mod tests {
             in_flight: 1,
             client_holds: false,
             upstream: Some("cdn.example.com".into()),
+            attempt: 1,
+            waited_ms: 180,
         }
     }
 
@@ -596,7 +605,22 @@ mod tests {
         s.client_holds = true;
         assert_eq!(State::of(&s), State::Held(5000));
         s.ttfb_ms = None;
-        assert_eq!(State::of(&s), State::Waiting(20_000));
+        assert_eq!(
+            State::of(&s),
+            State::Waiting {
+                ms: 20_000,
+                attempt: 1
+            }
+        );
+        // A later try counts from the first one.
+        (s.attempt, s.waited_ms) = (3, 31_000);
+        assert_eq!(
+            State::of(&s),
+            State::Waiting {
+                ms: 31_000,
+                attempt: 3
+            }
+        );
     }
 
     #[test]

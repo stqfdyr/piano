@@ -22,6 +22,11 @@ pub(crate) const CERT_WARN_DAYS: i64 = 14;
 pub(crate) const CERT_ERROR_DAYS: i64 = 3;
 /// Share of a limit in use from which status warns.
 const NEAR_LIMIT_PERCENT: u64 = 80;
+/// Media requests whose player gave up before the response head, from which status
+/// warns: over 54 days 1–2% of a slow upstream's requests did, and 47–68% on its bad
+/// days, when seeking took minutes.
+const GAVE_UP_MIN: u64 = 5;
+const GAVE_UP_PERCENT: u64 = 30;
 
 fn unix(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -244,6 +249,8 @@ impl Admin {
                 in_flight: s.sources(),
                 client_holds: s.writing(),
                 upstream: s.upstream(),
+                attempt: s.attempt(),
+                waited_ms: ms(s.first_try().elapsed()),
             })
             .collect();
         proto::Live {
@@ -434,6 +441,8 @@ fn wire(c: &Counts) -> proto::Counts {
         reused: c.reused,
         bytes_sent: c.sent.iter().sum(),
         bytes_fetched: c.fetched.iter().sum(),
+        media_gave_up: c.media_gave_up,
+        media_answered: c.media_answered,
     }
 }
 
@@ -611,6 +620,20 @@ fn findings(s: &Status, now: u64) -> Vec<Finding> {
                 Some("access log lines with end = redirect_refused name the host in err"),
             ));
         }
+        let gave_up = r.media_gave_up;
+        let answered = r.media_answered;
+        if gave_up >= GAVE_UP_MIN && gave_up * 100 >= (gave_up + answered) * GAVE_UP_PERCENT {
+            out.push(finding(
+                Level::Warn,
+                "media_gave_up",
+                format!(
+                    "{}: {gave_up} of {} media requests got no response before the player gave up {hour}",
+                    site.name,
+                    gave_up + answered
+                ),
+                Some("the upstream is slow to start these streams; access log lines with attempt > 1 are the player asking again"),
+            ));
+        }
         let failed: Vec<String> = End::ALL
             .iter()
             .filter(|e| e.is_upstream_failure() && **e != End::RedirectRefused)
@@ -766,6 +789,23 @@ mod tests {
             f[2].message
         );
         assert!(f[2].message.contains("last 10 min"), "{}", f[2].message);
+    }
+
+    #[test]
+    fn media_requests_the_player_gave_up_on() {
+        let mut s = status();
+        let with = |s: &mut Status, gave_up: u64, answered: u64| {
+            let r = &mut s.sites[0].traffic.recent;
+            (r.media_gave_up, r.media_answered) = (gave_up, answered);
+        };
+        with(&mut s, 4, 0);
+        assert!(codes(&s, 0).is_empty(), "too few to tell");
+        with(&mut s, 5, 12);
+        assert!(codes(&s, 0).is_empty(), "under 30%");
+        with(&mut s, 6, 12);
+        let f = findings(&s, 0);
+        assert_eq!(f[0].code, "media_gave_up");
+        assert!(f[0].message.contains("6 of 18"), "{}", f[0].message);
     }
 
     #[test]

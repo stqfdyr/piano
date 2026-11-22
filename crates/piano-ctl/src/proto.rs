@@ -204,6 +204,13 @@ pub struct Counts {
     /// Response body bytes read from upstreams, retried and hedged requests included.
     #[serde(default)]
     pub bytes_fetched: u64,
+    /// Media requests whose client left before the response head; they are not in
+    /// `ttfb`, which has only requests that got one.
+    #[serde(default)]
+    pub media_gave_up: u64,
+    /// Media requests that got a response head.
+    #[serde(default)]
+    pub media_answered: u64,
 }
 
 impl Counts {
@@ -380,6 +387,17 @@ pub struct StreamLive {
     pub client_holds: bool,
     /// Host the bytes come from.
     pub upstream: Option<String>,
+    /// Which try of the client this is (1 for the first): a client that gave up before
+    /// the response head and asked again for the same bytes.
+    #[serde(default = "first_try")]
+    pub attempt: u32,
+    /// Milliseconds since the client's first try of this wait started.
+    #[serde(default)]
+    pub waited_ms: u64,
+}
+
+fn first_try() -> u32 {
+    1
 }
 
 /// Reply to `cache purge`: what was removed.

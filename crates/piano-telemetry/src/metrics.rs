@@ -81,6 +81,8 @@ pub struct SiteCounters {
     sent: [AtomicU64; Kind::ALL.len()],
     fetched: [AtomicU64; Kind::ALL.len()],
     ttfb: [Histogram; Ttfb::ALL.len()],
+    media_gave_up: AtomicU64,
+    media_answered: AtomicU64,
 }
 
 /// Time-to-first-byte histograms by [`Ttfb::ALL`] index.
@@ -107,9 +109,17 @@ impl SiteCounters {
         self.fetched[kind.index()].fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Counts a media request whose client left before the response head.
+    pub fn record_media_gave_up(&self) {
+        self.media_gave_up.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Counts the time from a request to the response head its client got.
     pub fn record_ttfb(&self, kind: Ttfb, d: Duration) {
         self.ttfb[kind.index()].record(d);
+        if kind == Ttfb::Media {
+            self.media_answered.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn ttfb(&self) -> TtfbBuckets {
@@ -126,6 +136,8 @@ impl SiteCounters {
             reused: load(&self.reused),
             sent: self.sent.each_ref().map(load),
             fetched: self.fetched.each_ref().map(load),
+            media_gave_up: load(&self.media_gave_up),
+            media_answered: load(&self.media_answered),
         }
     }
 }
@@ -146,6 +158,13 @@ pub struct Counts {
     /// are left out: clients send a few KiB at most.
     pub sent: ByKind,
     pub fetched: ByKind,
+    /// Media requests whose client left before the response head: the upstream took
+    /// longer to answer than the player waits. Not in the time-to-first-byte histogram,
+    /// which only has requests that got a head.
+    pub media_gave_up: u64,
+    /// Media requests that got a response head; with `media_gave_up`, the media
+    /// requests that ended or are under way.
+    pub media_answered: u64,
 }
 
 impl Counts {
@@ -160,6 +179,8 @@ impl Counts {
             reused: sub(self.reused, earlier.reused),
             sent: std::array::from_fn(|i| sub(self.sent[i], earlier.sent[i])),
             fetched: std::array::from_fn(|i| sub(self.fetched[i], earlier.fetched[i])),
+            media_gave_up: sub(self.media_gave_up, earlier.media_gave_up),
+            media_answered: sub(self.media_answered, earlier.media_answered),
         }
     }
 

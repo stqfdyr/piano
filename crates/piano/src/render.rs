@@ -373,18 +373,21 @@ pub fn status(s: &Status, color: Color) -> String {
             size(r.bytes_fetched),
         );
     }
+    // Media requests whose client gave up before the head are not in the percentiles.
+    let gave_up = s.sites.iter().any(|x| x.traffic.recent.media_gave_up > 0);
     let timed = s.sites.iter().any(|x| x.ttfb.values().any(|l| l.count > 0));
-    if timed {
+    if timed || gave_up {
         let _ = writeln!(
             o,
             "\n  time to first byte, p50 / p95, last {}",
             duration(s.ttfb_secs.max(1))
         );
-        let _ = writeln!(
+        let _ = write!(
             o,
             "  {:<w$} {:>15} {:>15} {:>15}",
             "site", "browse", "image", "media"
         );
+        let _ = writeln!(o, "{}", if gave_up { "  gave up" } else { "" });
         for x in &s.sites {
             let cell = |k: &str| match x.ttfb.get(k) {
                 Some(Latency {
@@ -394,13 +397,23 @@ pub fn status(s: &Status, color: Color) -> String {
                 }) => format!("{} / {}", millis(*a), millis(*b)),
                 _ => "-".to_owned(),
             };
-            let _ = writeln!(
+            let _ = write!(
                 o,
                 "  {:<w$} {:>15} {:>15} {:>15}",
                 x.name,
                 cell("browse"),
                 cell("image"),
                 cell("media")
+            );
+            let n = x.traffic.recent.media_gave_up;
+            let _ = writeln!(
+                o,
+                "{}",
+                if gave_up {
+                    format!("  {n:>7}")
+                } else {
+                    String::new()
+                }
             );
         }
     }

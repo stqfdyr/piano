@@ -106,6 +106,8 @@ pub struct Ctx {
     rewritten: Option<usize>,
     /// How the image engine answered: fetched, coalesced, missing or shed.
     pub(crate) cache: Option<&'static str>,
+    /// What the media engine saw of the stream.
+    pub(crate) media: Option<media::MediaLog>,
     /// The bytes sent to the client were counted as they went, by the media engine.
     pub(crate) sent_counted: bool,
     /// The time to first byte was counted when the head went out, by the media engine,
@@ -382,6 +384,11 @@ fn access_line(session: &Session, e: Option<&Error>, end: End, ctx: &Ctx) -> Str
     opt_num(&mut j, "ttfb_ms", ctx.ttfb.map(millis));
     opt_num(&mut j, "rewrite", ctx.rewritten.map(|n| n as u64));
     opt_str(&mut j, "cache", ctx.cache);
+    let m = ctx.media.as_ref();
+    opt_num(&mut j, "attempt", m.map(|m| u64::from(m.attempt)));
+    opt_num(&mut j, "waited_ms", m.map(|m| millis(m.waited)));
+    opt_num(&mut j, "starved_ms", m.map(|m| millis(m.starved)));
+    opt_num(&mut j, "blocked_ms", m.map(|m| millis(m.blocked)));
     j.str("end", end.as_str());
     let err = e.map(|e| capped(&e.to_string(), MAX_ERR));
     opt_str(&mut j, "err", err.as_deref());
