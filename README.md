@@ -16,9 +16,9 @@ Each `v*` tag is built by the release workflow into
 script) with a `.sha256` file and a build provenance attestation:
 
 ```sh
-gh release download v0.3.0 --repo stqfdyr/piano --pattern 'piano-*'
-sha256sum -c piano-0.3.0-x86_64-linux-musl.tar.gz.sha256
-gh attestation verify piano-0.3.0-x86_64-linux-musl.tar.gz --repo stqfdyr/piano
+gh release download v0.4.0 --repo stqfdyr/piano --pattern 'piano-*'
+sha256sum -c piano-0.4.0-x86_64-linux-musl.tar.gz.sha256
+gh attestation verify piano-0.4.0-x86_64-linux-musl.tar.gz --repo stqfdyr/piano
 ```
 
 The binary is static, built for `x86_64-unknown-linux-musl` with
@@ -92,8 +92,8 @@ check` passed with warnings.
 release archive:
 
 ```sh
-tar -xzf piano-0.3.0-x86_64-linux-musl.tar.gz
-sh piano-0.3.0-x86_64-linux-musl/install.sh
+tar -xzf piano-0.4.0-x86_64-linux-musl.tar.gz
+sh piano-0.4.0-x86_64-linux-musl/install.sh
 ```
 
 It creates the `piano` user, installs `/usr/local/bin/piano`, the service and

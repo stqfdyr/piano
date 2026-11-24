@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "piano"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1726,11 +1726,11 @@ dependencies = [
 
 [[package]]
 name = "piano-cache"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "piano-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "regex",
  "serde",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "piano-ctl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "log",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "piano-e2e"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "piano-edge"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1794,14 +1794,14 @@ dependencies = [
 
 [[package]]
 name = "piano-media"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "piano-proxy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "piano-telemetry"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "pingora-http",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "piano-upstream"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "piano-config",
@@ -3456,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "yansi"
