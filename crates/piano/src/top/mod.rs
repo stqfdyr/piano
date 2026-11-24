@@ -47,8 +47,9 @@ struct State {
     /// The clock of the animations, and when the last reply came.
     started: Instant,
     replied: Option<Instant>,
-    /// Page counts at the last refresh, and until when a count that grew flashes.
-    counts: [usize; 5],
+    /// Page counts at the last refresh (none before the first view), and until when a
+    /// count that grew flashes.
+    counts: Option<[Option<view::Badge>; 5]>,
     flash_until: [Option<Instant>; 5],
 }
 
@@ -83,23 +84,32 @@ impl State {
             page: Page::Streams,
             started: Instant::now(),
             replied: None,
-            counts: [0; 5],
+            counts: None,
             flash_until: [None; 5],
         }
     }
 
-    /// Starts a flash on each page other than the shown one whose count grew.
+    /// Starts a flash on each page other than the shown one that has news: a count of
+    /// events that grew, or something needing attention where there was nothing. The
+    /// first view only sets the counts.
     fn notice(&mut self, now: Instant) {
         let Some(v) = &self.view else {
             return;
         };
-        let counts = view::badges(v, self.problems.unseen).map(|b| b.map_or(0, |(n, _)| n));
-        for (i, (&new, old)) in counts.iter().zip(self.counts).enumerate() {
-            if new > old && i != self.page.index() {
-                self.flash_until[i] = Some(now + FLASH);
+        let new = view::badges(v, self.problems.unseen);
+        if let Some(old) = self.counts {
+            for (i, (n, o)) in new.iter().zip(old).enumerate() {
+                let news = match (n, o) {
+                    (Some(n), Some(o)) => n.events && n.n > o.n,
+                    (Some(n), None) => n.color != view::DIM,
+                    (None, _) => false,
+                };
+                if news && i != self.page.index() {
+                    self.flash_until[i] = Some(now + FLASH);
+                }
             }
         }
-        self.counts = counts;
+        self.counts = Some(new);
     }
 
     fn key(&mut self, k: KeyEvent) -> Key {
@@ -107,7 +117,8 @@ impl State {
             KeyCode::Char('q') | KeyCode::Esc => return Key::Quit,
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Key::Quit,
             KeyCode::Char('p') => self.paused = !self.paused,
-            KeyCode::Char('f') => self.full = !self.full,
+            // Addresses are only on the streams page, where the key is listed.
+            KeyCode::Char('f') if self.page == Page::Streams => self.full = !self.full,
             KeyCode::Tab | KeyCode::Right => self.page = self.page.next(),
             KeyCode::BackTab | KeyCode::Left => self.page = self.page.prev(),
             KeyCode::Char(c) => match Page::of_key(c) {
@@ -156,7 +167,7 @@ impl State {
             });
             self.log_read = read.err().map(|e| e.to_string());
             // Problems from before the view started are on their page, not news.
-            if std::mem::take(&mut self.reopened) && self.log_read.is_none() {
+            if self.log_read.is_none() && std::mem::take(&mut self.reopened) {
                 self.problems.unseen = 0;
             }
         }
@@ -400,6 +411,39 @@ mod tests {
     }
 
     #[test]
+    fn only_news_flashes() {
+        let mut s = State::new();
+        let mut l = live();
+        let now = std::time::Instant::now();
+        s.history.push(l.clone());
+        s.view = View::of(&s.history);
+        // The first view has a 5xx already: not news.
+        s.notice(now);
+        assert_eq!(s.flash_until, [None; 5]);
+        // Another 5xx on a page not shown flashes; the stream count does not.
+        l.uptime_ms += 1000;
+        if let Some(c) = l.sites[0].total.status.get_mut("5xx") {
+            *c += 1;
+        }
+        s.history.push(l.clone());
+        s.view = View::of(&s.history);
+        s.notice(now);
+        assert!(s.flash_until[1].is_some());
+        assert_eq!(s.flash_until[0], None);
+        // On its own page it does not.
+        s.flash_until = [None; 5];
+        s.page = Page::Sites;
+        l.uptime_ms += 1000;
+        if let Some(c) = l.sites[0].total.status.get_mut("5xx") {
+            *c += 1;
+        }
+        s.history.push(l);
+        s.view = View::of(&s.history);
+        s.notice(now);
+        assert_eq!(s.flash_until[1], None);
+    }
+
+    #[test]
     fn keys_turn_pages_and_seeing_problems_clears_their_count() {
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
         let mut s = State::new();
@@ -423,6 +467,12 @@ mod tests {
         assert_eq!(s.page, Page::Problems);
         assert_eq!(s.key(key(KeyCode::Char('9'))), Key::Ignore);
         assert_eq!(s.key(key(KeyCode::Char('x'))), Key::Ignore);
+        // Addresses are only shown, and switched, on the streams page.
+        assert_eq!(s.key(key(KeyCode::Char('f'))), Key::Ignore);
+        assert!(!s.full);
+        s.key(key(KeyCode::Char('1')));
+        assert_eq!(s.key(key(KeyCode::Char('f'))), Key::Redraw);
+        assert!(s.full);
         assert_eq!(s.key(key(KeyCode::Char('q'))), Key::Quit);
         assert_eq!(
             s.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),

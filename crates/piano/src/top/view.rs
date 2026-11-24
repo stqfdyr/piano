@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Sparkline, Table, Wrap};
 
-const DIM: Color = Color::Indexed(244);
+pub const DIM: Color = Color::Indexed(244);
 const RULE: Color = Color::Indexed(240);
 const FAINT: Color = Color::Indexed(238);
 /// Key caps: light text on a dark grey cap, readable on dark and light themes alike.
@@ -151,6 +151,12 @@ fn rate(bytes_per_sec: f64) -> Span<'static> {
     Span::raw(format!("{}/s", size(bytes_per_sec as u64)))
 }
 
+/// `r` with at most two decimals and no trailing zeros: `2.5`, `0.33`, `1`.
+fn short(r: f64) -> String {
+    let s = format!("{r:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 /// Bold unless dimmed for being zero.
 fn strong(s: Span<'static>) -> Span<'static> {
     if s.style.fg == Some(DIM) {
@@ -240,8 +246,40 @@ fn table<'a>(cols: &[Col], keep: &[usize], rows: Vec<Vec<Cell<'a>>>) -> Table<'a
         .flex(Flex::Start)
 }
 
-/// What needs attention on each page, by [`Page::ALL`]: a count and its colour.
-pub fn badges(v: &View, unseen: usize) -> [Option<(usize, Color)>; 5] {
+/// What needs attention on each page, by [`Page::ALL`]: a count and its colour, and
+/// whether the count is of events, so that its growth is news.
+pub fn badges(v: &View, unseen: usize) -> [Option<Badge>; 5] {
+    let mut out = counts(v, unseen).map(|b| {
+        b.map(|(n, color)| Badge {
+            n,
+            color,
+            events: false,
+        })
+    });
+    // Sites count 5xx, upstream red counts blocked upstreams, edge red counts closes and
+    // problems count arrivals; the rest are levels.
+    for (i, b) in out.iter_mut().enumerate() {
+        if let Some(b) = b {
+            b.events = match i {
+                1 | 4 => true,
+                2 | 3 => b.color == BAD,
+                _ => false,
+            };
+        }
+    }
+    out
+}
+
+/// A page's count in the page bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Badge {
+    pub n: usize,
+    pub color: Color,
+    pub events: bool,
+}
+
+/// What needs attention on each page: a count and its colour.
+fn counts(v: &View, unseen: usize) -> [Option<(usize, Color)>; 5] {
     let streams = (!v.streams.is_empty()).then(|| {
         let c = v.streams.iter().fold(DIM, |c, r| match r.state {
             State::Stalled { ms, .. } if ms >= 15_000 => BAD,
@@ -300,7 +338,7 @@ fn tabs(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>, v: &View, tag: Vec<Span<'
             } else {
                 spans.push(dim(label));
             }
-            if let Some((n, c)) = badges[i] {
+            if let Some(Badge { n, color: c, .. }) = badges[i] {
                 spans.push(Span::raw(" "));
                 if s.flash[i] {
                     spans.push(chip(&n.to_string(), c, ON_CHIP));
@@ -456,7 +494,6 @@ fn offline(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>) {
 /// Bytes per second written to clients, each reply as wide as the screen allows, with
 /// its peak and, given a second row, its span.
 fn throughput(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>) {
-    let peak = s.series.iter().copied().max().unwrap_or(0);
     // The legend is at most this wide, so the chart's width is known before it.
     let lw = 18u16.min(area.width / 3);
     let [chart, _, legend] = Layout::horizontal([
@@ -468,6 +505,8 @@ fn throughput(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>) {
     let tail = chart::stretch(s.series, usize::from(chart.width));
     let shown = tail.len() / (usize::from(chart.width) / s.series.len().max(1)).max(1);
     let span = (shown as f64 * s.interval_secs).round();
+    // Over what is drawn: a narrow chart leaves the oldest replies out.
+    let peak = tail.iter().copied().max().unwrap_or(0);
     let mut labels = vec![Line::from(vec![dim("peak "), rate(peak as f64)])];
     if area.height >= 2 {
         labels.push(Line::from(dim(format!("out · last {span}s"))));
@@ -1280,7 +1319,7 @@ fn upstreams(f: &mut Frame<'_>, area: Rect, v: &View) {
             };
             let refill = b
                 .per_sec
-                .map_or_else(|| dim("—"), |r| Span::raw(format!("{r}/s")));
+                .map_or_else(|| dim("—"), |r| Span::raw(format!("{}/s", short(r))));
             let max = b.burst.map(|x| x.max(1.0).round() as u64);
             let trend = chart::stretch(&b.series, trend_width);
             Row::new(vec![
@@ -1567,6 +1606,14 @@ fn footer(f: &mut Frame<'_>, area: Rect, s: &Screen<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rates_are_short() {
+        assert_eq!(short(2.5), "2.5");
+        assert_eq!(short(1.0), "1");
+        assert_eq!(short(1.0 / 3.0), "0.33");
+        assert_eq!(short(0.1 + 0.2), "0.3");
+    }
 
     #[test]
     fn repeated_problems_fold_into_one_line() {

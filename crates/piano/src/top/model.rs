@@ -78,6 +78,16 @@ impl History {
             .collect()
     }
 
+    /// How much a counter grew between successive replies, oldest first: for events too
+    /// rare for a per-second rate, which would round one event a second down to none.
+    fn deltas(&self, f: impl Fn(&Live) -> u64) -> Vec<u64> {
+        self.samples
+            .iter()
+            .zip(self.samples.iter().skip(1))
+            .map(|(a, b)| f(b).saturating_sub(f(a)))
+            .collect()
+    }
+
     /// A level at each reply, oldest first.
     fn levels(&self, f: impl Fn(&Live) -> u64) -> Vec<u64> {
         self.samples.iter().map(f).collect()
@@ -214,13 +224,15 @@ pub struct BudgetRow {
     pub series: Vec<u64>,
 }
 
-/// Client connections: levels now, and counts over the window with their rates per reply.
+/// Client connections: levels now, and counts over the window with how many came at
+/// each reply.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Edge {
     pub open: u64,
     pub handshaking: u64,
     pub limit: u64,
     pub open_series: Vec<u64>,
+    // The series below count events between successive replies.
     /// Handshakes that failed or timed out.
     pub failed: u64,
     pub failed_series: Vec<u64>,
@@ -443,11 +455,11 @@ impl View {
             limit: conn.limit,
             open_series: h.levels(|l| l.connections.open),
             failed: since(handshakes),
-            failed_series: h.rates(handshakes),
+            failed_series: h.deltas(handshakes),
             denied: since(|l| l.connections.denied),
-            denied_series: h.rates(|l| l.connections.denied),
+            denied_series: h.deltas(|l| l.connections.denied),
             closed: since(|l| l.connections.closed_at_limit),
-            closed_series: h.rates(|l| l.connections.closed_at_limit),
+            closed_series: h.deltas(|l| l.connections.closed_at_limit),
         };
         let memory = Memory {
             redirects: c.redirects,
@@ -692,6 +704,19 @@ mod tests {
         assert_eq!(a.ttfb[1], None);
         assert_eq!(v.budgets[0].limited, 6);
         assert_eq!(h.sent_series().len(), 60);
+    }
+
+    #[test]
+    fn rare_edge_events_count_per_reply() {
+        let mut h = History::default();
+        for (ms, denied) in [(0, 0), (1003, 1), (2010, 1), (3020, 3)] {
+            let mut l = live(ms, Counts::default(), &[], Vec::new(), 0);
+            l.connections.denied = denied;
+            h.push(l);
+        }
+        let v = View::of(&h).unwrap();
+        assert_eq!(v.edge.denied_series, [1, 0, 2]);
+        assert_eq!(v.edge.denied, 3);
     }
 
     #[test]
